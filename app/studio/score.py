@@ -4,17 +4,34 @@ aar58/tools/faceid.py). Copy, brand and engagement are NOT SCORED until an LLM k
 as NULL and shown as 'not scored', never as a number. No network, no paid calls."""
 import json
 from pathlib import Path
-import cv2
-import numpy as np
 from . import APP_DIR
+
+cv2 = None
+np = None
+
+def _cv():
+    """OpenCV is an optional extra. The Vercel request function does not install it."""
+    global cv2, np
+    if cv2 is None or np is None:
+        import cv2 as _cv2
+        import numpy as _np
+        try:
+            _cv2.utils.logging.setLogLevel(_cv2.utils.logging.LOG_LEVEL_ERROR)
+        except Exception:
+            pass
+        cv2, np = _cv2, _np
+    return cv2, np
+
+def available():
+    try:
+        _cv()
+        return True
+    except ImportError:
+        return False
 
 def _models():
     from .assets import model_dir
     return model_dir()
-try:
-    cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
-except Exception:
-    pass
 NOT_SCORED = ("copy", "brand", "engagement")
 IMG = (".png", ".jpg", ".jpeg", ".webp")
 VID = (".mp4", ".mov", ".webm")
@@ -23,6 +40,7 @@ _ref_cache = {}
 
 _dets = {}
 def _det(shape):
+    cv2, _np = _cv()
     k = (shape[1], shape[0])
     if k not in _dets:
         _dets[k] = cv2.FaceDetectorYN.create(str(_models() / "yunet.onnx"), "", k, 0.7)
@@ -32,6 +50,7 @@ def _det(shape):
 _rec = None
 def _recog():
     global _rec
+    cv2, _np = _cv()
     if _rec is None:
         _rec = cv2.FaceRecognizerSF.create(str(_models() / "sface.onnx"), "")
     return _rec
@@ -39,6 +58,7 @@ def _recog():
 
 def embed(img):
     """(embedding, face_box_in_original_px) of the largest face, or (None, None)."""
+    cv2, _np = _cv()
     h, w = img.shape[:2]
     s = min(1.0, 1280 / max(h, w))
     im = cv2.resize(img, (int(w * s), int(h * s))) if s < 1 else img
@@ -56,6 +76,7 @@ def ref_paths(cfg, persona):
 
 
 def ref_embeddings(cfg, persona):
+    cv2, _np = _cv()
     if persona not in _ref_cache:
         out = []
         for p in ref_paths(cfg, persona):
@@ -68,6 +89,7 @@ def ref_embeddings(cfg, persona):
 
 
 def frames(path, n=5):
+    cv2, _np = _cv()
     if path.lower().endswith(IMG):
         img = cv2.imread(path)
         return [img] if img is not None else []
@@ -85,6 +107,7 @@ def frames(path, n=5):
 
 def visual(frs):
     """Technical checks only: sharpness (variance of Laplacian), exposure (mean luma, clipped %), resolution."""
+    cv2, np = _cv()
     sharp, luma, clip_lo, clip_hi = [], [], [], []
     for f in frs:
         g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
@@ -115,6 +138,7 @@ def visual_flags(v, q, stage=None):
 
 
 def score_file(cfg, persona, path, n_frames=5, stage=None):
+    cv2, np = _cv()
     from .storage import local
     path = local(path)
     q = cfg.get("quality") or {}

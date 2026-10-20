@@ -51,7 +51,8 @@ def spread(text, start, end):
 
 def speech_span(media, noise_db=-35, min_sil=0.25):
     """(start, end) of speech in the audio track via silencedetect. Local, no models."""
-    r = subprocess.run(["ffmpeg", "-i", str(media), "-af", f"silencedetect=n={noise_db}dB:d={min_sil}", "-f", "null", "-"],
+    from .assets import ffmpeg_bin
+    r = subprocess.run([ffmpeg_bin("ffmpeg"), "-i", str(media), "-af", f"silencedetect=n={noise_db}dB:d={min_sil}", "-f", "null", "-"],
                        capture_output=True, text=True)
     d = duration(media) or 0
     starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", r.stderr)]
@@ -127,6 +128,8 @@ def _esc(p):
 # ---------- framing
 def face_center(video, n=5):
     from . import score
+    if not score.available():
+        return None
     xs, ys = [], []
     for f in score.frames(str(video), n):
         _, box = score.embed(f)
@@ -192,8 +195,9 @@ def compose(src, out_dir, params, script=None, fast=False):
         al = params.get("_alignment") if cap.get("use_alignment", True) else None
         words = word_times(script=None if cap.get("vtt") else script, vtt=cap.get("vtt"), media=src,
                            alignment=al, offset=float(params.get("_alignment_offset") or 0))
+    from .assets import ffmpeg_bin
     from .media import FONT
-    sw, sh = map(int, subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+    sw, sh = map(int, subprocess.run([ffmpeg_bin("ffprobe"), "-v", "error", "-select_streams", "v:0", "-show_entries",
                                       "stream=width,height", "-of", "csv=p=0", str(src)],
                                      capture_output=True, text=True).stdout.strip().split(",")[:2])
     center = face_center(src, 1 if fast else 5)

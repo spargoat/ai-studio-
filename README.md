@@ -14,8 +14,8 @@ Source lives in [`app/`](app/). Engine commands and templates are in [app/README
 | Jobs database | Turso/libSQL when `TURSO_DATABASE_URL` is set; local SQLite otherwise (tests and CLI) |
 | Job files | Vercel Blob when `BLOB_READ_WRITE_TOKEN` is set. A stage pulls inputs into `/tmp`, runs, uploads outputs, and stores the Blob URL. `/file` redirects only to `*.blob.vercel-storage.com` |
 | Progress | `POST /api/jobs/<id>/advance` runs one stage, or one fal queue poll. Cron `GET /api/cron/advance` moves jobs in `created`, `running`, or `partial` |
-| Face score | OpenCV YuNet + SFace (`yunet.onnx`, `sface.onnx`) from the [OpenCV model zoo](https://github.com/opencv/opencv_zoo), downloaded at build |
-| ffmpeg | Static Linux build unpacked to `/tmp` on first compose/finish |
+| Face score | Optional. Local installs use `pip install '.[score]'` (numpy + opencv-python-headless). The request function does not include them. YuNet + SFace (`yunet.onnx`, `sface.onnx`) download into `/tmp` on first score, from Blob `runtime/<name>` when that object exists, otherwise from the [OpenCV model zoo](https://github.com/opencv/opencv_zoo), then the bytes are stored in Blob |
+| ffmpeg | Not in the bundle. On Vercel, the first compose/finish downloads a static Linux build into `/tmp` (Blob `runtime/ffmpeg-linux64.tar.xz` when present, otherwise the BtbN release) and unpacks `ffmpeg` and `ffprobe` |
 
 Live runs from the app return **409** unless `STUDIO_ALLOW_LIVE=1`. Dry runs stay the default.
 
@@ -57,17 +57,20 @@ Leave unset until a live run is intended. Caps in `app/config/config.yaml` still
 | `STUDIO_COOKIE_SECURE` | Set to `1` to mark the cookie Secure even when the proxy header is absent. HTTPS on Vercel sets this from `X-Forwarded-Proto` |
 | `VERCEL_SUPPORT_LARGE_FUNCTIONS` | Set to `1` only if the Python bundle exceeds the 500 MB standard limit |
 | `STUDIO_SQLITE` | Set to `1` to force the local SQLite file even if a Turso URL is present (tests) |
+| `STUDIO_FETCH_FFMPEG` | Set to `1` to download the static ffmpeg outside Vercel. On Vercel this happens when `VERCEL=1` |
 
 `VERCEL` is set by the platform. Do not copy it into a local `.env`.
 
 ## Local checks
 
 ```bash
+# from the repository root; the score extra is local only
+pip install -r requirements.txt '.[score]'
 cd app
-python3 -m unittest tests.test_dryrun tests.test_storage tests.test_advance
+python3 -m unittest tests.test_dryrun tests.test_storage tests.test_advance tests.test_assets
 ```
 
-Dry-run tests use a throwaway SQLite file and mock providers. They do not call fal or ElevenLabs.
+Dry-run tests use a throwaway SQLite file and mock providers. They do not call fal or ElevenLabs. The `score` extra is what the quality-gate tests import; it is not installed into the Vercel function.
 
 ## What Aaron still does in the dashboard
 
@@ -81,6 +84,8 @@ Dry-run tests use a throwaway SQLite file and mock providers. They do not call f
 
 - One Python function. Default max duration is **300 seconds** (Hobby maximum). A single stage that runs longer than that, usually compose/finish on a long clip, returns 504. Pro can raise `maxDuration` up to 800s in `vercel.json`.
 - Request bodies are capped at **4.5 MB**. Job media is uploaded to Blob, not through the function body.
-- The standard Python bundle limit is **500 MB** uncompressed. opencv-python-headless, the two face models (~38 MB), and the compressed static ffmpeg (~150 MB) are expected to fit. If a build reports the unzipped-size error, set `VERCEL_SUPPORT_LARGE_FUNCTIONS=1` and redeploy. The ffmpeg archive is unpacked to `/tmp` at runtime so the extracted binaries are not part of the bundle.
+- This project's Python builder packs the function to about **225 MB** uncompressed (`LAMBDA_SIZE_EXCEEDED` at 236.69 MB, 405.79 MB before that pack). opencv-python-headless and numpy are not dependencies of the request function. Face models and ffmpeg are fetched into `/tmp` at runtime, and `excludeFiles` drops tests, UI source, `node_modules`, screenshots, and `app/models`. `python3 scripts/measure_bundle.py` reprints that uncompressed size (pip wheels plus the project files the builder would zip). Measured on Python 3.12: **20.1 MB** (19.4 MB of wheels, 0.7 MB of source). The builder also adds its small runtime shim; that is not in the 20.1 MB.
+- On Vercel, identity and visual scores are not computed, and compose framing uses the geometric center instead of a detected face. The stage still finishes; the quality gate only flags, it does not block. Locally, with the `score` extra installed, scoring and face framing are unchanged.
+- The first compose or finish on a cold instance downloads the ffmpeg archive (about 150 MB) before it encodes. Later requests on that instance reuse `/tmp`. A new instance downloads again, from Blob when `runtime/ffmpeg-linux64.tar.xz` was stored.
 - fal generations do not block the request. Advance submits, stores the request id, and the next advance or the cron polls once.
-- Blob objects are public unguessable URLs so `<img>` and `<video>` can load them after `/file` redirects. The password gates the app and the `/file` route, not a URL someone already has.
+- Blob objects are public unguessable URLs so `<img>` and `<video>` can load them after `/file` redirects. The password gates the app and the `/file` route, not a URL someone already has. The same store holds the runtime ffmpeg and model cache under `runtime/`.

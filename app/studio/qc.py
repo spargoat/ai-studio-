@@ -1,10 +1,11 @@
 """Automated gate checks (blank / corrupt output). Not a quality verdict."""
 import subprocess
+from .assets import ffmpeg_bin
 from .media import duration
 
 
 def _mean_luma_std(path, is_video):
-    args = ["ffmpeg", "-v", "error", "-i", str(path)]
+    args = [ffmpeg_bin("ffmpeg"), "-v", "error", "-i", str(path)]
     if is_video:
         args += ["-ss", "0.5"]
     args += ["-frames:v", "1", "-vf", "scale=64:-2,format=gray", "-f", "rawvideo", "-"]
@@ -28,7 +29,7 @@ def check(kind, path):
         if not d or d < 1:
             return False, f"duration {d}"
         if kind == "voice":
-            r = subprocess.run(["ffmpeg", "-v", "info", "-i", str(path), "-af", "volumedetect", "-f", "null", "-"],
+            r = subprocess.run([ffmpeg_bin("ffmpeg"), "-v", "info", "-i", str(path), "-af", "volumedetect", "-f", "null", "-"],
                                capture_output=True, text=True)
             mv = [l for l in r.stderr.splitlines() if "mean_volume" in l]
             mean = float(mv[0].split(":")[1].split()[0]) if mv else -99

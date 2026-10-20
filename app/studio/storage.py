@@ -57,6 +57,40 @@ def local(path, getter=None):
     return str(dest)
 
 
+def _headers():
+    return {"authorization": f"Bearer {_token()}", "x-api-version": "7"}
+
+
+def blob_url(pathname, session=None):
+    """Public URL of an existing Blob object with this exact pathname, or None."""
+    if not enabled() or not pathname:
+        return None
+    http = session or requests
+    try:
+        res = http.get(BLOB_PUT, params={"prefix": pathname, "limit": "20"}, headers=_headers(), timeout=60)
+        res.raise_for_status()
+        body = res.json()
+    except Exception:
+        return None
+    for blob in body.get("blobs") or []:
+        if blob.get("pathname") == pathname and blob.get("url"):
+            return blob["url"]
+    return None
+
+
+def download(url, dest, session=None):
+    """Write a URL to dest. Used for Blob cache hits and public runtime assets."""
+    http = session or requests
+    res = http.get(url, timeout=300)
+    res.raise_for_status()
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    tmp.write_bytes(res.content)
+    tmp.replace(dest)
+    return dest
+
+
 def put_file(pathname, data, content_type, session=None):
     """Upload bytes to Vercel Blob. Returns the public URL."""
     http = session or requests
