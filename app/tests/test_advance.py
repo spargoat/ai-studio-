@@ -156,6 +156,9 @@ class T(unittest.TestCase):
         self.assertNotIn("advanced", cron.get_data(as_text=True))
         self.assertFalse(path.exists())
         self.assertEqual(client.get("/healthz").status_code, 200)
+        asset = client.get("/assets/index-CHLvFPo1.js")
+        self.assertEqual(asset.status_code, 200, asset.data[:120])
+        self.assertIn("javascript", asset.content_type)
         os.environ["STUDIO_SQLITE"] = "1"
         client = create_app(c).test_client()
         self.assertEqual(client.get("/api/jobs").status_code, 200)
@@ -163,6 +166,59 @@ class T(unittest.TestCase):
         self.assertEqual(cron.status_code, 200)
         self.assertEqual(cron.get_json()["advanced"], [])
         self.assertTrue(path.exists())
+
+    def test_blob_upload_failure_marks_job_failed(self):
+        from unittest.mock import patch
+        from studio import storage
+        os.environ["BLOB_READ_WRITE_TOKEN"] = "vercel_blob_rw_abc123_secret"
+        os.environ["STUDIO_ONE_STAGE"] = "1"
+        self.addCleanup(os.environ.pop, "BLOB_READ_WRITE_TOKEN", None)
+        body = '{"error":{"code":"bad_request","message":"Invalid pathname"}}'
+
+        def boom(pathname, data, content_type, session=None):
+            raise storage.BlobError(f"Blob upload failed (400): {body}")
+
+        app = create_app(cfg())
+        client = app.test_client()
+        with patch("studio.storage.put_file", boom):
+            created = client.post("/api/jobs", json={"brief": dict(BRIEF, id="t-blob")})
+            self.assertEqual(created.status_code, 201, created.data)
+            step = client.post("/api/jobs/t-blob/advance")
+        self.assertEqual(step.status_code, 200, step.data)
+        self.assertNotIn(b"Traceback", step.data)
+        payload = step.get_json()
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["stage"], "brief")
+        self.assertEqual(payload["status"], "failed")
+        self.assertIn("Invalid pathname", payload["error"])
+        self.assertIn("bad_request", payload["error"])
+        detail = client.get("/api/jobs/t-blob").get_json()
+        self.assertEqual(detail["job"]["status"], "failed")
+        brief = next(s for s in detail["stages"] if s["id"] == "brief")
+        self.assertEqual(brief["runs"][-1]["status"], "failed")
+        self.assertIn("Invalid pathname", brief["runs"][-1]["error"])
+
+    def test_hashed_ui_assets_are_served_without_a_session(self):
+        os.environ["STUDIO_APP_PASSWORD"] = "pw"
+        os.environ["STUDIO_SESSION_SECRET"] = "secret"
+        os.environ["STUDIO_REQUIRE_AUTH"] = "1"
+        for key in ("STUDIO_APP_PASSWORD", "STUDIO_SESSION_SECRET", "STUDIO_REQUIRE_AUTH"):
+            self.addCleanup(os.environ.pop, key, None)
+        client = create_app(cfg()).test_client()
+        page = client.get("/")
+        self.assertEqual(page.status_code, 302)
+        self.assertIn("/login", page.headers["Location"])
+        js = client.get("/assets/index-CHLvFPo1.js")
+        self.assertEqual(js.status_code, 200, js.data[:200])
+        self.assertIn("javascript", js.content_type)
+        self.assertGreater(len(js.data), 1000)
+        self.assertNotIn(b"<html", js.data[:80].lower())
+        css = client.get("/assets/index-B6TAifSU.css")
+        self.assertEqual(css.status_code, 200)
+        self.assertIn("css", css.content_type)
+        missing = client.get("/assets/missing-hash.js")
+        self.assertEqual(missing.status_code, 404)
+        self.assertNotIn("Location", missing.headers)
 
 
 if __name__ == "__main__":

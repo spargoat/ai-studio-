@@ -37,7 +37,6 @@ EXCLUDES = [
     "**/package-lock.json",
     "app/ui/node_modules/**",
     "app/ui/src/**",
-    "app/ui/dist/assets/**",
     "app/tests/**",
     "app/screens/**",
     "app/tools/**",

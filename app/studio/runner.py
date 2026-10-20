@@ -375,7 +375,12 @@ class Runner:
             meta = json.loads(run["meta_json"] or "{}")
             if meta.get("fal"):
                 self._poll_fal(job, run)
-                return {"action": "poll", "stage": run["stage"], "status": self.settle(job_id)}
+                fresh = self.db.run(run["id"])
+                body = {"action": "poll", "stage": run["stage"], "status": self.settle(job_id)}
+                if fresh and fresh["status"] == "failed" and fresh.get("error"):
+                    body["ok"] = False
+                    body["error"] = fresh["error"]
+                return body
             return {"action": "busy", "stage": run["stage"], "status": "running"}
         self.async_fal = True
         try:
@@ -395,9 +400,25 @@ class Runner:
                 if not due:
                     continue
                 self.db.set_job_status(job_id, "running")
-                result = self.run_stage(job, sdef)
-                return {"action": "stage", "stage": sid, "ok": result is True or result == "pending",
+                try:
+                    result = self.run_stage(job, sdef)
+                except (BriefError, SpendGuardError):
+                    raise
+                except Exception as e:
+                    message = str(e)
+                    latest = self.db.latest(job_id, sid)
+                    if latest and latest["status"] == "running":
+                        self.db.update_run(latest["id"], status="failed", error=message, finished_at=now())
+                    self.log(job_id, sid, "error", message)
+                    return {"action": "stage", "stage": sid, "ok": False, "pending": False,
+                            "error": message, "status": self.settle(job_id)}
+                body = {"action": "stage", "stage": sid, "ok": result is True or result == "pending",
                         "pending": result == "pending", "status": self.settle(job_id)}
+                if result is False:
+                    latest = self.db.latest(job_id, sid)
+                    if latest and latest.get("error"):
+                        body["error"] = latest["error"]
+                return body
         finally:
             self.async_fal = False
         return {"action": "idle", "status": self.settle(job_id)}
@@ -448,8 +469,8 @@ class Runner:
                            actual_cost_usd=actual, attempts=falm.get("attempt") or run["attempts"],
                            finished_at=now(), review_status="pending" if sdef.get("review") else None)
         self.score_run(run["id"])
-        from .storage import publish_run
-        publish_run(self.db, run["id"], out_dir)
+        if not self._publish(run["id"], out_dir):
+            return False
         self.log(job["id"], run["stage"], "info", f"v{run['version']} fal {falm['request_id']} completed")
         return True
 
@@ -608,8 +629,8 @@ class Runner:
                                    review_status="pending" if sdef.get("review") else None)
                 self.log(job_id, sid, "info", f"v{ver} ok in {time.time()-t0:.1f}s, actual ${actual:.4f}, attempt {attempt}/{max_try}")
                 self.score_run(rid)
-                from .storage import publish_run
-                publish_run(self.db, rid, out_dir)
+                if not self._publish(rid, out_dir):
+                    return False
                 return True
             except FalPending as e:
                 meta = {"fal": {"request_id": e.request_id, "status_url": e.status_url,
@@ -713,8 +734,21 @@ class Runner:
         self.db.update_run(rid, status=READY, output_path=str(p), actual_cost_usd=0.0, cost_basis="local: $0",
                            attempts=1, finished_at=now())
         self.log(job["id"], "brief", "info", f"v{ver} resolved prompts saved")
+        if not self._publish(rid, out_dir):
+            return False
+        return True
+
+    def _publish(self, run_id, out_dir):
+        """Upload the stage directory. A Blob rejection fails this run instead of raising."""
         from .storage import publish_run
-        publish_run(self.db, rid, out_dir)
+        try:
+            publish_run(self.db, run_id, out_dir)
+        except Exception as e:
+            message = str(e)
+            self.db.update_run(run_id, status="failed", error=message, finished_at=now())
+            run = self.db.run(run_id)
+            self.log(run["job_id"] if run else "?", run["stage"] if run else None, "error", message)
+            return False
         return True
 
     def set_override(self, job_id, stage, params=None, model=None, price_key=None, prompt=None):

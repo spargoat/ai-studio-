@@ -1,7 +1,7 @@
 """JSON API for the React UI. Thin layer over Runner / DB / library / export / persona. Dry runs only from the UI."""
 import contextlib, hmac, io, json, os, threading, time
 from pathlib import Path
-from flask import Blueprint, abort, jsonify, request, send_file, send_from_directory
+from flask import Blueprint, abort, jsonify, request, send_file
 from . import library, persona as P
 from .config import key_status, load_template
 from .runner import BriefError, SpendGuardError
@@ -323,10 +323,8 @@ def register(app, cfg, runner, live, bg):
         return jsonify([{"name": z.name, "url": f"/file?p={z}", "size": z.stat().st_size,
                          "at": time.strftime("%Y-%m-%d %H:%M", time.localtime(z.stat().st_mtime))} for z in zs])
 
-    # ---------- SPA
-    @bp.get("/assets/<path:p>")
-    def assets(p):
-        return send_from_directory(UI_DIST / "assets", p)
+    # ---------- SPA. /assets is registered on the app so it stays available
+    # when the database gate returns before the blueprint.
 
     def spa(**_):
         if not (UI_DIST / "index.html").exists():

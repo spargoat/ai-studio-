@@ -29,7 +29,15 @@ class HTTP:
 
     def put(self, url, **kw):
         self.calls.append((url, kw))
-        return Resp({"url": "https://abc123.public.blob.vercel-storage.com/jobs/a.png"})
+        pathname = kw["params"]["pathname"]
+        return Resp({
+            "url": "https://abc123.public.blob.vercel-storage.com/" + pathname,
+            "downloadUrl": "https://abc123.public.blob.vercel-storage.com/" + pathname + "?download=1",
+            "pathname": pathname,
+            "contentType": kw["headers"]["x-content-type"],
+            "contentDisposition": "attachment; filename=\"still.png\"",
+            "etag": "\"abc\"",
+        })
 
     def get(self, url, timeout=None):
         self.calls.append(("GET", url))
@@ -48,19 +56,25 @@ class T(unittest.TestCase):
         self.assertFalse(storage.allowed_redirect("https://blob.vercel-storage.com.evil.example/x"))
 
     def test_blob_put_materialize_and_redirect(self):
-        os.environ["BLOB_READ_WRITE_TOKEN"] = "test-token"
+        os.environ["BLOB_READ_WRITE_TOKEN"] = "vercel_blob_rw_abc123_secret"
         os.environ["STUDIO_TMP"] = tempfile.mkdtemp()
         self.addCleanup(os.environ.pop, "BLOB_READ_WRITE_TOKEN", None)
         self.addCleanup(os.environ.pop, "STUDIO_TMP", None)
         http = HTTP()
         url = storage.put_file("jobs/j/still/v1/still.png", b"png", "image/png", session=http)
-        self.assertEqual(url, "https://abc123.public.blob.vercel-storage.com/jobs/a.png")
+        self.assertEqual(url, "https://abc123.public.blob.vercel-storage.com/jobs/j/still/v1/still.png")
         self.assertEqual(http.calls[0][1]["params"]["pathname"], "jobs/j/still/v1/still.png")
+        self.assertEqual(http.calls[0][1]["data"], b"png")
         self.assertEqual(http.calls[0][0], storage.BLOB_PUT)
         headers = http.calls[0][1]["headers"]
-        self.assertEqual(headers["authorization"], "Bearer test-token")
-        self.assertEqual(headers["x-api-version"], "7")
-        self.assertNotIn("test-token", url)
+        self.assertEqual(headers["authorization"], "Bearer vercel_blob_rw_abc123_secret")
+        self.assertEqual(headers["x-api-version"], "13")
+        self.assertEqual(headers["x-vercel-blob-store-id"], "abc123")
+        self.assertEqual(headers["x-vercel-blob-access"], "public")
+        self.assertEqual(headers["x-content-type"], "image/png")
+        self.assertEqual(headers["x-add-random-suffix"], "0")
+        self.assertEqual(headers["x-allow-overwrite"], "1")
+        self.assertNotIn("secret", url)
         self.assertTrue(storage.allowed_redirect(url))
         self.assertTrue(storage.allowed_redirect("https://blob.vercel-storage.com/jobs/a.png"))
         self.assertFalse(storage.allowed_redirect("https://evil.example/still.png"))
@@ -73,6 +87,39 @@ class T(unittest.TestCase):
         mapping = storage.publish_tree("jobs/j/brief/v1", tree, session=http)
         self.assertEqual(len(mapping), 1)
         self.assertTrue(next(iter(mapping.values())).startswith("https://"))
+
+    def test_blob_error_includes_response_body(self):
+        os.environ["BLOB_READ_WRITE_TOKEN"] = "vercel_blob_rw_abc123_secret"
+        self.addCleanup(os.environ.pop, "BLOB_READ_WRITE_TOKEN", None)
+        payload = '{"error":{"code":"bad_request","message":"Invalid pathname"}}'
+
+        class Bad:
+            status_code = 400
+            text = payload
+            content = payload.encode()
+
+            def raise_for_status(self):
+                import requests
+                raise requests.HTTPError("400 Client Error: Bad Request")
+
+            def json(self):
+                raise AssertionError("error responses are not parsed as success")
+
+        class HTTPBad:
+            def put(self, url, **kw):
+                self.url, self.kw = url, kw
+                return Bad()
+
+        http = HTTPBad()
+        with self.assertRaises(storage.BlobError) as caught:
+            storage.put_file("jobs/j-1020/brief/v1/brief.json", b"{}", "application/json", session=http)
+        self.assertIn("400", str(caught.exception))
+        self.assertIn("bad_request", str(caught.exception))
+        self.assertIn("Invalid pathname", str(caught.exception))
+        self.assertEqual(http.url, storage.BLOB_PUT)
+        self.assertEqual(http.kw["params"]["pathname"], "jobs/j-1020/brief/v1/brief.json")
+        self.assertEqual(http.kw["headers"]["x-api-version"], "13")
+        self.assertEqual(http.kw["headers"]["x-allow-overwrite"], "1")
 
     def test_libsql_connection_fallback(self):
         """Turso URL uses libSQL; with the env unset, DB stays on local SQLite."""

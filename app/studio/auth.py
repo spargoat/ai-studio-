@@ -63,7 +63,7 @@ def init(app):
     @app.before_request
     def gate():
         c = config()
-        if not c["required"] or request.path in PUBLIC:
+        if not c["required"] or request.path in PUBLIC or request.path.startswith("/assets/"):
             return None
         if not c["configured"]:
             return ("Sign-in is not configured.", 503)

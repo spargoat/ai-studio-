@@ -3,7 +3,7 @@ The original server-rendered review pages stay at /classic and /job/<id>."""
 import json
 import threading
 from pathlib import Path
-from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, url_for
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, send_from_directory, url_for
 from .runner import Runner
 
 PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
@@ -75,7 +75,7 @@ def create_app(cfg, live=False):
     @app.before_request
     def database_required():
         from .db import missing_on_vercel
-        if request.path == "/healthz" or not missing_on_vercel():
+        if request.path == "/healthz" or request.path.startswith("/assets/") or not missing_on_vercel():
             return None
         msg = "Database not configured"
         if request.path.startswith("/api/"):
@@ -84,6 +84,13 @@ def create_app(cfg, live=False):
 
     from .auth import init as auth_init
     auth_init(app)                                   # shared-password sign-in (no-op unless configured/required)
+    from .api import UI_DIST
+
+    @app.get("/assets/<path:name>")
+    def ui_assets(name):
+        """Hashed Vite files. Also published from public/assets; this is the function fallback."""
+        return send_from_directory(UI_DIST / "assets", name)
+
     from .db import missing_on_vercel
     if missing_on_vercel():
         return app                                   # no Runner, so nothing opens /tmp SQLite or writes
