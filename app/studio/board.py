@@ -405,6 +405,57 @@ def preview_pack(config=None):
             "feed": feed, "breakdown": breakdown, "funnel": funnel, "teardown": teardown, "timeline": timeline}
 
 
+# Slice-1 stacked the two lenses on top of each other because only one showed at a time.
+# v3 shows Intel and Create together, so the preset sits in two columns.
+_SLICE1_POSITIONS = {
+    "timeline": (0, 0), "ad_feed": (380, 0), "ad_breakdown": (380, 280), "funnel": (680, 280),
+    "teardown": (380, 560), "brief": (0, 24), "script": (290, 24), "voice": (580, 24), "video": (870, 24),
+}
+# First v3 pass stacked the cards on top of each other. This draft is migrated forward too.
+_V3_DRAFT_POSITIONS = {
+    "timeline": (36, 28), "ad_feed": (36, 330), "funnel": (36, 560),
+    "ad_breakdown": (36, 800), "teardown": (300, 800),
+    "brief": (760, 40), "script": (760, 300), "voice": (1020, 40), "video": (1020, 320),
+}
+_V3_POSITIONS = {
+    "timeline": {"x": 24, "y": 20}, "ad_feed": {"x": 24, "y": 420}, "funnel": {"x": 24, "y": 780},
+    "ad_breakdown": {"x": 24, "y": 1050}, "teardown": {"x": 292, "y": 1050},
+    "brief": {"x": 620, "y": 20}, "script": {"x": 620, "y": 220},
+    "voice": {"x": 880, "y": 20}, "video": {"x": 880, "y": 230},
+}
+
+
+def migrate_talking_head_layout(graph):
+    """Shift an untouched slice-1 preset into the v3 columns.
+
+    Returns a new graph, or None when any preset node was already moved or is missing.
+    Edges, config and any extra nodes stay as they are.
+    """
+    nodes = (graph or {}).get("nodes") or []
+    by_id = {n.get("id"): n for n in nodes}
+
+    def matches(layout):
+        if not set(layout) <= set(by_id):
+            return False
+        for nid, (x, y) in layout.items():
+            pos = by_id[nid].get("position") or {}
+            try:
+                same = float(pos.get("x")) == float(x) and float(pos.get("y")) == float(y)
+            except (TypeError, ValueError):
+                return False
+            if not same:
+                return False
+        return True
+
+    if not any(matches(layout) for layout in (_SLICE1_POSITIONS, _V3_DRAFT_POSITIONS)):
+        return None
+    moved = copy.deepcopy(graph)
+    for node in moved["nodes"]:
+        if node.get("id") in _V3_POSITIONS:
+            node["position"] = dict(_V3_POSITIONS[node["id"]])
+    return moved
+
+
 def talking_head_preset():
     """Slice-1 board. Create stages take their prompts, params and review gates from the YAML templates."""
     return {
@@ -417,18 +468,18 @@ def talking_head_preset():
             "script": "Decide the stop before you size the trade. If you can't say where you're wrong, leave it.",
         },
         "nodes": [
-            {"id": "timeline", "type": "market_timeline", "position": {"x": 0, "y": 0}, "enabled": True,
+            {"id": "timeline", "type": "market_timeline", "position": dict(_V3_POSITIONS["timeline"]), "enabled": True,
              "config": {"event_id": "ev_launch_northline", "ad_id": "rec_4c91e2"}},
-            {"id": "ad_feed", "type": "ad_feed", "position": {"x": 380, "y": 0}, "enabled": True,
+            {"id": "ad_feed", "type": "ad_feed", "position": dict(_V3_POSITIONS["ad_feed"]), "enabled": True,
              "config": {"advertiser": "Northline Markets", "status": "live", "date_from": "2026-07-01",
                         "date_to": "2026-10-18", "longevity_min": "30", "ad_id": "rec_4c91e2"}},
-            {"id": "ad_breakdown", "type": "ad_breakdown", "position": {"x": 380, "y": 280}, "enabled": True, "config": {}},
-            {"id": "funnel", "type": "funnel_route", "position": {"x": 680, "y": 280}, "enabled": True, "config": {}},
-            {"id": "teardown", "type": "teardown", "position": {"x": 380, "y": 560}, "enabled": True, "config": {}},
-            {"id": "brief", "type": "brief", "position": {"x": 0, "y": 24}, "enabled": True, "config": {}},
-            {"id": "script", "type": "script", "position": {"x": 290, "y": 24}, "enabled": True, "config": {"framework": "PAS"}},
-            {"id": "voice", "type": "voice", "position": {"x": 580, "y": 24}, "enabled": True, "config": {}},
-            {"id": "video", "type": "video", "position": {"x": 870, "y": 24}, "enabled": True, "config": {}},
+            {"id": "ad_breakdown", "type": "ad_breakdown", "position": dict(_V3_POSITIONS["ad_breakdown"]), "enabled": True, "config": {}},
+            {"id": "funnel", "type": "funnel_route", "position": dict(_V3_POSITIONS["funnel"]), "enabled": True, "config": {}},
+            {"id": "teardown", "type": "teardown", "position": dict(_V3_POSITIONS["teardown"]), "enabled": True, "config": {}},
+            {"id": "brief", "type": "brief", "position": dict(_V3_POSITIONS["brief"]), "enabled": True, "config": {}},
+            {"id": "script", "type": "script", "position": dict(_V3_POSITIONS["script"]), "enabled": True, "config": {"framework": "PAS"}},
+            {"id": "voice", "type": "voice", "position": dict(_V3_POSITIONS["voice"]), "enabled": True, "config": {}},
+            {"id": "video", "type": "video", "position": dict(_V3_POSITIONS["video"]), "enabled": True, "config": {}},
         ],
         "edges": [
             {"id": "e-feed-breakdown", "source": "ad_feed", "sourceHandle": "ad", "target": "ad_breakdown", "targetHandle": "ad"},
@@ -444,5 +495,10 @@ def talking_head_preset():
 
 
 def ensure_presets(db):
-    if not db.board("talking_head"):
+    row = db.board("talking_head")
+    if not row:
         db.save_board("talking_head", "Talking head", talking_head_preset(), preset=True)
+        return
+    migrated = migrate_talking_head_layout(row.get("graph") or {})
+    if migrated:
+        db.save_board("talking_head", row.get("name") or "Talking head", migrated, preset=True)

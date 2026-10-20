@@ -1,7 +1,6 @@
-import { createContext, useContext } from "react";
+import { createContext, useContext, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
-import { Badge } from "../components/ui";
 import { CATALOG, LONGEVITY_NOTE, PORT_COLOR, REFERENCE_LABEL, type NodeSpec } from "./catalog";
 
 export type Artefact = {
@@ -11,7 +10,7 @@ export type Artefact = {
   interpretation?: string;
   decode?: string;
   emitted_ad_id?: string;
-  ad?: { id?: string; headline?: string; advertiser?: string; status?: string };
+  ad?: { id?: string; headline?: string; advertiser?: string; status?: string; longevity_days?: number };
   page?: { url?: string; title?: string };
   evidence?: {
     source?: string;
@@ -21,7 +20,7 @@ export type Artefact = {
     label?: string;
     fields?: Record<string, unknown>;
   };
-  inference?: { note?: string; longevity_note?: string };
+  inference?: { note?: string; longevity_note?: string; match_count?: number };
 };
 
 export type BoardData = {
@@ -42,68 +41,44 @@ export const BoardCtx = createContext<{
   toggle: (id: string) => void;
   follow: (id: string) => void;
   pickEvent: (id: string, event: { id: string; ad_id?: string }) => void;
-}>({ keys: {}, toggle: () => {}, follow: () => {}, pickEvent: () => {} });
-
-const STATUS_VARIANT: Record<string, "default" | "info" | "warning" | "success" | "danger"> = {
-  idle: "default", waiting: "info", running: "warning", "needs review": "warning",
-  done: "success", failed: "danger", blocked: "danger",
-};
+  wired: Set<string>;
+  persona: string;
+}>({ keys: {}, toggle: () => {}, follow: () => {}, pickEvent: () => {}, wired: new Set(), persona: "" });
 
 function money(n: number) {
   return `$${n.toFixed(2)}`;
 }
 
-function Origin({ evidence }: { evidence?: Artefact["evidence"] }) {
-  if (!evidence) return <p className="text-[10px] text-zinc-500">No read yet.</p>;
-  const fixture = evidence.origin !== "live";
+function statusClass(status: string) {
+  if (status === "done") return "ok";
+  if (status === "needs review" || status === "running") return "rv";
+  if (status === "failed" || status === "blocked") return "bad";
+  return "q";
+}
+
+function shortDate(iso: string) {
+  const d = new Date(`${iso}T00:00:00Z`);
+  if (Number.isNaN(d.getTime())) return iso.slice(5);
+  return d.toLocaleDateString("en-GB", { day: "numeric", month: "short", timeZone: "UTC" });
+}
+
+function EvidenceBox({ evidence, children }: { evidence?: Artefact["evidence"]; children?: ReactNode }) {
   return (
-    <div>
-      <p className={`text-[10px] font-semibold ${fixture ? "text-amber-300" : "text-emerald-300"}`}>
-        {fixture ? "Fixture · not a live read" : "Live tracker"}
-        {evidence.data_as_of ? ` · data as of ${evidence.data_as_of}` : ""}
-      </p>
-      <p className="text-[10px] text-zinc-500">{evidence.source}</p>
+    <div className="v3-ev">
+      <div className="v3-ev-l">Evidence</div>
+      {evidence ? (
+        <p className="v3-copy">{evidence.origin === "live" ? "Live tracker" : "Fixture · not a live read"} · {evidence.source || "—"}{evidence.data_as_of ? ` · ${evidence.data_as_of}` : ""}</p>
+      ) : <p className="v3-muted">No read yet.</p>}
+      {children}
     </div>
   );
 }
 
-function Split({ artefact, nodeType, nodeId, selectedEvent }: { artefact?: Artefact | null; nodeType: string; nodeId: string; selectedEvent?: string }) {
-  const evidence = artefact?.evidence;
-  const fields = evidence?.fields || {};
-  const picked = (fields.picked as { headline?: string; advertiser?: string } | undefined) || artefact?.ad;
-  const steps = (fields.steps as { label?: string }[] | undefined) || [];
+function InferenceBox({ note }: { note?: string }) {
   return (
-    <div className="px-2.5 py-2 space-y-2">
-      <div>
-        <div className="text-[9px] font-bold tracking-wider text-teal-300/90">Evidence</div>
-        <Origin evidence={evidence} />
-        {picked?.headline && <p className="text-[11px] text-zinc-200 mt-1">{picked.advertiser ? `${picked.advertiser}: ` : ""}{picked.headline}</p>}
-        {nodeType === "funnel_route" && steps.length > 0 && (
-          <p className="text-[10px] text-zinc-400 mt-1">{steps.map((s) => s.label).filter(Boolean).join(" → ")}</p>
-        )}
-        {nodeType === "market_timeline" && <TimelineChart nodeId={nodeId} artefact={artefact} selectedId={selectedEvent} />}
-        {nodeType === "market_timeline" && !!fields.emitted_event && (
-          <p className="text-[10px] text-zinc-200">
-            <span className="text-zinc-500">Event. </span>
-            {String((fields.emitted_event as { label?: string }).label || "marker")}
-          </p>
-        )}
-      </div>
-      <div className="border-t border-dashed border-zinc-700 pt-1.5">
-        <div className="text-[9px] font-bold tracking-wider text-amber-300/90">Inference</div>
-        <p className="text-[10px] text-zinc-400 leading-snug">{artefact?.inference?.note || "Nothing inferred yet."}</p>
-        {nodeType === "ad_breakdown" && (
-          <p className="text-[10px] text-amber-200/90 mt-1">{artefact?.inference?.longevity_note || LONGEVITY_NOTE}</p>
-        )}
-      </div>
-      {nodeType === "teardown" && (
-        <div className="space-y-1">
-          {artefact?.pattern_summary && <p className="text-[10px] text-zinc-300"><span className="text-zinc-500">Pattern. </span>{artefact.pattern_summary}</p>}
-          {artefact?.interpretation && <p className="text-[10px] text-zinc-300"><span className="text-zinc-500">Ours. </span>{artefact.interpretation}</p>}
-          {artefact?.decode && <p className="text-[10px] text-zinc-500"><span className="text-zinc-600">Decode. </span>{artefact.decode}</p>}
-          <p className="text-[10px] leading-snug text-amber-200 border border-amber-500/30 bg-amber-500/10 rounded px-1.5 py-1">{REFERENCE_LABEL}</p>
-        </div>
-      )}
+    <div className="v3-inf">
+      <div className="v3-inf-l">Inference</div>
+      <p className="v3-copy v3-clamp">{note || "Nothing inferred yet."}</p>
     </div>
   );
 }
@@ -114,8 +89,9 @@ function TimelineChart({ nodeId, artefact, selectedId }: { nodeId: string; artef
   const points = (fields.points as { date: string; reach: number; live_ads: number }[] | undefined) || [];
   const events = (fields.events as { id: string; date: string; kind: string; label: string; ad_id?: string }[] | undefined) || [];
   const selected = selectedId || (fields.emitted_event as { id?: string } | undefined)?.id;
-  if (!points.length) return <p className="text-[10px] text-zinc-500 mt-1">No series in this read.</p>;
-  const w = 308, h = 128, pad = 18;
+  const selectedEvent = events.find((ev) => ev.id === selected);
+  if (!points.length) return <p className="v3-muted">No series in this read.</p>;
+  const w = 400, h = 96, padT = 14, padB = 14;
   const maxR = Math.max(...points.map((p) => Number(p.reach) || 0), 1);
   const maxL = Math.max(...points.map((p) => Number(p.live_ads) || 0), 1);
   const t0 = Date.parse(points[0].date);
@@ -123,55 +99,160 @@ function TimelineChart({ nodeId, artefact, selectedId }: { nodeId: string; artef
   const xOf = (date: string) => {
     const t = Date.parse(date);
     const u = t1 === t0 ? 0 : (t - t0) / (t1 - t0);
-    return pad + Math.min(1, Math.max(0, u)) * (w - pad * 2);
+    return 8 + Math.min(1, Math.max(0, u)) * (w - 16);
   };
-  const yR = (v: number) => h - pad - (v / maxR) * (h - pad * 2);
-  const yL = (v: number) => h - pad - (v / maxL) * (h - pad * 2);
+  const yR = (v: number) => padT + (1 - v / maxR) * (h - padT - padB - 6);
+  const yL = (v: number) => padT + (1 - v / maxL) * (h - padT - padB - 6);
+  const base = h - padB;
   const line = (ys: (p: { date: string; reach: number; live_ads: number }) => number) =>
-    points.map((p, i) => `${i ? "L" : "M"}${xOf(p.date).toFixed(1)},${ys(p).toFixed(1)}`).join(" ");
+    points.map((p, i) => `${i ? "L" : "M"}${xOf(p.date).toFixed(1)} ${ys(p).toFixed(1)}`).join(" ");
+  const reach = line((p) => yR(Number(p.reach) || 0));
+  const x0 = xOf(points[0].date);
+  const xN = xOf(points[points.length - 1].date);
+  const area = `${reach} L${xN.toFixed(1)} ${base} L${x0.toFixed(1)} ${base} Z`;
+  const gid = `reach-${nodeId.replace(/[^a-z0-9]/gi, "")}`;
+  const ticks = [points[0], points[Math.floor(points.length / 2)], points[points.length - 1]];
   return (
-    <svg viewBox={`0 0 ${w} ${h}`} className="mt-1 w-full" role="img" aria-label="Reach and live ads">
-      <text x={pad} y={11} fill="#5eead4" fontSize="8">Reach</text>
-      <text x={w - pad} y={11} textAnchor="end" fill="#fbbf24" fontSize="8">Live ads</text>
-      <path d={line((p) => yR(Number(p.reach) || 0))} fill="none" stroke="#2dd4bf" strokeWidth="1.6" />
-      <path d={line((p) => yL(Number(p.live_ads) || 0))} fill="none" stroke="#fbbf24" strokeWidth="1.6" strokeDasharray="3 2" />
-      {events.map((ev) => {
-        const on = ev.id === selected;
-        const x = xOf(ev.date);
-        const removed = ev.kind === "removed";
-        const stroke = removed ? "#fbbf24" : "#5eead4";
-        return (
-          <g key={ev.id}>
-            <line x1={x} y1={pad + 4} x2={x} y2={h - 16} stroke={stroke} strokeOpacity={on ? 0.85 : 0.35} strokeWidth="1" />
-            <circle
-              cx={x} cy={h - 10} r={on ? 6 : 4.5}
-              fill={on ? stroke : "#09090b"} stroke={stroke} strokeWidth="1.6"
-              className="nodrag nopan cursor-pointer"
-              role="button"
-              tabIndex={0}
-              aria-label={`${ev.label}. Emits this ad.`}
-              onClick={(e) => { e.stopPropagation(); pickEvent(nodeId, ev); }}
-              onKeyDown={(e) => { if (e.key === "Enter") { e.stopPropagation(); pickEvent(nodeId, ev); } }}
-            />
-          </g>
-        );
-      })}
-    </svg>
+    <div>
+      <div className="v3-leg">
+        <span className="v3-lg"><i style={{ background: "#5ab0ff" }} />Reach</span>
+        <span className="v3-lg"><i style={{ background: "#c9a0ff" }} />Live ads</span>
+      </div>
+      <svg viewBox={`0 0 ${w} ${h}`} className="v3-chart" role="img" aria-label="Reach and live ads">
+        <defs>
+          <linearGradient id={gid} x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stopColor="#5ab0ff" stopOpacity="0.28" />
+            <stop offset="1" stopColor="#5ab0ff" stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        {[0.25, 0.5, 0.75].map((g) => (
+          <line key={g} x1="0" x2={w} y1={padT + g * (base - padT)} y2={padT + g * (base - padT)} stroke="#ffffff0a" />
+        ))}
+        <path d={area} fill={`url(#${gid})`} />
+        <path d={reach} fill="none" stroke="#5ab0ff" strokeWidth="1.5" />
+        <path d={line((p) => yL(Number(p.live_ads) || 0))} fill="none" stroke="#c9a0ff" strokeWidth="1.5" />
+        {events.map((ev) => {
+          const on = ev.id === selected;
+          const x = xOf(ev.date);
+          const y = 10;
+          return (
+            <g key={ev.id} className="nodrag nopan">
+              <line x1={x} y1={y + 6} x2={x} y2={base} stroke={on ? "#7c6cff" : "#ffffff26"} strokeDasharray="2 3" />
+              <rect x={x - 4} y={y - 4} width="8" height="8" transform={`rotate(45 ${x} ${y})`}
+                fill={on ? "#7c6cff" : "#2e2e35"} stroke={on ? "#c4bbff" : "#55555f"} className="v3-diamond" />
+              {on && <circle cx={x} cy={y} r="9" fill="none" stroke="#7c6cff" strokeOpacity="0.5" />}
+              <circle cx={x} cy={y} r="8" fill="transparent" className="nodrag nopan v3-hit" role="button" tabIndex={0}
+                aria-label={`${ev.label}. Emits this ad.`}
+                onClick={(e) => { e.stopPropagation(); pickEvent(nodeId, ev); }}
+                onKeyDown={(e) => { if (e.key === "Enter") { e.stopPropagation(); pickEvent(nodeId, ev); } }} />
+            </g>
+          );
+        })}
+        {ticks.map((p) => (
+          <text key={p.date} className="v3-ax" x={xOf(p.date)} y={h - 2} textAnchor="middle">{shortDate(p.date)}</text>
+        ))}
+      </svg>
+      {selectedEvent && <p className="v3-callout">{selectedEvent.label}{selectedEvent.date ? ` · ${shortDate(selectedEvent.date)}` : ""}</p>}
+    </div>
   );
 }
 
-function Handles({ spec }: { spec: NodeSpec }) {
+function FunnelSteps({ steps }: { steps: { label?: string }[] }) {
+  const shown = steps.filter((s) => s.label).slice(0, 5);
+  if (!shown.length) return null;
+  return (
+    <div className="v3-fm">
+      {shown.map((s, i) => (
+        <div key={`${s.label}-${i}`} style={{ display: "contents" }}>
+          {i > 0 && <span className="v3-fma" />}
+          <div className="v3-fmn"><small>{s.label}</small></div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
+  artefact?: Artefact | null; nodeType: string; nodeId: string; selectedEvent?: string; config: Record<string, string>;
+}) {
+  const evidence = artefact?.evidence;
+  const fields = evidence?.fields || {};
+  const picked = (fields.picked as { headline?: string; advertiser?: string; longevity_days?: number } | undefined) || artefact?.ad;
+  const steps = (fields.steps as { label?: string }[] | undefined) || [];
+  const ads = (fields.ads as { headline?: string; longevity_days?: number; id?: string }[] | undefined) || [];
+  if (nodeType === "market_timeline") {
+    return (
+      <div className="v3-bd">
+        <TimelineChart nodeId={nodeId} artefact={artefact} selectedId={selectedEvent} />
+        <EvidenceBox evidence={evidence} />
+        <InferenceBox note={artefact?.inference?.note} />
+      </div>
+    );
+  }
+  return (
+    <div className="v3-bd">
+      {nodeType === "ad_feed" && (
+        <>
+          <div className="v3-chips">
+            {config.status && <span className="v3-chip">{config.status}</span>}
+            {config.longevity_min && <span className="v3-chip">≥ {config.longevity_min}d</span>}
+            {config.advertiser && <span className="v3-chip">{config.advertiser}</span>}
+          </div>
+          {ads.length > 0 && (
+            <div className="v3-thumbs">
+              {ads.slice(0, 4).map((ad) => (
+                <div key={ad.id || ad.headline} className={`v3-thumb ${ad.id && ad.id === config.ad_id ? "is-sel" : ""}`}>
+                  <span>{ad.longevity_days != null ? `${ad.longevity_days}d` : "ad"}</span>
+                </div>
+              ))}
+            </div>
+          )}
+        </>
+      )}
+      {nodeType === "funnel_route" && <FunnelSteps steps={steps} />}
+      {nodeType === "teardown" && <p className="v3-warn">{REFERENCE_LABEL}</p>}
+      {nodeType === "teardown" && artefact?.pattern_summary && <p className="v3-copy v3-clamp">{artefact.pattern_summary}</p>}
+      <EvidenceBox evidence={evidence}>
+        {picked?.headline && <p className="v3-copy">{picked.advertiser ? `${picked.advertiser}: ` : ""}{picked.headline}</p>}
+      </EvidenceBox>
+      <InferenceBox note={artefact?.inference?.note} />
+      {nodeType === "ad_breakdown" && <p className="v3-warn">{artefact?.inference?.longevity_note || LONGEVITY_NOTE}</p>}
+      {nodeType === "teardown" && artefact?.decode && <p className="v3-muted v3-clamp">{artefact.decode}</p>}
+    </div>
+  );
+}
+
+function CreateBody({ nodeType, persona }: { nodeType: string; persona: string }) {
+  return (
+    <div className="v3-bd">
+      {nodeType === "brief" && (
+        <>
+          <span className="v3-pchip"><span className="v3-av" />{persona || "Persona"}</span>
+          <p className="v3-copy">Wraps the brief stage. Pattern summary stays above the decode.</p>
+        </>
+      )}
+      {nodeType === "script" && <p className="v3-copy">Wraps the script stage. Dry run writes [MOCK] copy.</p>}
+      {nodeType === "voice" && <p className="v3-copy">Wraps the voice stage. Dry run is silent audio, $0.</p>}
+      {nodeType === "video" && <p className="v3-copy">Wraps the video stage. Dry run is a placeholder, $0.</p>}
+    </div>
+  );
+}
+
+function Handles({ spec, id }: { spec: NodeSpec; id: string }) {
+  const { wired } = useContext(BoardCtx);
   const spot = (i: number, n: number) => `${((i + 1) / (n + 1)) * 100}%`;
   return (
     <>
       {spec.inputs.map((p, i) => (
         <Handle key={`in-${p.id}`} type="target" position={Position.Left} id={p.id}
-          style={{ top: spot(i, spec.inputs.length), background: PORT_COLOR[p.type] || "#a1a1aa" }}
+          className={wired.has(`${id}:in:${p.id}`) ? "connected" : ""}
+          style={{ top: spot(i, spec.inputs.length), ["--c" as string]: PORT_COLOR[p.type] || "#555" }}
           title={`${p.id} · ${p.type}`} />
       ))}
       {spec.outputs.map((p, i) => (
         <Handle key={`out-${p.id}`} type="source" position={Position.Right} id={p.id}
-          style={{ top: spot(i, spec.outputs.length), background: PORT_COLOR[p.type] || "#a1a1aa" }}
+          className={wired.has(`${id}:out:${p.id}`) ? "connected" : ""}
+          style={{ top: spot(i, spec.outputs.length), ["--c" as string]: PORT_COLOR[p.type] || "#555" }}
           title={`${p.id} · ${p.type}`} />
       ))}
     </>
@@ -179,53 +260,48 @@ function Handles({ spec }: { spec: NodeSpec }) {
 }
 
 export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "board">>) {
-  const { keys, toggle } = useContext(BoardCtx);
+  const { keys, toggle, persona } = useContext(BoardCtx);
   const spec = CATALOG[data.nodeType];
   if (!spec) return null;
   const Icon = spec.icon;
   const intel = spec.side === "intel";
   const status = data.status || "idle";
   const cost = data.ran && data.actual != null ? money(data.actual) : money(data.est ?? 0);
-  const costTitle = data.ran ? `actual ${money(data.actual ?? 0)}` : `estimate ${money(data.est ?? 0)}`;
-  const preview = data.preview;
+  const live = data.preview?.evidence?.origin === "live";
+  const count = data.preview?.inference?.match_count;
   return (
     <article data-node={data.nodeType} style={{ width: spec.width }}
-      className={`rounded-xl border bg-zinc-950/95 shadow-lg ${selected ? "ring-2 ring-offset-0" : ""} ${
-        intel ? "border-teal-700/80 ring-teal-400" : "border-violet-700/80 ring-violet-400"} ${data.enabled ? "" : "opacity-60"}`}>
-      <div className="overflow-hidden rounded-[11px]">
-      <header className={`flex items-center gap-2 px-2.5 py-2 border-b ${intel ? "bg-teal-950/50 border-teal-900/60" : "bg-violet-950/40 border-violet-900/60"}`}>
-        <span className={`shrink-0 w-8 h-8 rounded-lg flex items-center justify-center ${intel ? "bg-teal-500/15 text-teal-300" : "bg-violet-500/15 text-violet-300"}`}>
-          <Icon size={16} aria-hidden />
-        </span>
-        <h3 className="text-xs font-semibold text-zinc-100 truncate">{spec.headline}</h3>
-        <button type="button" role="switch" aria-checked={data.enabled} aria-label={`${data.enabled ? "Disable" : "Enable"} ${spec.headline}`}
-          className={`nodrag nopan ml-auto shrink-0 w-8 h-4 rounded-full relative ${data.enabled ? (intel ? "bg-teal-500" : "bg-violet-500") : "bg-zinc-700"}`}
-          onClick={(e) => { e.stopPropagation(); toggle(id); }}>
-          <span className={`absolute top-0.5 w-3 h-3 rounded-full bg-white transition-all ${data.enabled ? "left-4" : "left-0.5"}`} />
-        </button>
-      </header>
-      <div className="flex flex-wrap gap-1 px-2.5 py-1.5">
-        <Badge size="sm" variant={STATUS_VARIANT[status] || "default"} dot>{status}</Badge>
-        <Badge size="sm" variant="info">dry</Badge>
-        <Badge size="sm" variant="default" title={costTitle}>{data.ran ? cost : `est ${cost}`}</Badge>
+      className={`v3-node ${selected ? "is-sel" : ""} ${data.enabled ? "" : "is-off"}`}>
+      <div className="v3-node-clip">
+        <header className="v3-h">
+          <span className={`v3-ic ${intel ? "in" : "cr"}`}><Icon size={14} aria-hidden /></span>
+          <h3 className="v3-title">{spec.headline}</h3>
+          <span className="v3-hm">
+            {data.nodeType === "market_timeline" && <span className={live ? "v3-live" : "v3-fix"}>{live ? "LIVE" : "FIXTURE"}</span>}
+            {data.nodeType === "ad_feed" && count != null && <span className="v3-mono">{count}</span>}
+            {data.nodeType !== "market_timeline" && <span className="v3-mono">$0</span>}
+            {data.nodeType === "market_timeline" && <span className="v3-mono">· $0</span>}
+          </span>
+          <button type="button" role="switch" aria-checked={data.enabled} aria-label={`${data.enabled ? "Disable" : "Enable"} ${spec.headline}`}
+            className={`nodrag nopan v3-tg ${data.enabled ? "" : "is-off"}`}
+            onClick={(e) => { e.stopPropagation(); toggle(id); }}>
+            <i />
+          </button>
+        </header>
+        {spec.needsKey && !keys[spec.needsKey] && (
+          <div className="v3-nk-row">
+            <Link to="/settings#connections" className="nodrag nopan v3-nk">Needs key → Settings</Link>
+          </div>
+        )}
+        {intel
+          ? <IntelBody artefact={data.preview} nodeType={data.nodeType} nodeId={id} selectedEvent={data.config.event_id} config={data.config} />
+          : <CreateBody nodeType={data.nodeType} persona={persona} />}
+        <footer className="v3-ft">
+          <span className={`v3-st ${statusClass(status)}`}>{status}</span>
+          <span className="v3-cost v3-mono" title={data.ran ? `actual ${cost}` : `estimate ${cost}`}>{data.ran ? cost : cost}</span>
+        </footer>
       </div>
-      {spec.needsKey && !keys[spec.needsKey] && (
-        <div className="px-2.5 pb-1">
-          <Link to="/settings#connections" className="nodrag nopan inline-flex text-[10px] font-medium text-amber-200 border border-amber-500/40 bg-amber-500/10 rounded-full px-2 py-0.5">
-            Needs key → Settings
-          </Link>
-        </div>
-      )}
-      {intel ? <Split artefact={preview} nodeType={data.nodeType} nodeId={id} selectedEvent={data.config.event_id} /> : (
-        <p className="px-2.5 pb-2 text-[10px] text-zinc-500">
-          {data.nodeType === "script" && "Wraps the script stage. Dry run writes [MOCK] copy."}
-          {data.nodeType === "voice" && "Wraps the voice stage. Dry run is silent audio, $0."}
-          {data.nodeType === "video" && "Wraps the video stage. Dry run is a placeholder, $0."}
-          {data.nodeType === "brief" && "Wraps the brief stage. Pattern summary stays above the decode."}
-        </p>
-      )}
-      </div>
-      <Handles spec={spec} />
+      <Handles spec={spec} id={id} />
     </article>
   );
 }
@@ -237,14 +313,11 @@ export function StubNode({ data }: NodeProps<Node<StubData, "stub">>) {
   const Icon = spec.icon;
   const intel = spec.side === "intel";
   return (
-    <button type="button" data-stub={data.followId} onClick={() => follow(data.followId)}
-      className={`nodrag nopan w-44 text-left rounded-xl border border-dashed px-2.5 py-2 flex items-center gap-2 bg-zinc-950/90 ${intel ? "border-teal-600" : "border-violet-500"}`}>
-      <span className={`shrink-0 w-8 h-8 rounded-lg flex items-center justify-center ${intel ? "bg-teal-500/15 text-teal-300" : "bg-violet-500/15 text-violet-300"}`}>
-        <Icon size={16} aria-hidden />
-      </span>
+    <button type="button" data-stub={data.followId} onClick={() => follow(data.followId)} className="nodrag nopan v3-stub">
+      <span className={`v3-ic ${intel ? "in" : "cr"}`}><Icon size={14} aria-hidden /></span>
       <span>
-        <span className="block text-[9px] uppercase tracking-wider text-zinc-500">{spec.side} · follow</span>
-        <span className="block text-xs font-semibold text-zinc-100">{spec.headline}</span>
+        <span className="v3-stub-k">{spec.side} · follow</span>
+        <span className="v3-title">{spec.headline}</span>
       </span>
     </button>
   );

@@ -7,7 +7,8 @@ import { Menu, X } from "lucide-react";
 
 export default function MainLayout() {
   const { sidebarOpen, setSidebarOpen, toggleSidebar } = useUIStore();
-  const board = useLocation().pathname.startsWith("/board");
+  const path = useLocation().pathname;
+  const full = path.startsWith("/board") || path.startsWith("/settings");
   return (
     <div className="h-screen w-screen flex relative">
       <ToastContainer />
@@ -20,7 +21,7 @@ export default function MainLayout() {
         <Sidebar onNavigate={() => setSidebarOpen(false)} />
       </div>
       <div className="flex-1 flex flex-col overflow-hidden min-w-0">
-        {board ? <div className="flex-1 min-h-0"><Outlet /></div> : (
+        {full ? <div className="flex-1 min-h-0"><Outlet /></div> : (
           <div className="flex-1 overflow-y-auto px-4 pt-14 pb-10 md:px-8 md:pt-6"><div className="max-w-6xl mx-auto"><Outlet /></div></div>
         )}
       </div>

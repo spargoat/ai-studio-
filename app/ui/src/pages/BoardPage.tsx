@@ -1,28 +1,33 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  ReactFlow, ReactFlowProvider, Background, Controls, MiniMap, applyNodeChanges, applyEdgeChanges,
+  ReactFlow, ReactFlowProvider, Background, Controls, ViewportPortal, applyNodeChanges, applyEdgeChanges,
   useReactFlow, type Connection, type Edge, type Node, type NodeChange, type EdgeChange, type OnConnect, type FinalConnectionState,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Play, Plus, Save } from "lucide-react";
+import { Hash, Play, Copy, Save } from "lucide-react";
 import { api } from "../lib/api";
-import { Button } from "../components/ui";
 import { toast } from "../components/Toast";
 import { CATALOG, PALETTE, PORT_COLOR, portType, type Side } from "../board/catalog";
 import { applyConnection, placeNode, type Box } from "../board/graph";
 import { BoardCtx, nodeTypes, type Artefact, type BoardData } from "../board/nodes";
 
+type Lens = Side | "both";
 type FlowNode = Node<BoardData, "board">;
-
 type GraphNode = { id: string; type: string; position: { x: number; y: number }; enabled?: boolean; config?: Record<string, string> };
 type GraphEdge = { id: string; source: string; target: string; sourceHandle?: string; targetHandle?: string };
 
 function toFlow(nodes: GraphNode[]): FlowNode[] {
-  return (nodes || []).filter((n) => CATALOG[n.type]).map((n) => ({
-    id: n.id, type: "board", position: n.position || { x: 0, y: 0 },
-    data: { nodeType: n.type, enabled: n.enabled !== false, config: n.config || {} },
-  }));
+  let selectTimeline = true;
+  const flow: FlowNode[] = (nodes || []).filter((n) => CATALOG[n.type]).map((n) => {
+    const selected = selectTimeline && n.type === "market_timeline";
+    if (selected) selectTimeline = false;
+    return {
+      id: n.id, type: "board" as const, position: n.position || { x: 0, y: 0 }, selected,
+      data: { nodeType: n.type, enabled: n.enabled !== false, config: n.config || {} },
+    };
+  });
+  return flow;
 }
 
 function serialize(nodes: FlowNode[], edges: Edge[], variables: Record<string, string>) {
@@ -33,31 +38,14 @@ function serialize(nodes: FlowNode[], edges: Edge[], variables: Record<string, s
   };
 }
 
-function EventPanel({ config, preview }: { config: Record<string, string>; preview?: Artefact | null }) {
-  const fields = (preview?.evidence?.fields || {}) as {
-    events?: { id: string; label?: string; date?: string; kind?: string; ad_id?: string }[];
-    emitted_event?: { id?: string; label?: string; date?: string; kind?: string; ad_id?: string };
-  };
-  const event = (fields.events || []).find((ev) => ev.id === config.event_id) || fields.emitted_event;
-  const ad = preview?.ad;
-  const adId = event?.ad_id || config.ad_id;
-  const matched = ad?.id && ad.id === adId ? ad : undefined;
-  return (
-    <div className="space-y-2">
-      <p className="text-zinc-400">A marker selects that event&apos;s ad and passes it to Ad Feed, then to Breakdown, Funnel and Teardown.</p>
-      {event ? (
-        <dl className="space-y-1.5">
-          <div><dt className="text-[10px] uppercase tracking-wide text-zinc-500">Event</dt><dd className="text-zinc-100">{event.label || event.id}</dd></div>
-          {event.date && <div><dt className="text-[10px] uppercase tracking-wide text-zinc-500">Date</dt><dd className="text-zinc-100">{event.date}</dd></div>}
-          {event.kind && <div><dt className="text-[10px] uppercase tracking-wide text-zinc-500">Kind</dt><dd className="text-zinc-100">{event.kind}</dd></div>}
-          <div>
-            <dt className="text-[10px] uppercase tracking-wide text-zinc-500">Ad</dt>
-            <dd className="text-zinc-100">{matched?.headline || "Selected ad"} <span className="text-zinc-500">{adId}</span></dd>
-          </div>
-        </dl>
-      ) : <p className="text-zinc-400">Click a marker on the chart.</p>}
-    </div>
-  );
+function savedLabel(iso?: string) {
+  if (!iso) return "";
+  const t = Date.parse(iso);
+  if (Number.isNaN(t)) return `Saved ${iso}`;
+  const mins = Math.round((Date.now() - t) / 60000);
+  if (mins < 1) return "Saved just now";
+  if (mins < 60) return `Saved ${mins} min ago`;
+  return `Saved ${iso.slice(0, 16).replace("T", " ")}`;
 }
 
 function stageView(stage: { runs?: { status: string; review_status?: string; actual_cost_usd?: number; est_cost_usd?: number }[] } | undefined, jobStatus?: string) {
@@ -74,6 +62,43 @@ function stageView(stage: { runs?: { status: string; review_status?: string; act
   return { status, actual: run.actual_cost_usd ?? 0, ran: true };
 }
 
+function nodeBox(n: FlowNode): Box {
+  const spec = CATALOG[n.data.nodeType];
+  return {
+    x: n.position.x, y: n.position.y,
+    width: n.measured?.width || spec.width,
+    height: n.measured?.height || (n.data.nodeType === "market_timeline" ? 360 : spec.side === "intel" ? 250 : 180),
+  };
+}
+
+function ZoneBoxes({ nodes, lens, fixture }: { nodes: FlowNode[]; lens: Lens; fixture: boolean }) {
+  const sides: Side[] = lens === "both" ? ["intel", "create"] : [lens];
+  return (
+    <ViewportPortal>
+      {sides.map((side) => {
+        const list = nodes.filter((n) => CATALOG[n.data.nodeType]?.side === side);
+        if (!list.length) return null;
+        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+        for (const n of list) {
+          const box = nodeBox(n);
+          minX = Math.min(minX, box.x); minY = Math.min(minY, box.y);
+          maxX = Math.max(maxX, box.x + box.width); maxY = Math.max(maxY, box.y + box.height);
+        }
+        const pad = 36;
+        return (
+          <div key={side} className="v3-zone" style={{ left: minX - pad, top: minY - 28, width: maxX - minX + pad * 2, height: maxY - minY + pad + 28 }}>
+            <div className="v3-zl">
+              <i style={{ background: side === "intel" ? "#5ab0ff" : "#7c6cff" }} />
+              {side === "intel" ? (fixture ? "INTEL · FIXTURE" : "INTEL · LIVE ANALYTICS") : "CREATE · PRODUCTION PIPELINE"}
+              <span>{side === "intel" ? (fixture ? "recorded sample · not a live read" : "read-only · ads-tracker") : "dry run"}</span>
+            </div>
+          </div>
+        );
+      })}
+    </ViewportPortal>
+  );
+}
+
 function Canvas() {
   const qc = useQueryClient();
   const { screenToFlowPosition, fitView } = useReactFlow();
@@ -85,10 +110,13 @@ function Canvas() {
   const [edges, setEdges] = useState<Edge[]>([]);
   const [name, setName] = useState("Talking head");
   const [variables, setVariables] = useState<Record<string, string>>({});
-  const [tab, setTab] = useState<Side>("intel");
+  const [tab, setTab] = useState<Lens>("both");
   const [estimates, setEstimates] = useState<Record<string, number>>({});
   const [jobId, setJobId] = useState<string | null>(null);
   const [loaded, setLoaded] = useState("");
+  const [query, setQuery] = useState("");
+  const [pane, setPane] = useState<"config" | "output" | "runs">("config");
+  const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
     if (!board) return;
@@ -120,7 +148,6 @@ function Canvas() {
     placeholderData: keepPreviousData,
     enabled: nodes.length > 0,
   });
-  // The board payload already carries the fixture, so a refetch cannot blank the nodes.
   const preview = previewQuery.data || board?.preview || null;
   const { data: job } = useQuery({
     queryKey: ["job", jobId],
@@ -137,6 +164,15 @@ function Canvas() {
     for (const row of meta?.connections || []) out[row.id] = !!row.set;
     return out;
   }, [meta]);
+  const persona = (meta?.personas || []).find((p: { id: string; display?: string }) => p.id === (variables.persona || ""))?.display || variables.persona || "";
+  const wired = useMemo(() => {
+    const set = new Set<string>();
+    for (const edge of edges) {
+      if (edge.sourceHandle) set.add(`${edge.source}:out:${edge.sourceHandle}`);
+      if (edge.targetHandle) set.add(`${edge.target}:in:${edge.targetHandle}`);
+    }
+    return set;
+  }, [edges]);
 
   const toggle = useCallback((id: string) => {
     setNodes((ns) => ns.map((n) => n.id === id ? { ...n, data: { ...n.data, enabled: !n.data.enabled } } : n));
@@ -155,14 +191,13 @@ function Canvas() {
         return { ...n, selected: true, data: { ...n.data, config: { ...n.data.config, event_id: event.id, ad_id: adId } } };
       }
       const next = { ...n, selected: false };
-      if (n.data.nodeType === "ad_feed") {
-        next.data = { ...n.data, config: { ...n.data.config, ad_id: adId } };
-      }
+      if (n.data.nodeType === "ad_feed") next.data = { ...n.data, config: { ...n.data.config, ad_id: adId } };
       return next;
     }));
+    setPane("config");
   }, []);
 
-  const previewByType: Record<string, any> = {
+  const previewByType: Record<string, Artefact | null> = {
     ad_feed: preview?.feed, ad_breakdown: preview?.breakdown, funnel_route: preview?.funnel,
     teardown: preview?.teardown, market_timeline: preview?.timeline,
   };
@@ -170,10 +205,11 @@ function Canvas() {
   for (const stage of job?.stages || []) stages[stage.id] = stage;
 
   const view = useMemo(() => {
-    const visible = nodes.filter((n) => CATALOG[n.data.nodeType]?.side === tab);
+    const visible = tab === "both" ? nodes : nodes.filter((n) => CATALOG[n.data.nodeType]?.side === tab);
     const ids = new Set(visible.map((n) => n.id));
     const stubs: Node[] = [];
     const viewEdges: Edge[] = [];
+    const selectedId = nodes.find((n) => n.selected)?.id;
     const paint = (n: FlowNode): FlowNode => {
       const sv = stageView(stages[n.id], job?.job?.status);
       return { ...n, data: { ...n.data, preview: previewByType[n.data.nodeType] || null, status: sv.status, est: estimates[n.id] ?? 0, actual: sv.actual, ran: sv.ran } };
@@ -181,10 +217,11 @@ function Canvas() {
     for (const edge of edges) {
       const srcIn = ids.has(edge.source);
       const dstIn = ids.has(edge.target);
-      const color = PORT_COLOR[portType(nodes.find((n) => n.id === edge.source)?.data.nodeType || "", "out", edge.sourceHandle) || ""] || "#71717a";
-      const styled = { ...edge, style: { stroke: color }, animated: false };
+      const color = PORT_COLOR[portType(nodes.find((n) => n.id === edge.source)?.data.nodeType || "", "out", edge.sourceHandle) || ""] || "#6b6b76";
+      const hot = edge.source === selectedId || edge.target === selectedId;
+      const styled: Edge = { ...edge, type: "default", style: { stroke: color, strokeWidth: hot ? 2.25 : 1.5, opacity: hot ? 1 : 0.55 }, animated: hot };
       if (srcIn && dstIn) viewEdges.push(styled);
-      else if (srcIn || dstIn) {
+      else if (tab !== "both" && (srcIn || dstIn)) {
         const otherId = srcIn ? edge.target : edge.source;
         const other = nodes.find((n) => n.id === otherId);
         const anchor = nodes.find((n) => n.id === (srcIn ? edge.source : edge.target));
@@ -208,7 +245,7 @@ function Canvas() {
 
   useEffect(() => {
     if (!nodes.length) return;
-    const t = setTimeout(() => fitView({ padding: 0.12, maxZoom: 1, duration: 200 }), 80);
+    const t = setTimeout(() => fitView({ padding: 0.18, maxZoom: 1, duration: 200 }), 80);
     return () => clearTimeout(t);
   }, [tab, loaded, fitView]);
 
@@ -251,24 +288,18 @@ function Canvas() {
     const inType = portType(dst.data.nodeType, "in", state.toHandle?.id);
     if (outType && inType && outType !== inType) toast.error(`Cannot connect ${outType} to ${inType}.`);
   }, [nodes]);
-  const isValid = useCallback((c: Connection | Edge) => {
-    return applyConnection(edges, c, wireCtx(nodes)).ok;
-  }, [edges, nodes, wireCtx]);
+  const isValid = useCallback((c: Connection | Edge) => applyConnection(edges, c, wireCtx(nodes)).ok, [edges, nodes, wireCtx]);
 
-  const boxesFor = (list: FlowNode[], side: Side): Box[] => list.filter((n) => CATALOG[n.data.nodeType]?.side === side).map((n) => ({
-    x: n.position.x, y: n.position.y,
-    width: n.measured?.width || CATALOG[n.data.nodeType].width,
-    height: n.measured?.height || (CATALOG[n.data.nodeType].side === "intel" ? 280 : 150),
-  }));
+  const occupied = (list: FlowNode[], side: Side) => (tab === "both" ? list : list.filter((n) => CATALOG[n.data.nodeType]?.side === side));
   const addNode = (type: string) => {
     const spec = CATALOG[type];
     if (!spec) return;
-    if (spec.side !== tab) setTab(spec.side);
+    if (tab !== "both" && spec.side !== tab) setTab(spec.side);
     const id = `${type}-${Math.random().toString(36).slice(2, 6)}`;
-    const size = { width: spec.width, height: spec.side === "intel" ? 280 : 150 };
+    const size = { width: spec.width, height: spec.side === "intel" ? 250 : 180 };
     setNodes((ns) => [...ns, {
       id, type: "board",
-      position: placeNode(boxesFor(ns, spec.side), { x: 48, y: 48 }, size),
+      position: placeNode(occupied(ns, spec.side).map(nodeBox), { x: 48, y: 48 }, size),
       data: { nodeType: type, enabled: true, config: {} },
     }]);
   };
@@ -306,117 +337,212 @@ function Canvas() {
     onError: (e: Error) => toast.error(e.message),
   });
 
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement | null)?.tagName;
+      const typing = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+      if ((e.metaKey || e.ctrlKey) && e.key === "Enter") { e.preventDefault(); run.mutate(); return; }
+      if (!typing && e.key === "/") { e.preventDefault(); searchRef.current?.focus(); }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [run]);
+
   const selected = nodes.find((n) => n.selected);
+  const selectedSpec = selected ? CATALOG[selected.data.nodeType] : undefined;
+  const selectedView = selected ? stageView(stages[selected.id], job?.job?.status) : null;
+  const selectedPreview = selected ? previewByType[selected.data.nodeType] : null;
   const fixture = !preview || preview.origin !== "live";
+  const cap = meta?.caps?.per_job;
+  const needle = query.trim().toLowerCase();
+  const lensIndex = tab === "intel" ? 0 : tab === "both" ? 1 : 2;
+
+  const setFeed = (key: string, value: string) => {
+    if (!selected) return;
+    setNodes((ns) => ns.map((n) => n.id === selected.id ? { ...n, data: { ...n.data, config: { ...n.data.config, [key]: value } } } : n));
+  };
 
   return (
-    <BoardCtx.Provider value={{ keys, toggle, follow, pickEvent }}>
-      <div className="h-full flex flex-col bg-zinc-950 text-zinc-100">
-        <header className="shrink-0 flex flex-wrap items-center gap-2 px-3 pl-12 md:pl-3 py-2 border-b border-zinc-800">
-          <input aria-label="Board name" value={name} onChange={(e) => setName(e.target.value)}
-            className="bg-transparent text-sm font-semibold text-white w-36 border-b border-transparent focus:border-zinc-600 outline-none" />
-          <select aria-label="Load board" value={boardId} onChange={(e) => { setLoaded(""); setBoardId(e.target.value); }}
-            className="bg-zinc-900 border border-zinc-700 rounded-md text-xs px-2 py-1">
+    <BoardCtx.Provider value={{ keys, toggle, follow, pickEvent, wired, persona }}>
+      <div className="v3 v3-board">
+        <header className="v3-top">
+          <div className="v3-crumb">Boards / <input aria-label="Board name" value={name} onChange={(e) => setName(e.target.value)} /></div>
+          <select aria-label="Load board" className="v3-select" value={boardId} onChange={(e) => { setLoaded(""); setBoardId(e.target.value); }}>
             {(list || [{ id: "talking_head", name: "Talking head" }]).map((b: any) => <option key={b.id} value={b.id}>{b.name}{b.preset ? " · preset" : ""}</option>)}
           </select>
-          <select aria-label="Persona" value={variables.persona || ""} onChange={(e) => setVariables((v) => ({ ...v, persona: e.target.value }))}
-            className="bg-zinc-900 border border-zinc-700 rounded-md text-xs px-2 py-1">
+          <span className={`v3-badge ${fixture ? "ex" : "ok"}`}>{fixture ? "Fixture · not live" : "Live tracker"}</span>
+          <span className="v3-badge v3-mono">Dry run · $0.00{cap != null ? ` of $${Number(cap).toFixed(0)} cap` : ""}</span>
+          <div className="v3-sp" />
+          <select aria-label="Persona" className="v3-select" value={variables.persona || ""} onChange={(e) => setVariables((v) => ({ ...v, persona: e.target.value }))}>
             {(meta?.personas || []).map((p: any) => <option key={p.id} value={p.id}>{p.display}</option>)}
           </select>
-          <span className={`text-[10px] font-semibold rounded-full px-2 py-0.5 ${fixture ? "text-amber-200 bg-amber-500/10 border border-amber-500/30" : "text-emerald-200 bg-emerald-500/10 border border-emerald-500/30"}`}>
-            {fixture ? "Fixture · not live" : "Live tracker"}
-          </span>
-          <div className="ml-auto flex gap-1.5">
-            <Button size="xs" variant="ghost" icon={<Plus size={12} />} onClick={() => create.mutate()} loading={create.isPending}>New</Button>
-            <Button size="xs" variant="secondary" icon={<Save size={12} />} onClick={() => save.mutate()} loading={save.isPending}>Save</Button>
-            <Button size="xs" icon={<Play size={12} />} onClick={() => run.mutate()} loading={run.isPending}>Dry run</Button>
-          </div>
+          {board?.updated_at && <span className="v3-saved">{savedLabel(board.updated_at)}</span>}
+          <button type="button" className="v3-btn" onClick={() => create.mutate()} disabled={create.isPending}><Copy size={13} />Copy</button>
+          <button type="button" className="v3-btn" onClick={() => save.mutate()} disabled={save.isPending}><Save size={13} />Save</button>
+          <button type="button" className="v3-btn pri" onClick={() => run.mutate()} disabled={run.isPending}><Play size={13} />Run (dry)</button>
         </header>
-        <div className="flex-1 min-h-0 flex flex-col md:flex-row">
-          <aside className="shrink-0 md:w-52 border-b md:border-b-0 md:border-r border-zinc-800 bg-zinc-950">
-            <div className="flex md:flex-col gap-2 p-2 overflow-x-auto md:overflow-y-auto md:h-full">
-              {PALETTE.map((group) => (
-                <div key={group.side} className="flex md:flex-col gap-2 shrink-0">
-                  <div className={`hidden md:block text-[9px] font-bold tracking-widest px-1 ${group.side === "intel" ? "text-teal-400" : "text-violet-400"}`}>{group.label}</div>
-                  {group.types.map((type) => {
-                    const spec = CATALOG[type];
-                    const Icon = spec.icon;
-                    const intel = spec.side === "intel";
-                    return (
-                      <button key={type} type="button" draggable
-                        onDragStart={(e) => { e.dataTransfer.setData("application/board-node", type); e.dataTransfer.effectAllowed = "move"; }}
-                        onClick={() => addNode(type)}
-                        data-palette={type}
-                        className={`palette-tile shrink-0 w-40 md:w-full ${intel ? "palette-tile-intel" : "palette-tile-create"}`}>
-                        <span className="palette-icon">
-                          <Icon size={16} aria-hidden />
-                        </span>
-                        <span className="palette-label">{spec.headline}</span>
-                      </button>
-                    );
-                  })}
-                </div>
-              ))}
-            </div>
-          </aside>
-          <div className="flex-1 min-h-0 min-w-0 relative board-shell"
+        <div className="v3-board-body">
+          <div className="v3-canvas board-shell v3-shell"
             onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
             onDrop={(e) => {
               e.preventDefault();
               const type = e.dataTransfer.getData("application/board-node");
               if (!CATALOG[type]) return;
               const spec = CATALOG[type];
-              const size = { width: spec.width, height: spec.side === "intel" ? 280 : 150 };
+              const size = { width: spec.width, height: spec.side === "intel" ? 250 : 180 };
               const dropped = screenToFlowPosition({ x: e.clientX, y: e.clientY });
               const id = `${type}-${Math.random().toString(36).slice(2, 6)}`;
               setNodes((ns) => [...ns, {
                 id, type: "board",
-                position: placeNode(boxesFor(ns, spec.side), dropped, size),
+                position: placeNode(occupied(ns, spec.side).map(nodeBox), dropped, size),
                 data: { nodeType: type, enabled: true, config: {} },
               }]);
-              setTab(spec.side);
+              setTab((current) => (current === "both" ? current : spec.side));
             }}>
-            <ReactFlow nodes={view.nodes} edges={view.edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
-              onConnect={onConnect} onConnectEnd={onConnectEnd} isValidConnection={isValid} edgesReconnectable={false}
-              connectionRadius={40} colorMode="dark" fitView minZoom={0.35} proOptions={{ hideAttribution: false }}>
-              <Background gap={18} color="#27272a" />
-              <Controls showInteractive={false} />
-              <MiniMap pannable zoomable className="!bg-zinc-900" maskColor="rgba(0,0,0,0.55)" />
-            </ReactFlow>
-            <div className="pointer-events-none absolute inset-x-0 bottom-4 z-20 flex justify-center">
-              <div className="pointer-events-auto flex rounded-full border border-zinc-700 bg-zinc-900/95 p-1 shadow-xl" role="tablist" aria-label="Board lens">
-                {(["intel", "create"] as Side[]).map((side) => (
-                  <button key={side} type="button" role="tab" aria-selected={tab === side} onClick={() => setTab(side)}
-                    className={`px-4 py-1.5 rounded-full text-xs font-semibold capitalize ${tab === side ? (side === "intel" ? "bg-teal-600 text-white" : "bg-violet-600 text-white") : "text-zinc-400"}`}>
-                    {side === "intel" ? "Intel" : "Create"}
+            <aside className="v3-pal">
+              <div className="v3-search-wrap">
+                <input ref={searchRef} className="v3-search" placeholder="Add…" aria-label="Add node" value={query} onChange={(e) => setQuery(e.target.value)} />
+                <span className="v3-kbd">/</span>
+              </div>
+              {PALETTE.map((group) => {
+                const types = group.types.filter((type) => !needle || CATALOG[type].headline.toLowerCase().includes(needle));
+                const soon = group.side === "create" && (!needle || "hook lab".includes(needle));
+                if (!types.length && !soon) return null;
+                return (
+                  <div key={group.side}>
+                    <h6>{group.label}</h6>
+                    <div className="v3-grid">
+                      {types.map((type) => {
+                        const spec = CATALOG[type];
+                        const Icon = spec.icon;
+                        const intel = spec.side === "intel";
+                        return (
+                          <button key={type} type="button" draggable
+                            onDragStart={(e) => { e.dataTransfer.setData("application/board-node", type); e.dataTransfer.effectAllowed = "move"; }}
+                            onClick={() => addNode(type)}
+                            data-palette={type}
+                            className={`palette-tile ${intel ? "palette-tile-intel" : "palette-tile-create"}`}>
+                            <span className="palette-icon"><Icon size={15} aria-hidden /></span>
+                            <span className="palette-label">{spec.headline}</span>
+                          </button>
+                        );
+                      })}
+                      {soon && (
+                        <button type="button" disabled className="palette-tile palette-tile-create soon" title="Not in this slice">
+                          <span className="palette-icon"><Hash size={15} aria-hidden /></span>
+                          <span className="palette-label">Hook Lab</span>
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </aside>
+            <div className="v3-flow">
+              <ReactFlow nodes={view.nodes} edges={view.edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
+                onConnect={onConnect} onConnectEnd={onConnectEnd} isValidConnection={isValid} edgesReconnectable={false}
+                connectionRadius={40} colorMode="dark" fitView minZoom={0.3}
+                connectionLineStyle={{ stroke: "#7c6cff", strokeWidth: 2 }}
+                proOptions={{ hideAttribution: false }}>
+                <Background gap={24} size={1.1} color="#2c2c33" />
+                <Controls showInteractive={false} />
+                <ZoneBoxes nodes={nodes} lens={tab} fixture={fixture} />
+              </ReactFlow>
+              <div className="v3-pill" role="tablist" aria-label="Board lens" data-lens={tab}>
+                <i className="v3-pill-ind" style={{ left: 4 + lensIndex * 96 }} />
+                {(["intel", "both", "create"] as Lens[]).map((side) => (
+                  <button key={side} type="button" role="tab" aria-selected={tab === side} onClick={() => setTab(side)} className={tab === side ? "on" : ""}>
+                    {side === "intel" && <i className="v3-dot" style={{ background: "#5ab0ff" }} />}
+                    {side === "create" && <i className="v3-dot" style={{ background: "#7c6cff" }} />}
+                    {side === "intel" ? "Intel" : side === "create" ? "Create" : "Both"}
                   </button>
                 ))}
               </div>
             </div>
           </div>
-          {selected && (
-            <aside className="shrink-0 w-full md:w-64 border-t md:border-t-0 md:border-l border-zinc-800 p-3 overflow-y-auto max-h-48 md:max-h-none text-xs space-y-2">
-              <h2 className="text-sm font-semibold text-white">{CATALOG[selected.data.nodeType]?.headline}</h2>
-              {selected.data.nodeType === "ad_feed" && (
-                <div className="space-y-1.5">
-                  {(["advertiser", "status", "date_from", "date_to", "longevity_min", "ad_id"] as const).map((key) => (
-                    <label key={key} className="block text-[10px] text-zinc-500">{key.replace(/_/g, " ")}
-                      <input value={selected.data.config[key] || ""} aria-label={key}
-                        onChange={(e) => setNodes((ns) => ns.map((n) => n.id === selected.id ? { ...n, data: { ...n.data, config: { ...n.data.config, [key]: e.target.value } } } : n))}
-                        className="mt-0.5 w-full bg-zinc-900 border border-zinc-700 rounded px-2 py-1 text-xs text-zinc-100" />
-                    </label>
+          <aside className="v3-inspector">
+            {selected && selectedSpec ? (
+              <>
+                <div className="v3-ih">
+                  <div className="v3-ih-r">
+                    <span className={`v3-ic ${selectedSpec.side === "intel" ? "in" : "cr"}`}><selectedSpec.icon size={14} /></span>
+                    <b>{selectedSpec.headline}</b>
+                    <span className="v3-badge" style={{ marginLeft: "auto" }}>{selectedSpec.side === "intel" ? "Intel" : "Create"}</span>
+                  </div>
+                  <div className="v3-sub">
+                    {selected.data.nodeType === "market_timeline" && "Chart node · reach and live ads. A marker emits that ad."}
+                    {selected.data.nodeType === "ad_feed" && "Query the tracker. Filters stay on this node."}
+                    {selected.data.nodeType !== "market_timeline" && selected.data.nodeType !== "ad_feed" && "Keys stay in Settings. This board does not ask for them."}
+                  </div>
+                </div>
+                <div className="v3-tabs">
+                  {(["config", "output", "runs"] as const).map((id) => (
+                    <button key={id} type="button" className={pane === id ? "on" : ""} onClick={() => setPane(id)}>{id[0].toUpperCase() + id.slice(1)}</button>
                   ))}
                 </div>
-              )}
-              {selected.data.nodeType === "market_timeline" && <EventPanel config={selected.data.config} preview={previewByType.market_timeline} />}
-              {selected.data.nodeType !== "ad_feed" && selected.data.nodeType !== "market_timeline" && (
-                <p className="text-zinc-400">Connections and keys live in Settings. This board does not ask for them.</p>
-              )}
-            </aside>
-          )}
+                <div className="v3-ib">
+                  {pane === "config" && selected.data.nodeType === "ad_feed" && (
+                    <div className="v3-flds">
+                      {(["advertiser", "status", "date_from", "date_to", "longevity_min", "ad_id"] as const).map((key) => (
+                        <label key={key} className="v3-fld">{key.replace(/_/g, " ")}
+                          <input className="v3-inp" value={selected.data.config[key] || ""} aria-label={key} onChange={(e) => setFeed(key, e.target.value)} />
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                  {pane === "config" && selected.data.nodeType === "market_timeline" && (
+                    <TimelineConfig config={selected.data.config} preview={previewByType.market_timeline} />
+                  )}
+                  {pane === "config" && selected.data.nodeType !== "ad_feed" && selected.data.nodeType !== "market_timeline" && (
+                    <p className="v3-copy">This node takes its stage settings from the template. Connect a matching port to feed it.</p>
+                  )}
+                  {pane === "output" && (
+                    <>
+                      <div className="v3-ev">
+                        <div className="v3-ev-l">Evidence</div>
+                        <p className="v3-copy">{selectedPreview?.evidence?.label || selectedPreview?.evidence?.source || "No read yet."}</p>
+                      </div>
+                      <div className="v3-inf">
+                        <div className="v3-inf-l">Inference</div>
+                        <p className="v3-copy">{selectedPreview?.inference?.note || "Nothing inferred yet."}</p>
+                      </div>
+                    </>
+                  )}
+                  {pane === "runs" && (
+                    <div className="v3-kv"><span>Status</span><span>{selectedView?.status || "idle"}</span></div>
+                  )}
+                </div>
+              </>
+            ) : (
+              <div className="v3-ib"><p className="v3-copy">Select a node.</p></div>
+            )}
+          </aside>
         </div>
       </div>
     </BoardCtx.Provider>
+  );
+}
+
+function TimelineConfig({ config, preview }: { config: Record<string, string>; preview?: Artefact | null }) {
+  const fields = (preview?.evidence?.fields || {}) as {
+    events?: { id: string; label?: string; date?: string; kind?: string; ad_id?: string }[];
+    emitted_event?: { id?: string; label?: string; date?: string; kind?: string; ad_id?: string };
+  };
+  const event = (fields.events || []).find((ev) => ev.id === config.event_id) || fields.emitted_event;
+  const ad = preview?.ad;
+  const adId = event?.ad_id || config.ad_id;
+  const matched = ad?.id && ad.id === adId ? ad : undefined;
+  return (
+    <div className="v3-fld">
+      <label>Selected marker → output</label>
+      {event ? (
+        <div className="v3-inp v3-stack">
+          <span>{event.label || event.id}</span>
+          <span className="v3-muted">{event.date}{event.kind ? ` · ${event.kind}` : ""} · {matched?.headline || adId}</span>
+        </div>
+      ) : <p className="v3-copy">Click a marker on the chart.</p>}
+      <p className="v3-copy">A marker selects that event&apos;s ad and passes it to Ad Feed, then to Breakdown, Funnel and Teardown.</p>
+    </div>
   );
 }
 

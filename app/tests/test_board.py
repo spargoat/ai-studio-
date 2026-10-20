@@ -14,8 +14,8 @@ for k in ("FAL_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS", "ADINTEL_API_URL", "ADI
     os.environ.pop(k, None)
 
 from studio.adintel import FIXTURE_LABEL, LONGEVITY_NOTE, REFERENCE_LABEL, query_ads
-from studio.board import (BoardError, compile_board, preview_config, preview_pack, talking_head_preset,
-                          timeline_artefact as board_timeline)
+from studio.board import (BoardError, compile_board, migrate_talking_head_layout, preview_config, preview_pack,
+                          talking_head_preset, timeline_artefact as board_timeline)
 from studio.config import connection_status, load_config
 from studio.runner import Runner, SpendGuardError
 from studio.providers import fal, elevenlabs
@@ -317,6 +317,38 @@ class T(unittest.TestCase):
         graph = talking_head_preset()
         self.assertEqual(preview_config(graph)["event_id"], "ev_launch_northline")
         self.assertEqual(preview_config(graph)["ad_id"], "rec_4c91e2")
+
+    def test_v3_layout_migrates_only_untouched_preset_positions(self):
+        preset = talking_head_preset()
+        pos = {n["id"]: n["position"] for n in preset["nodes"]}
+        self.assertGreater(pos["brief"]["x"], pos["teardown"]["x"])
+        self.assertGreater(pos["ad_breakdown"]["y"], pos["ad_feed"]["y"])
+        self.assertGreater(pos["voice"]["x"], pos["brief"]["x"])
+        self.assertIsNone(migrate_talking_head_layout(preset))
+        old = json.loads(json.dumps(preset))
+        slice1 = {
+            "timeline": (0, 0), "ad_feed": (380, 0), "ad_breakdown": (380, 280), "funnel": (680, 280),
+            "teardown": (380, 560), "brief": (0, 24), "script": (290, 24), "voice": (580, 24), "video": (870, 24),
+        }
+        for node in old["nodes"]:
+            x, y = slice1[node["id"]]
+            node["position"] = {"x": x, "y": y}
+        migrated = migrate_talking_head_layout(old)
+        self.assertEqual([e["id"] for e in migrated["edges"]], [e["id"] for e in old["edges"]])
+        self.assertEqual(migrated["nodes"][0]["config"], old["nodes"][0]["config"])
+        self.assertEqual(next(n["position"]["x"] for n in migrated["nodes"] if n["id"] == "brief"), pos["brief"]["x"])
+        old["nodes"][0]["position"] = {"x": 12, "y": 12}
+        self.assertIsNone(migrate_talking_head_layout(old))
+        draft = json.loads(json.dumps(preset))
+        draft_pos = {
+            "timeline": (36, 28), "ad_feed": (36, 330), "funnel": (36, 560),
+            "ad_breakdown": (36, 800), "teardown": (300, 800),
+            "brief": (760, 40), "script": (760, 300), "voice": (1020, 40), "video": (1020, 320),
+        }
+        for node in draft["nodes"]:
+            x, y = draft_pos[node["id"]]
+            node["position"] = {"x": x, "y": y}
+        self.assertEqual(migrate_talking_head_layout(draft)["nodes"][0]["position"]["y"], pos["timeline"]["y"])
 
     def test_settings_does_not_run_doctor(self):
         calls = []
