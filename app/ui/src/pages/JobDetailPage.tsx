@@ -7,6 +7,7 @@ import { Loader2, Play, RotateCcw, Check, X, BookmarkPlus, ChevronDown, ChevronR
 import { PageHeader, Button, Badge, Input } from "../components/ui";
 import { toast } from "../components/Toast";
 import { Status, Media, Section } from "../components/common";
+import { NeedsKey } from "../components/NeedsKey";
 import { api, usd, ts, fileUrl } from "../lib/api";
 
 const SCORED_STAGES = ["still", "video", "lipsync", "finish", "compose"];
@@ -18,7 +19,7 @@ function identityText(sc: any) {
   return "n/a";
 }
 
-function Scores({ sc, stage }: { sc: any; stage: string }) {
+function Scores({ sc, stage, llmMissing }: { sc: any; stage: string; llmMissing?: boolean }) {
   if (!sc) {
     if (!SCORED_STAGES.includes(stage)) return null;
     return <div className="flex flex-wrap gap-1 mt-1"><Badge size="sm">identity not scored</Badge><Badge size="sm">visual not scored</Badge></div>;
@@ -28,13 +29,14 @@ function Scores({ sc, stage }: { sc: any; stage: string }) {
       {sc.passed == null ? <Badge size="sm">not scored</Badge> : <Badge variant={sc.passed ? "success" : "danger"} size="sm">{sc.passed ? "PASS" : "FLAG"}</Badge>}
       <Badge variant="info" size="sm">identity {identityText(sc)}</Badge>
       {sc.visual ? <Badge size="sm">{sc.visual.width}x{sc.visual.height} · sharp {Math.round(sc.visual.sharpness)}</Badge> : <Badge size="sm">visual not scored</Badge>}
-      <Badge size="sm" title="needs an LLM key">copy/brand/engagement: not scored</Badge>
+      <Badge size="sm">copy/brand/engagement: not scored</Badge>
+      {llmMissing && <NeedsKey provider="llm" />}
       {(sc.flags || []).map((f: string) => <div key={f} className="w-full text-[11px] text-red-400">{f}</div>)}
     </div>
   );
 }
 
-function StageRow({ jid, s, running }: { jid: string; s: any; running: boolean }) {
+function StageRow({ jid, s, running, needsKey, llmMissing }: { jid: string; s: any; running: boolean; needsKey?: boolean; llmMissing?: boolean }) {
   const qc = useQueryClient();
   const [note, setNote] = useState(""); const [open, setOpen] = useState(false);
   const last = s.runs[s.runs.length - 1];
@@ -57,13 +59,14 @@ function StageRow({ jid, s, running }: { jid: string; s: any; running: boolean }
         {s.review && <Badge variant="warning" size="sm">review gate</Badge>}
         {last?.stale && <Badge size="sm">stale</Badge>}
         <span className="text-[11px] text-zinc-500 font-mono">{s.provider} · {s.model}</span>
+        {needsKey && <NeedsKey provider={s.key_provider} />}
         {s.model !== s.default_model && <Badge size="sm" title="template default">default {s.default_model}</Badge>}
       </div>
       {last && <div className="mt-2 grid grid-cols-1 md:grid-cols-[minmax(0,320px)_1fr] gap-4">
         <div>{last.output_path && <Media path={last.output_path} poster={last.poster} className="w-full max-h-80" />}</div>
         <div className="text-xs text-zinc-400 space-y-1">
           <div><b className="text-white">v{last.version}</b> · {last.mode} · {usd(last.actual_cost_usd, 3)} · tries {last.attempts} · {ts(last.finished_at || last.started_at)}</div>
-          <Scores sc={last.score} stage={s.id} />
+          <Scores sc={last.score} stage={s.id} llmMissing={llmMissing} />
           {last.exports && <div>exports: {Object.entries(last.exports).map(([a, p]: any) => <a key={a} href={fileUrl(p)} target="_blank" rel="noreferrer" className="text-violet-400 mr-2 underline">{a}</a>)}</div>}
           {last.review_note && <div>note: {last.review_note}</div>}
           {last.error && last.status !== "succeeded" && <div className="text-red-400 whitespace-pre-wrap">{String(last.error).slice(0, 400)}</div>}
@@ -91,6 +94,11 @@ function StageRow({ jid, s, running }: { jid: string; s: any; running: boolean }
 
 export default function JobDetailPage() {
   const { id = "" } = useParams(); const loc = useLocation(); const qc = useQueryClient();
+  const { data: meta } = useQuery({ queryKey: ["meta"], queryFn: () => api("/api/meta") });
+  const unset = (provider: string) => {
+    const row = (meta?.connections || []).find((c: any) => c.id === provider);
+    return !!row && !row.set;
+  };
   const { data, isLoading, error } = useQuery({ queryKey: ["job", id], queryFn: () => api(`/api/jobs/${id}`),
     refetchInterval: (q: any) => (q.state.data?.running || q.state.data?.job?.status === "running" ? 1000 : 6000) });
   const resume = useMutation({ mutationFn: () => api(`/api/jobs/${id}/resume`, { method: "POST" }),
@@ -114,7 +122,7 @@ export default function JobDetailPage() {
       </ol>
       <div className="text-xs text-zinc-500 mb-2 flex items-center gap-2">{running && <Loader2 size={12} className="animate-spin text-amber-400" />}
         {done}/{data.stages.length} stages succeeded{running ? " · running, updating live" : ""}</div>
-      <div>{data.stages.map((s: any) => <StageRow key={s.id} jid={id} s={s} running={running} />)}</div>
+      <div>{data.stages.map((s: any) => <StageRow key={s.id} jid={id} s={s} running={running} needsKey={!!s.key_provider && unset(s.key_provider)} llmMissing={s.id === "still" && unset("llm")} />)}</div>
       <Section title="Events"><div className="text-[11px] text-zinc-500 space-y-0.5 max-h-64 overflow-y-auto font-mono">
         {data.events.map((e: any) => <div key={e.id}><span className="text-zinc-600">{(e.created_at || "").slice(11, 19)}</span> {e.stage || ""} <span className={e.level === "error" ? "text-red-400" : ""}>{e.level}</span>: {e.message}</div>)}</div></Section>
     </div>

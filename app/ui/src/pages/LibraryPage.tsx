@@ -35,7 +35,8 @@ export default function LibraryPage() {
     onSuccess: (_r, id) => { toast.success(`#${id} promoted`); setPreview(null); setNote(""); qc.invalidateQueries({ queryKey: ["library"] }); }, onError: (e: any) => toast.error(e.message) });
   return (
     <div>
-      <PageHeader title="Library" description="Approved outputs and final renders, with prompts and scores. Promote the ones worth reusing." />
+      <PageHeader title="Library" description="Approved outputs and final renders, with prompts and scores. Promote the ones worth reusing."
+        actions={<Link to="/export" className="text-xs text-violet-400">Export</Link>} />
       <div className="flex items-center gap-1 mb-3 overflow-x-auto">
         {TABS.map(({ id, label, icon: Icon }) => (
           <button key={id} onClick={() => setTab(id)} className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-xs transition-colors whitespace-nowrap ${tab === id ? "bg-violet-600/20 text-violet-400 border border-violet-500/30" : "text-zinc-500 hover:text-zinc-300 hover:bg-zinc-800"}`}>

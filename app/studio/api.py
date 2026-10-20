@@ -3,7 +3,8 @@ import contextlib, hmac, io, json, os, threading, time
 from pathlib import Path
 from flask import Blueprint, abort, jsonify, redirect, request, send_file
 from . import library, persona as P
-from .config import key_status, load_template
+from .adintel import AdIntelError, timeline_view
+from .config import connection_status, key_status, load_template
 from .gates import show_review
 from .runner import BriefError, SpendGuardError
 
@@ -75,6 +76,8 @@ def register(app, cfg, runner, live, bg):
         pers = cfg["_personas"]
         return jsonify({"live": live, "personas": [{"id": k, "display": v.get("display") or k} for k, v in pers.items()],
                         "templates": sorted(p.stem for p in TEMPLATES_DIR.glob("*.yaml")),
+                        "template_keys": template_key_needs(),
+                        "connections": connection_status(cfg),
                         "fal_lock": db.fal_lock(), "caps": caps(), "spend": db.effective_spend()})
 
     @bp.get("/api/overview")
@@ -110,10 +113,13 @@ def register(app, cfg, runner, live, bg):
                             | {"exports": m.get("exports"), "poster": m.get("poster"), "score": sco,
                                "stale": r["status"] == "succeeded" and runner.is_stale(jid, r)})
             last = runs[-1] if runs else {}
+            configured = sc.get("provider")
+            key_provider = configured if ((cfg.get("providers") or {}).get(configured) or {}).get("key_env") else None
             stages.append({"id": d["id"], "kind": d["kind"], "review": bool(d.get("review")),
                            "show_review": show_review(d["id"], d.get("review"), last.get("status"), last.get("review_status")),
                            "needs": d.get("needs") or [],
-                           "provider": last.get("provider") or sc["provider"], "model": last.get("model") or sc["model"],
+                           "provider": last.get("provider") or configured, "model": last.get("model") or sc["model"],
+                           "key_provider": key_provider,
                            "default_model": sc["model"], "runs": runs})
         return jsonify({"job": job_row(j) | {"brief": j["brief"]}, "stages": stages, "events": db.events(jid, 60),
                         "running": jid in active})
@@ -168,8 +174,31 @@ def register(app, cfg, runner, live, bg):
                 keys.append({"provider": n, "env": name, "set": ok, "optional": bool(p.get("optional_key"))})
         out, blockers, _ = doctor_text()
         return jsonify({"caps": caps(), "spend": db.effective_spend(), "spend_by_provider": db.spend_summary(),
-                        "quality": cfg.get("quality") or {}, "keys": keys, "fal_lock": db.fal_lock(), "blockers": blockers,
+                        "quality": cfg.get("quality") or {}, "keys": keys, "connections": connection_status(cfg),
+                        "fal_lock": db.fal_lock(), "blockers": blockers,
                         "data_dir": str(data_dir)})
+
+    def template_key_needs():
+        out = {}
+        for path in sorted(TEMPLATES_DIR.glob("*.yaml")):
+            spec = load_template(path.stem)
+            need = []
+            for stage in spec.get("stages") or []:
+                use = stage.get("uses") or stage.get("id")
+                provider = ((cfg.get("stages") or {}).get(use) or {}).get("provider")
+                if not provider or provider in need:
+                    continue
+                if ((cfg.get("providers") or {}).get(provider) or {}).get("key_env"):
+                    need.append(provider)
+            out[path.stem] = need
+        return out
+
+    @bp.get("/api/intel/timeline")
+    def intel_timeline():
+        try:
+            return jsonify(timeline_view(request.args.get("event_id") or None))
+        except AdIntelError as e:
+            return err(e, 502)
 
     @bp.get("/api/spend")
     def spend():
@@ -384,5 +413,5 @@ def register(app, cfg, runner, live, bg):
         return send_file(UI_DIST / "index.html")
 
     app.register_blueprint(bp)
-    for rule in ("/", "/new", "/jobs", "/jobs/<path:x>", "/library", "/export", "/personas", "/settings", "/spend"):
+    for rule in ("/", "/new", "/jobs", "/jobs/<path:x>", "/library", "/export", "/personas", "/settings", "/spend", "/intel"):
         app.add_url_rule(rule, "spa_" + rule.strip("/").replace("/", "_").replace("<path:x>", "x") or "spa_root", spa)

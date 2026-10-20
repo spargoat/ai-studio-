@@ -7,6 +7,7 @@ import { Video, Image, FileText, Wand2, Calculator, Play, Lock } from "lucide-re
 import { PageHeader, Button, Input, Textarea, Select, Badge } from "../components/ui";
 import { toast } from "../components/Toast";
 import { Section, th, td, tr } from "../components/common";
+import { NeedsKey } from "../components/NeedsKey";
 import { api, usd } from "../lib/api";
 
 const TEMPLATE_INFO: Record<string, { label: string; desc: string; icon: typeof Video; color: string; needs: string[] }> = {
@@ -33,6 +34,10 @@ export default function NewJobPage() {
   });
   const info = TEMPLATE_INFO[f.template];
   const templates: string[] = meta?.templates || Object.keys(TEMPLATE_INFO);
+  const missingKeys = ((meta?.template_keys?.[f.template] || []) as string[]).filter((id) => {
+    const row = (meta?.connections || []).find((c: any) => c.id === id);
+    return row ? !row.set : false;
+  });
 
   return (
     <div>
@@ -59,6 +64,10 @@ export default function NewJobPage() {
           {(info?.needs.includes("topic") || f.template === "static_ad") && <Input label="Topic" value={f.topic} onChange={set("topic")} />}
           {f.template === "static_ad" && <><Input label="Headline" value={f.headline} onChange={set("headline")} /><Input label="CTA" value={f.cta} onChange={set("cta")} /></>}
         </div>
+        {missingKeys.length > 0 && <div className="mt-3 flex flex-wrap gap-2">
+          {missingKeys.map((id) => <NeedsKey key={id} provider={id} />)}
+          <span className="text-[11px] text-zinc-500 self-center">Dry run still starts without these keys.</span>
+        </div>}
         {f.mode === "live" && <div className="mt-3 flex gap-2 items-start text-sm text-amber-300 border border-amber-500/30 bg-amber-500/10 rounded-lg px-3 py-2">
           <Lock size={14} className="mt-0.5 shrink-0" /><span>{blocked || (meta?.fal_lock ? `Live runs are blocked: fal has been locked (exhausted balance) since ${meta.fal_lock.started_at}. Top up first.` : "Live runs start from the CLI so the spend guards stay explicit. This app starts dry runs only.")}</span></div>}
         <div className="flex flex-wrap gap-2 mt-4">

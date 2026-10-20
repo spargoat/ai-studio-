@@ -12,6 +12,7 @@ const ExportPage = lazy(() => import("./pages/ExportPage"));
 const Personas = lazy(() => import("./pages/PersonasPage"));
 const Settings = lazy(() => import("./pages/SettingsPage"));
 const Spend = lazy(() => import("./pages/SpendPage"));
+const Intel = lazy(() => import("./pages/IntelPage"));
 
 function Wrap({ children }: { children: React.ReactNode }) {
   return <Suspense fallback={<div className="py-16 text-center text-zinc-500 text-sm">Loading...</div>}>{children}</Suspense>;
@@ -27,4 +28,5 @@ export const router = createBrowserRouter([{ element: <MainLayout />, children: 
   { path: "/personas", element: <Wrap><Personas /></Wrap> },
   { path: "/settings", element: <Wrap><Settings /></Wrap> },
   { path: "/spend", element: <Wrap><Spend /></Wrap> },
+  { path: "/intel", element: <Wrap><Intel /></Wrap> },
 ] }]);

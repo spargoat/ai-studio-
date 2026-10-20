@@ -5,6 +5,7 @@ import { AlertTriangle, PlusCircle, Loader2 } from "lucide-react";
 import { PageHeader, Button, Badge } from "../components/ui";
 import { Section, Kpi } from "../components/common";
 import JobsTable from "../components/JobsTable";
+import { NeedsKey } from "../components/NeedsKey";
 import { api, usd } from "../lib/api";
 
 export default function DashboardPage() {
@@ -24,12 +25,12 @@ export default function DashboardPage() {
         <Kpi label="Live preflight" value={data.blockers.length ? "Blocked" : "OK"} tone={data.blockers.length ? "bad" : "good"} sub={`${data.blockers.length} blocker(s)`} />
       </div>
       {data.blockers.length > 0 && <Section title="Blockers (from studio doctor)">
-        <ul className="text-sm space-y-1">{data.blockers.map((b: string) => <li key={b} className="flex gap-2 text-red-300"><AlertTriangle size={14} className="mt-0.5 shrink-0" />{b}</li>)}</ul>
+        <ul className="text-sm space-y-2">{data.blockers.map((b: string) => <li key={b} className="flex flex-wrap items-center gap-2 text-red-300"><AlertTriangle size={14} className="shrink-0" />{b}{/key not set/i.test(b) && <NeedsKey />}</li>)}</ul>
         <p className="text-xs text-zinc-500 mt-2">Dry runs are unaffected; these only block live (paid) runs.</p></Section>}
       {data.pending.length > 0 && <Section title="Awaiting review">
         <div className="flex flex-wrap gap-2">{data.pending.slice(0, 20).map((p: any) => (
           <Link key={p.job_id + p.stage} to={`/jobs/${p.job_id}#st-${p.stage}`}><Badge variant="warning" size="sm">{p.job_id} / {p.stage} v{p.version}</Badge></Link>))}</div></Section>}
-      <Section title="Recent jobs" right={<Link to="/jobs" className="text-xs text-violet-400">Run log →</Link>}><JobsTable jobs={data.jobs} /></Section>
+      <Section title="Recent jobs" right={<Link to="/jobs" className="text-xs text-violet-400">Runs →</Link>}><JobsTable jobs={data.jobs} /></Section>
       <details className="text-xs text-zinc-500"><summary className="cursor-pointer">Doctor output</summary><pre className="mt-2 whitespace-pre-wrap text-zinc-400">{data.doctor}</pre></details>
     </div>
   );

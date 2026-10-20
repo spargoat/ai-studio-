@@ -59,6 +59,8 @@ Leave unset until a live run is intended. Caps in `app/config/config.yaml` still
 | `VERCEL_SUPPORT_LARGE_FUNCTIONS` | Set to `1` only if the Python bundle exceeds the 500 MB standard limit |
 | `STUDIO_SQLITE` | Set to `1` to force the local SQLite file. On Vercel this is a testing override: without it, a missing Turso URL is a 503, not an ephemeral database. Also forces SQLite when a Turso URL is present |
 | `STUDIO_FETCH_FFMPEG` | Set to `1` to download the static ffmpeg outside Vercel. On Vercel this happens when `VERCEL=1` |
+| `ADINTEL_API_URL` | Base URL of the ads-tracker read API. With `ADINTEL_API_SECRET`, the Intel page calls it. If either is unset, Intel uses a labelled fixture and does not present it as live |
+| `ADINTEL_API_SECRET` | Shared server-side secret for that read API. Sent as a bearer token. Never returned to the browser |
 | `STUDIO_RUN_TIMEOUT_S` | Seconds a non-fal stage may stay `running` before reconcile marks it failed. Default 360 |
 | `STUDIO_LEASE_TTL_S` | How long a compose lease is valid if the instance dies before releasing it. Default is the run timeout |
 

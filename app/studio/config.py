@@ -53,6 +53,24 @@ def key_status(provider_cfg):
     return (names[0] if names else None), False
 
 
+def connection_status(cfg):
+    """Connection rows for Settings. Masks are placeholders. Values are never included."""
+    rows = []
+    for name, provider in (cfg.get("providers") or {}).items():
+        if not provider.get("key_env"):
+            continue
+        env, ok = key_status(provider)
+        rows.append({"id": name, "label": name, "env": env, "set": bool(ok),
+                     "mask": "••••••••" if ok else "", "optional": bool(provider.get("optional_key"))})
+    url = bool(os.environ.get("ADINTEL_API_URL"))
+    secret = bool(os.environ.get("ADINTEL_API_SECRET"))
+    rows.append({"id": "adintel_url", "label": "Ads tracker", "env": "ADINTEL_API_URL", "set": url,
+                 "mask": "••••••••" if url else "", "optional": True})
+    rows.append({"id": "adintel_secret", "label": "Ads tracker secret", "env": "ADINTEL_API_SECRET", "set": secret,
+                 "mask": "••••••••" if secret else "", "optional": True})
+    return rows
+
+
 def get_key(provider_cfg):
     for name in provider_cfg.get("key_env", []) or []:
         v = os.environ.get(name)
