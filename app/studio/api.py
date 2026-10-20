@@ -3,7 +3,8 @@ import contextlib, hmac, io, json, os, threading, time
 from pathlib import Path
 from flask import Blueprint, abort, jsonify, request, send_file
 from . import library, persona as P
-from .config import key_status, load_template
+from .board import BoardError, compile_board, ensure_presets, job_brief, preview_pack
+from .config import connection_status, key_status, load_template
 from .runner import BriefError, SpendGuardError
 
 UI_DIST = Path(__file__).resolve().parent.parent / "ui" / "dist"
@@ -18,6 +19,7 @@ def one_stage():
 
 def register(app, cfg, runner, live, bg):
     db = runner.db
+    ensure_presets(db)
     bp = Blueprint("api", __name__)
     app.json.sort_keys = False
     active, alock = set(), threading.Lock()
@@ -74,7 +76,8 @@ def register(app, cfg, runner, live, bg):
         pers = cfg["_personas"]
         return jsonify({"live": live, "personas": [{"id": k, "display": v.get("display") or k} for k, v in pers.items()],
                         "templates": sorted(p.stem for p in TEMPLATES_DIR.glob("*.yaml")),
-                        "fal_lock": db.fal_lock(), "caps": caps(), "spend": db.effective_spend()})
+                        "fal_lock": db.fal_lock(), "caps": caps(), "spend": db.effective_spend(),
+                        "connections": connection_status(cfg)})
 
     @bp.get("/api/overview")
     def overview():
@@ -107,6 +110,7 @@ def register(app, cfg, runner, live, bg):
                 runs.append({k: r[k] for k in ("id", "version", "status", "review_status", "review_note", "mode", "provider", "model",
                                                 "output_path", "actual_cost_usd", "est_cost_usd", "attempts", "error", "started_at", "finished_at")}
                             | {"exports": m.get("exports"), "poster": m.get("poster"), "score": sco,
+                               "summary": m.get("summary"),
                                "stale": r["status"] == "succeeded" and runner.is_stale(jid, r)})
             last = runs[-1] if runs else {}
             stages.append({"id": d["id"], "kind": d["kind"], "review": bool(d.get("review")), "needs": d.get("needs") or [],
@@ -151,8 +155,8 @@ def register(app, cfg, runner, live, bg):
                 keys.append({"provider": n, "env": name, "set": ok, "optional": bool(p.get("optional_key"))})
         out, blockers, _ = doctor_text()
         return jsonify({"caps": caps(), "spend": db.effective_spend(), "spend_by_provider": db.spend_summary(),
-                        "quality": cfg.get("quality") or {}, "keys": keys, "fal_lock": db.fal_lock(), "blockers": blockers,
-                        "data_dir": str(data_dir)})
+                        "quality": cfg.get("quality") or {}, "keys": keys, "connections": connection_status(cfg),
+                        "fal_lock": db.fal_lock(), "blockers": blockers, "data_dir": str(data_dir)})
 
     @bp.get("/api/spend")
     def spend():
@@ -324,6 +328,110 @@ def register(app, cfg, runner, live, bg):
         return jsonify([{"name": z.name, "url": f"/file?p={z}", "size": z.stat().st_size,
                          "at": time.strftime("%Y-%m-%d %H:%M", time.localtime(z.stat().st_mtime))} for z in zs])
 
+    def board_public(row, estimates=None, estimate_error=None):
+        body = {"id": row["id"], "name": row["name"], "preset": row["preset"], "graph": row["graph"],
+                "last_job_id": row.get("last_job_id"), "updated_at": row.get("updated_at"),
+                "estimates": estimates or {}}
+        if estimate_error:
+            body["estimate_error"] = estimate_error
+        return body
+
+    def estimates_for(graph):
+        try:
+            stages = compile_board(graph)
+            rows = runner.estimate_job(job_brief(graph, stages))
+        except (BoardError, BriefError, KeyError, ValueError) as e:
+            return {}, str(e)
+        return {r["stage"]: r["est_usd"] for r in rows}, None
+
+    @bp.get("/api/boards")
+    def board_list():
+        ensure_presets(db)
+        return jsonify(db.boards())
+
+    @bp.post("/api/boards")
+    def board_create():
+        body = request.get_json(force=True)
+        graph = body.get("graph") or {}
+        name = (body.get("name") or "Untitled board").strip() or "Untitled board"
+        import random, string
+        bid = "b-" + "".join(random.choices(string.ascii_lowercase + string.digits, k=6))
+        db.save_board(bid, name, graph, preset=False)
+        row = db.board(bid)
+        est, err = estimates_for(row["graph"])
+        return jsonify(board_public(row, est, err)), 201
+
+    @bp.get("/api/boards/<bid>")
+    def board_get(bid):
+        ensure_presets(db)
+        row = db.board(bid) or abort(404)
+        est, err = estimates_for(row["graph"])
+        return jsonify(board_public(row, est, err))
+
+    @bp.put("/api/boards/<bid>")
+    def board_save(bid):
+        row = db.board(bid) or abort(404)
+        body = request.get_json(force=True)
+        graph = body.get("graph") or row["graph"]
+        name = (body.get("name") or row["name"]).strip() or row["name"]
+        db.save_board(bid, name, graph)
+        saved = db.board(bid)
+        est, err = estimates_for(saved["graph"])
+        return jsonify(board_public(saved, est, err))
+
+    @bp.post("/api/boards/<bid>/run")
+    def board_run(bid):
+        row = db.board(bid) or abort(404)
+        body = request.get_json(silent=True) or {}
+        mode = body.get("mode") or "dry"
+        try:
+            stages = compile_board(row["graph"])
+            brief = job_brief(row["graph"], stages)
+        except BoardError as e:
+            return err(e)
+        if mode == "live":
+            if os.environ.get("STUDIO_ALLOW_LIVE") != "1":
+                return err("Live runs are blocked. Set STUDIO_ALLOW_LIVE=1 to allow them. Dry run is the default.", 409)
+            try:
+                from .runner import Runner
+                with Runner(cfg, live=True, log=lambda m: None) as lr:
+                    total = sum(r["est_usd"] for r in lr.estimate_job(brief))
+                    lr.check_budget(bid, total, live=True)
+                    jid = lr.create_job(brief)
+            except (BriefError, SpendGuardError, KeyError, ValueError) as e:
+                return err(e, 409)
+            db.set_board_job(bid, jid)
+            return jsonify({"id": jid, "mode": "live"}), 201
+        if mode != "dry":
+            return err("mode must be dry or live")
+        if live:
+            return err("this server was started with --live; the board only starts dry runs", 409)
+        try:
+            jid = runner.create_job(brief)
+        except (BriefError, KeyError, ValueError) as e:
+            return err(e)
+        db.set_board_job(bid, jid)
+        if not one_stage():
+            run_bg(jid, runner.run_job, jid)
+        else:
+            try:
+                runner.advance(jid)
+            except BriefError as e:
+                return err(e, 409)
+        return jsonify({"id": jid, "mode": "dry"}), 201
+
+    @bp.get("/api/intel/preview")
+    def intel_preview():
+        a = request.args
+        config = {"advertiser": a.get("advertiser") or "", "status": a.get("status") or "",
+                  "date_from": a.get("date_from") or "", "date_to": a.get("date_to") or "",
+                  "longevity_min": a.get("longevity_min") or "", "ad_id": a.get("ad_id") or "",
+                  "event_id": a.get("event_id") or ""}
+        try:
+            return jsonify(preview_pack(config))
+        except Exception as e:
+            return err(e, 502)
+
     # ---------- SPA. /assets is registered on the app so it stays available
     # when the database gate returns before the blueprint.
 
@@ -333,5 +441,5 @@ def register(app, cfg, runner, live, bg):
         return send_file(UI_DIST / "index.html")
 
     app.register_blueprint(bp)
-    for rule in ("/", "/new", "/jobs", "/jobs/<path:x>", "/library", "/export", "/personas", "/settings", "/spend"):
+    for rule in ("/", "/new", "/board", "/jobs", "/jobs/<path:x>", "/library", "/export", "/personas", "/settings", "/spend"):
         app.add_url_rule(rule, "spa_" + rule.strip("/").replace("/", "_").replace("<path:x>", "x") or "spa_root", spa)

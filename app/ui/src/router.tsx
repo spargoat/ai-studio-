@@ -12,6 +12,7 @@ const ExportPage = lazy(() => import("./pages/ExportPage"));
 const Personas = lazy(() => import("./pages/PersonasPage"));
 const Settings = lazy(() => import("./pages/SettingsPage"));
 const Spend = lazy(() => import("./pages/SpendPage"));
+const Board = lazy(() => import("./pages/BoardPage"));
 
 function Wrap({ children }: { children: React.ReactNode }) {
   return <Suspense fallback={<div className="py-16 text-center text-zinc-500 text-sm">Loading...</div>}>{children}</Suspense>;
@@ -19,6 +20,7 @@ function Wrap({ children }: { children: React.ReactNode }) {
 
 export const router = createBrowserRouter([{ element: <MainLayout />, children: [
   { path: "/", element: <Wrap><Dashboard /></Wrap> },
+  { path: "/board", element: <Wrap><Board /></Wrap> },
   { path: "/new", element: <Wrap><NewJob /></Wrap> },
   { path: "/jobs", element: <Wrap><Jobs /></Wrap> },
   { path: "/jobs/:id", element: <Wrap><JobDetail /></Wrap> },

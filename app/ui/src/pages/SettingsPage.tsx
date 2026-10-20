@@ -1,7 +1,7 @@
 // Adapted from AMN OS pages/SettingsPage.tsx (workspace/API-key/database sections) → caps, quality gate, keys (names only), fal lock.
 // Read-only: values come from config/config.yaml. Supabase/workspace sections removed.
 import { useQuery } from "@tanstack/react-query";
-import { Shield, Key, Gauge, Loader2 } from "lucide-react";
+import { Shield, Cable, Gauge, Loader2 } from "lucide-react";
 import { PageHeader, Badge } from "../components/ui";
 import { Section } from "../components/common";
 import { api, usd } from "../lib/api";
@@ -22,10 +22,15 @@ export default function SettingsPage() {
       <Section title={<span className="flex items-center gap-2"><Shield size={15} className="text-emerald-400" />Quality gate</span>}>
         {Object.entries(data.quality).map(([k, v]: any) => <Row key={k} k={k.replace(/_/g, " ")} v={Array.isArray(v) ? v.join(", ") : String(v)} />)}
       </Section>
-      <Section title={<span className="flex items-center gap-2"><Key size={15} className="text-amber-400" />API keys <span className="text-[11px] text-zinc-500 font-normal">names only, values never shown</span></span>}>
-        {data.keys.map((k: any) => <div key={k.provider} className="flex justify-between items-center gap-3 py-1.5 border-b border-zinc-800/60 text-sm">
-          <span className="text-zinc-300">{k.provider} <code className="text-[11px] text-zinc-500">{k.env}</code></span>
-          <Badge size="sm" variant={k.set ? "success" : k.optional ? "default" : "danger"}>{k.set ? "set" : k.optional ? "not set (optional)" : "NOT SET"}</Badge></div>)}
+      <Section id="connections" title={<span className="flex items-center gap-2"><Cable size={15} className="text-amber-400" />Connections <span className="text-[11px] text-zinc-500 font-normal">status and a mask — values never leave the server</span></span>}>
+        <p className="text-xs text-zinc-500 mb-2">Keys stay here. The board never asks for them. A node that needs a missing key links back to this section.</p>
+        {(data.connections || []).map((k: any) => <div key={k.id} className="flex justify-between items-center gap-3 py-1.5 border-b border-zinc-800/60 text-sm">
+          <span className="text-zinc-300">{k.label} <code className="text-[11px] text-zinc-500">{k.env}</code></span>
+          <span className="flex items-center gap-2">
+            <span className="font-mono text-[11px] text-zinc-400">{k.set ? k.mask : "—"}</span>
+            <Badge size="sm" variant={k.set ? "success" : k.optional ? "default" : "danger"}>{k.set ? "set" : k.optional ? "not set" : "NOT SET"}</Badge>
+          </span>
+        </div>)}
       </Section>
       <Section title="fal account">{data.fal_lock ? <p className="text-sm text-red-300">Locked (exhausted balance) since {data.fal_lock.started_at} on {data.fal_lock.job_id}/{data.fal_lock.stage}. Live runs are blocked until it is topped up.</p> : <p className="text-sm text-zinc-400">No lock recorded.</p>}</Section>
       <p className="text-[11px] text-zinc-600">Data directory: {data.data_dir}</p>

@@ -5,30 +5,21 @@ import { useState, useEffect } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useQuery } from "@tanstack/react-query";
 import {
-  LayoutDashboard, PlusCircle, ClipboardList, Library, PackageOpen, Users, Settings, DollarSign,
+  ClipboardList, Library, Users, Settings, DollarSign, Workflow,
   Sun, Moon, Pin, PinOff, LucideIcon,
 } from "lucide-react";
 import { useTheme } from "../hooks/useTheme";
 import { api } from "../lib/api";
 
 interface NavItem { path: string; icon: LucideIcon; label: string; description?: string }
-interface NavSection { title: string; items: NavItem[] }
 
-const NAV_SECTIONS: NavSection[] = [
-  { title: "CREATE", items: [
-    { path: "/", icon: LayoutDashboard, label: "Dashboard", description: "Jobs, spend, blockers" },
-    { path: "/new", icon: PlusCircle, label: "New job", description: "Brief, estimate, dry run" },
-  ] },
-  { title: "LIBRARY", items: [
-    { path: "/library", icon: Library, label: "Library", description: "Approved outputs" },
-    { path: "/export", icon: PackageOpen, label: "Export", description: "Bundle to zip" },
-    { path: "/personas", icon: Users, label: "Personas", description: "Locks and refs" },
-  ] },
-  { title: "MANAGE", items: [
-    { path: "/jobs", icon: ClipboardList, label: "Run log", description: "All jobs and stages" },
-    { path: "/spend", icon: DollarSign, label: "Spend", description: "Usage vs caps" },
-    { path: "/settings", icon: Settings, label: "Settings", description: "Caps, threshold, keys" },
-  ] },
+const NAV: NavItem[] = [
+  { path: "/board", icon: Workflow, label: "Board", description: "Intel and Create on one graph" },
+  { path: "/library", icon: Library, label: "Library", description: "Approved outputs" },
+  { path: "/jobs", icon: ClipboardList, label: "Runs", description: "Jobs and stages" },
+  { path: "/spend", icon: DollarSign, label: "Spend", description: "Usage vs caps" },
+  { path: "/personas", icon: Users, label: "Personas", description: "Locks and refs" },
+  { path: "/settings", icon: Settings, label: "Settings", description: "Connections, caps, keys" },
 ];
 
 const LS_KEY = "studio_sidebar_pinned";
@@ -54,17 +45,14 @@ export default function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
       style={{ width: expanded ? 200 : 56, transition: "width 200ms ease" }}>
       <div className="absolute top-0 left-0 right-0 h-24 bg-gradient-to-b from-violet-600/[0.06] to-transparent pointer-events-none" />
       <div className="relative mb-2 shrink-0 z-10 px-2">
-        <div className={`flex items-center gap-2 rounded-lg bg-violet-600 font-bold text-sm text-white border border-violet-500/30 ${expanded ? "w-full px-2.5 py-2" : "w-9 h-9 mx-auto justify-center"}`}>
+        <button type="button" onClick={() => { navigate("/board"); onNavigate?.(); }} className={`flex items-center gap-2 rounded-lg bg-violet-600 font-bold text-sm text-white border border-violet-500/30 ${expanded ? "w-full px-2.5 py-2" : "w-9 h-9 mx-auto justify-center"}`}>
           <span className="shrink-0 w-5 h-5 flex items-center justify-center text-xs">S</span>
           {expanded && <span className="text-xs truncate flex-1">AI Studio</span>}
           {expanded && <span className={`text-[9px] px-1.5 py-0.5 rounded ${meta?.live ? "bg-red-500/30" : "bg-violet-900/60"}`}>{meta?.live ? "LIVE" : "DRY RUN"}</span>}
-        </div>
+        </button>
       </div>
-      {NAV_SECTIONS.map((section, si) => (
-        <div key={section.title} className="w-full flex flex-col">
-          {si > 0 && <div className="w-6 h-px bg-zinc-800 my-1.5 mx-auto" />}
-          <span className={`text-zinc-600 font-bold tracking-widest mb-0.5 ${expanded ? "text-[9px] px-4 mt-1" : "text-[8px] text-center"}`}>{section.title}</span>
-          {section.items.map(({ path, icon: Icon, label, description }) => {
+      <div className="w-full flex flex-col">
+          {NAV.map(({ path, icon: Icon, label, description }) => {
             const isActive = path === "/" ? location.pathname === "/" : location.pathname.startsWith(path);
             return (
               <button key={path} onClick={() => { navigate(path); onNavigate?.(); }}
@@ -76,8 +64,7 @@ export default function Sidebar({ onNavigate }: { onNavigate?: () => void }) {
               </button>
             );
           })}
-        </div>
-      ))}
+      </div>
       <div className="mt-auto pt-2 shrink-0 flex flex-col items-center gap-1 px-2">
         <button onClick={() => { navigate("/spend"); onNavigate?.(); }}
           className={`group relative flex items-center gap-2 rounded-lg hover:bg-zinc-800 transition-colors ${expanded ? "w-full px-2.5 py-1.5" : "w-10 py-1 justify-center flex-col"}`}

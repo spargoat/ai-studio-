@@ -147,16 +147,26 @@ class Runner:
         return self.cfg["_data_dir"] / "jobs" / job_id
 
     def template(self, job):
+        brief = job.get("brief") or {}
+        if brief.get("board_stages"):
+            return {"name": brief.get("template") or "board", "stages": brief["board_stages"],
+                    "_board": True, "_path": "board"}
         return load_template(job["template"])
 
     def stage_defs(self, job):
         t = self.template(job)
+        board = bool(t.get("_board"))
         defs = []
         for s in t["stages"]:
             s = dict(s)
-            s.setdefault("needs", [] if s["id"] == "brief" else ["brief"])
-            if s["id"] != "brief" and "brief" not in s["needs"]:
-                s["needs"] = ["brief", *s["needs"]]
+            if board:
+                # Wires already became needs. Don't force every stage to wait on brief:
+                # intel nodes run before the brief exists.
+                s.setdefault("needs", [])
+            else:
+                s.setdefault("needs", [] if s["id"] == "brief" else ["brief"])
+                if s["id"] != "brief" and "brief" not in s["needs"]:
+                    s["needs"] = ["brief", *s["needs"]]
             ov = (job["brief"].get("overrides") or {}).get(s["id"]) or {}
             if "prompt" in ov:
                 s["prompt"] = ov["prompt"]
@@ -215,10 +225,13 @@ class Runner:
         fake = {"brief": brief, "template": brief["template"], "id": "estimate"}
         rows = []
         for sdef in self.stage_defs(fake):
-            if sdef["kind"] == "brief":
+            if sdef["kind"] in ("brief", "intel") or sdef.get("disabled"):
+                continue
+            uses = sdef.get("uses", sdef["id"])
+            if uses not in self.cfg["stages"]:
                 continue
             ctx = self.build_ctx(fake, sdef, inputs={}, dry_estimate=True)
-            sc = self.cfg["stages"][sdef.get("uses", sdef["id"])]
+            sc = self.cfg["stages"][uses]
             units = pricing.units_for(sdef["kind"], sdef["params"], ctx)
             est = pricing.cost(self.cfg, sc["price_key"], sdef["kind"], units, sdef["params"])
             row = pricing.price_row(self.cfg, sc["price_key"])
@@ -235,6 +248,9 @@ class Runner:
         blocked, waiting, failed = [], [], []
         for sdef in defs:
             sid = sdef["id"]
+            if sdef.get("disabled"):
+                blocked.append(sid)
+                continue
             if only and sid != only:
                 continue
             latest = self.db.latest(job_id, sid)
@@ -306,8 +322,9 @@ class Runner:
         return next(d for d in defs if d["id"] == sid)
 
     def is_complete(self, job_id, defs):
+        active = [d for d in defs if not d.get("disabled")]
         return all(self.is_ready(self.db.latest(job_id, d["id"]), d)
-                   and not self.is_stale(job_id, self.db.latest(job_id, d["id"])) for d in defs)
+                   and not self.is_stale(job_id, self.db.latest(job_id, d["id"])) for d in active)
 
     def rerun(self, job_id, stage, cascade=False):
         st = self.run_job(job_id, only=stage)
@@ -322,6 +339,8 @@ class Runner:
         due_any = waiting = failed = running = False
         for sdef in defs:
             sid = sdef["id"]
+            if sdef.get("disabled"):
+                continue
             latest = self.db.latest(job_id, sid)
             if latest and latest["status"] == "running":
                 running = True
@@ -394,6 +413,8 @@ class Runner:
         try:
             for sdef in defs:
                 sid = sdef["id"]
+                if sdef.get("disabled"):
+                    continue
                 if only and sid != only:
                     continue
                 latest = self.db.latest(job_id, sid)
@@ -509,7 +530,8 @@ class Runner:
         audio_s = pricing.est_audio_seconds(brief["script"], cps)
         if not dry_estimate:
             from .storage import local
-            v = self.db.latest(job["id"], "voice")
+            voice_id = next((d["id"] for d in self.stage_defs(job) if d["kind"] == "voice"), "voice")
+            v = self.db.latest(job["id"], voice_id)
             if v and v["status"] == READY and v["output_path"]:
                 audio_s = duration(local(v["output_path"])) or audio_s
         vid_param = sdef["params"].get("duration", "auto") if sdef["kind"] == "video" else "auto"
@@ -558,6 +580,8 @@ class Runner:
         job_id, sid, kind = job["id"], sdef["id"], sdef["kind"]
         if kind == "brief":
             return self._run_brief(job, sdef)
+        if kind == "intel":
+            return self._run_intel(job, sdef)
         from .storage import local
         job_live = self.live or job.get("mode") == "live"
         mode = "live" if job_live else "dry"
@@ -569,6 +593,9 @@ class Runner:
             r = self.db.latest(job_id, d)
             inputs_ids[d] = r["id"]
             inputs[d] = local(r["output_path"])
+        for key, src in (sdef.get("input_alias") or {}).items():
+            if src in inputs:
+                inputs[key] = inputs[src]
         ctx = self.build_ctx(job, sdef, inputs)
         sc = self.apply_lora_route(job, sdef, sc, ctx)
         if sdef.get("model"):
@@ -600,6 +627,9 @@ class Runner:
         out_dir = self.job_dir(job_id) / sid / f"v{ver}"
         out_dir.mkdir(parents=True, exist_ok=True)
         ctx["out_dir"] = str(out_dir)
+        if kind == "video" and sdef.get("board_node") and not ctx["inputs"].get("still"):
+            # Slice 1 has no Still node. The existing image-to-video adapter still wants a frame.
+            ctx["inputs"]["still"] = self._placeholder_still(out_dir)
         if lead:   # local, free: pad silence before speech so the mouth model has a run-up
             from .media import ff as _ff
             padded = out_dir / "voice_leadin.wav"
@@ -736,12 +766,69 @@ class Runner:
         except Exception as e:
             meta["poster_error"] = str(e)
 
-    def _run_brief(self, job, sdef):
-        rid, ver = self.db.new_run(job["id"], "brief", self.mode, "local", "brief-resolver", "local_ffmpeg",
-                                   "", {}, {}, 0.0)
-        out_dir = self.job_dir(job["id"]) / "brief" / f"v{ver}"
+    def _placeholder_still(self, out_dir):
+        from .media import ff
+        path = Path(out_dir) / "board_still.png"
+        ff(["-f", "lavfi", "-i", "color=c=0x1d2b3a:s=270x480", "-frames:v", "1", str(path)])
+        return str(path)
+
+    def _load_inputs(self, job, sdef):
+        from .storage import local
+        blobs = {}
+        for dep in sdef.get("needs") or []:
+            run = self.db.latest(job["id"], dep)
+            if not run or not run.get("output_path"):
+                continue
+            try:
+                blobs[dep] = json.loads(Path(local(run["output_path"])).read_text())
+            except Exception:
+                continue
+        return blobs
+
+    def _run_intel(self, job, sdef):
+        from .board import artefact_summary, intel_artefact
+        sid = sdef["id"]
+        inputs_ids = {}
+        for dep in sdef.get("needs") or []:
+            run = self.db.latest(job["id"], dep)
+            if run:
+                inputs_ids[dep] = run["id"]
+        rid, ver = self.db.new_run(job["id"], sid, self.mode, "local", "adintel", "local_ffmpeg",
+                                   "", sdef.get("params") or {}, inputs_ids, 0.0)
+        out_dir = self.job_dir(job["id"]) / sid / f"v{ver}"
         out_dir.mkdir(parents=True, exist_ok=True)
-        resolved = {"brief": job["brief"], "persona": self.cfg["_personas"][job["brief"]["persona"]],
+        try:
+            artefact = intel_artefact(sdef, self._load_inputs(job, sdef))
+        except Exception as e:
+            self.db.update_run(rid, status="failed", error=str(e), finished_at=now())
+            self.log(job["id"], sid, "error", str(e))
+            return False
+        path = out_dir / "out.json"
+        path.write_text(json.dumps(artefact, indent=2))
+        self.db.update_run(rid, status=READY, output_path=str(path), meta={"summary": artefact_summary(artefact)},
+                           actual_cost_usd=0.0, cost_basis="local: $0", attempts=1, finished_at=now())
+        self.log(job["id"], sid, "info", f"v{ver} {sdef.get('task')} read ({(artefact.get('evidence') or {}).get('origin')})")
+        if not self._publish(rid, out_dir):
+            return False
+        return True
+
+    def _run_brief(self, job, sdef):
+        sid = sdef["id"]
+        rid, ver = self.db.new_run(job["id"], sid, self.mode, "local", "brief-resolver", "local_ffmpeg",
+                                   "", {}, {}, 0.0)
+        out_dir = self.job_dir(job["id"]) / sid / f"v{ver}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        merged = dict(job["brief"])
+        for blob in self._load_inputs(job, sdef).values():
+            if not isinstance(blob, dict):
+                continue
+            for key in ("pattern_summary", "interpretation", "decode", "label", "topic"):
+                if blob.get(key):
+                    merged[key] = blob[key]
+        if any(k in merged for k in ("pattern_summary", "interpretation", "decode", "label")):
+            self.db.x("UPDATE jobs SET brief_json=? WHERE id=?", (json.dumps(merged), job["id"]))
+            job["brief"] = merged
+        resolved = {"brief": merged, "persona": self.cfg["_personas"][merged["persona"]],
                     "template": self.template(job).get("_path"),
                     "stages": {d["id"]: {"prompt": self.build_ctx(job, d, {}, dry_estimate=True)["prompt"],
                                          "params": d["params"], "needs": d["needs"], "review": d.get("review", False)}
@@ -750,7 +837,7 @@ class Runner:
         p.write_text(json.dumps(resolved, indent=2, default=str))
         self.db.update_run(rid, status=READY, output_path=str(p), actual_cost_usd=0.0, cost_basis="local: $0",
                            attempts=1, finished_at=now())
-        self.log(job["id"], "brief", "info", f"v{ver} resolved prompts saved")
+        self.log(job["id"], sid, "info", f"v{ver} resolved prompts saved")
         if not self._publish(rid, out_dir):
             return False
         return True

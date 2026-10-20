@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, stage TEXT,
   level TEXT, message TEXT, created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS boards (
+  id TEXT PRIMARY KEY, name TEXT, preset INTEGER DEFAULT 0, graph_json TEXT,
+  last_job_id TEXT, created_at TEXT, updated_at TEXT
+);
 """
 
 _lock = threading.Lock()
@@ -301,3 +305,33 @@ class DB:
 
     def events(self, job_id, limit=200):
         return self.q("SELECT * FROM events WHERE job_id=? ORDER BY id DESC LIMIT ?", (job_id, limit))
+
+    # --- boards (graph JSON; Turso when that is the connection, SQLite otherwise)
+    def save_board(self, board_id, name, graph, preset=None, last_job_id=None):
+        t = now()
+        existing = self.board(board_id)
+        blob = json.dumps(graph)
+        if existing:
+            if preset is None:
+                preset = existing["preset"]
+            self.x("UPDATE boards SET name=?, preset=?, graph_json=?, updated_at=?, last_job_id=COALESCE(?, last_job_id) WHERE id=?",
+                   (name, int(bool(preset)), blob, t, last_job_id, board_id))
+        else:
+            self.x("INSERT INTO boards (id, name, preset, graph_json, last_job_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                   (board_id, name, int(bool(preset)), blob, last_job_id, t, t))
+
+    def board(self, board_id):
+        row = self.one("SELECT * FROM boards WHERE id=?", (board_id,))
+        if row:
+            row["graph"] = json.loads(row["graph_json"] or "{}")
+            row["preset"] = bool(row["preset"])
+        return row
+
+    def boards(self):
+        rows = self.q("SELECT id, name, preset, last_job_id, created_at, updated_at FROM boards ORDER BY preset DESC, name")
+        for row in rows:
+            row["preset"] = bool(row["preset"])
+        return rows
+
+    def set_board_job(self, board_id, job_id):
+        self.x("UPDATE boards SET last_job_id=?, updated_at=? WHERE id=?", (job_id, now(), board_id))
