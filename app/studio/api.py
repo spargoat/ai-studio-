@@ -3,7 +3,8 @@ import contextlib, hmac, io, json, os, threading, time
 from pathlib import Path
 from flask import Blueprint, abort, jsonify, request, send_file
 from . import library, persona as P
-from .board import BoardError, compile_board, ensure_presets, job_brief, preview_pack
+from .adintel import configured
+from .board import BoardError, compile_board, ensure_presets, job_brief, preview_config, preview_pack
 from .config import connection_status, key_status, load_template
 from .runner import BriefError, SpendGuardError
 
@@ -153,10 +154,11 @@ def register(app, cfg, runner, live, bg):
             if p.get("key_env"):
                 name, ok = key_status(p)
                 keys.append({"provider": n, "env": name, "set": ok, "optional": bool(p.get("optional_key"))})
-        out, blockers, _ = doctor_text()
+        # doctor() opens a second database and walks the ledger. The settings page
+        # never renders that scan, and on a remote database it held the response for seconds.
         return jsonify({"caps": caps(), "spend": db.effective_spend(), "spend_by_provider": db.spend_summary(),
                         "quality": cfg.get("quality") or {}, "keys": keys, "connections": connection_status(cfg),
-                        "fal_lock": db.fal_lock(), "blockers": blockers, "data_dir": str(data_dir)})
+                        "fal_lock": db.fal_lock(), "blockers": [], "data_dir": str(data_dir)})
 
     @bp.get("/api/spend")
     def spend():
@@ -366,7 +368,13 @@ def register(app, cfg, runner, live, bg):
         ensure_presets(db)
         row = db.board(bid) or abort(404)
         est, err = estimates_for(row["graph"])
-        return jsonify(board_public(row, est, err))
+        body = board_public(row, est, err)
+        # Fixture reads are local. Attach them so the canvas can paint evidence on the
+        # first response. A configured tracker is fetched by /api/intel/preview instead,
+        # so this route does not wait on that network.
+        if not configured():
+            body["preview"] = preview_pack(preview_config(row["graph"]))
+        return jsonify(body)
 
     @bp.put("/api/boards/<bid>")
     def board_save(bid):
@@ -413,12 +421,13 @@ def register(app, cfg, runner, live, bg):
         db.set_board_job(bid, jid)
         if not one_stage():
             run_bg(jid, runner.run_job, jid)
-        else:
-            try:
-                runner.advance(jid)
-            except BriefError as e:
-                return err(e, 409)
-        return jsonify({"id": jid, "mode": "dry"}), 201
+            return jsonify({"id": jid, "mode": "dry", "pump": False}), 201
+        try:
+            runner.advance(jid)
+        except BriefError as e:
+            return err(e, 409)
+        # One request runs one stage. The client keeps calling /advance until a gate.
+        return jsonify({"id": jid, "mode": "dry", "pump": True}), 201
 
     @bp.get("/api/intel/preview")
     def intel_preview():

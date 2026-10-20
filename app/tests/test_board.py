@@ -14,7 +14,8 @@ for k in ("FAL_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS", "ADINTEL_API_URL", "ADI
     os.environ.pop(k, None)
 
 from studio.adintel import FIXTURE_LABEL, LONGEVITY_NOTE, REFERENCE_LABEL, query_ads
-from studio.board import BoardError, compile_board, preview_pack, talking_head_preset, timeline_artefact as board_timeline
+from studio.board import (BoardError, compile_board, preview_config, preview_pack, talking_head_preset,
+                          timeline_artefact as board_timeline)
 from studio.config import connection_status, load_config
 from studio.runner import Runner, SpendGuardError
 from studio.providers import fal, elevenlabs
@@ -249,15 +250,106 @@ class T(unittest.TestCase):
             secret_row = next(r for r in rows if r["id"] == "adintel_secret")
             self.assertEqual(secret_row["mask"], "••••••••")
             self.assertTrue(secret_row["set"])
+            loaded = client.get("/api/boards/talking_head").get_json()
+            self.assertEqual(loaded["preview"]["origin"], "fixture")
+            self.assertIn("Fixture", loaded["preview"]["label"])
+            self.assertTrue(loaded["preview"]["timeline"]["evidence"]["fields"]["points"])
             started = client.post("/api/boards/talking_head/run", json={})
             self.assertEqual(started.status_code, 201, started.get_data(as_text=True))
             payload = started.get_json()
             self.assertEqual(payload["mode"], "dry")
+            self.assertIs(payload["pump"], True)
             job = client.get(f"/api/jobs/{payload['id']}").get_json()
             self.assertEqual(job["job"]["mode"], "dry")
+            # The first request only runs the unwired timeline. The chain continues on /advance.
+            self.assertEqual(_stage_status(job, "timeline"), "succeeded")
+            self.assertIsNone(_stage_status(job, "ad_feed"))
+            last = {}
+            for _ in range(16):
+                last = client.post(f"/api/jobs/{payload['id']}/advance").get_json()
+                if last.get("ok") is False or last.get("status") in ("awaiting_review", "done", "failed"):
+                    break
+                if last.get("action") in ("idle", "stopped"):
+                    break
+            self.assertEqual(last.get("status"), "awaiting_review", last)
+            done = client.get(f"/api/jobs/{payload['id']}").get_json()
+            for sid in ("timeline", "ad_feed", "ad_breakdown", "funnel", "teardown", "brief", "script"):
+                self.assertEqual(_stage_status(done, sid), "succeeded", sid)
+                run = _stage_run(done, sid)
+                self.assertEqual(run["actual_cost_usd"], 0, sid)
+                self.assertEqual(run["mode"], "dry")
+            teardown = _json(_stage_run(done, "teardown")["output_path"])
+            self.assertEqual(teardown["label"], REFERENCE_LABEL)
+            self.assertEqual(teardown["evidence"]["label"], FIXTURE_LABEL)
+            self.assertIs(teardown["evidence"]["live"], False)
+            self.assertEqual(client.get(f"/api/jobs/{payload['id']}").get_json()["job"]["act"], 0)
         finally:
             os.environ.pop("STUDIO_ONE_STAGE", None)
             os.environ.pop("ADINTEL_API_SECRET", None)
+
+    def test_marker_keeps_the_series_and_passes_the_ad_downstream(self):
+        pack = preview_pack({"advertiser": "Northline Markets", "status": "live", "ad_id": "rec_4c91e2",
+                             "event_id": "ev_removed_fieldnote"})
+        fields = pack["timeline"]["evidence"]["fields"]
+        self.assertGreater(len(fields["points"]), 0)
+        self.assertGreater(len(fields["events"]), 0)
+        self.assertEqual(fields["emitted_event"]["id"], "ev_removed_fieldnote")
+        self.assertEqual(pack["timeline"]["emitted_ad_id"], "rec_77aa10")
+        self.assertEqual(pack["timeline"]["ad"]["headline"], "Seven checks")
+        self.assertEqual(pack["feed"]["ad"]["id"], "rec_4c91e2")
+        self.assertEqual(pack["breakdown"]["ad"]["id"], "rec_77aa10")
+        self.assertEqual(pack["breakdown"]["ad"]["status"], "removed")
+        self.assertEqual(pack["funnel"]["evidence"]["fields"]["ad_id"], "rec_77aa10")
+        self.assertEqual(pack["teardown"]["ad"]["id"], "rec_77aa10")
+        self.assertEqual(pack["teardown"]["ad"]["creative_family"], "curiosity-list")
+        self.assertIn("Fixture", pack["label"])
+        self.assertIs(pack["live"], False)
+        self.assertIs(pack["breakdown"]["evidence"]["live"], False)
+
+    def test_empty_preview_is_labelled_fixture(self):
+        pack = preview_pack({})
+        self.assertEqual(pack["origin"], "fixture")
+        self.assertIn("Fixture", pack["label"])
+        self.assertTrue(pack["feed"]["evidence"]["fields"]["ads"])
+        self.assertTrue(pack["timeline"]["evidence"]["fields"]["points"])
+        self.assertTrue(pack["breakdown"]["ad"])
+        self.assertTrue(pack["teardown"]["pattern_summary"])
+        graph = talking_head_preset()
+        self.assertEqual(preview_config(graph)["event_id"], "ev_launch_northline")
+        self.assertEqual(preview_config(graph)["ad_id"], "rec_4c91e2")
+
+    def test_settings_does_not_run_doctor(self):
+        calls = []
+
+        def fake_doctor(_cfg):
+            calls.append("doctor")
+            print("OK: live preflight would pass")
+            return 0
+
+        with patch("studio.cli.doctor", fake_doctor):
+            app = create_app(cfg(), live=False)
+            client = app.test_client()
+            settings = client.get("/api/settings")
+            self.assertEqual(settings.status_code, 200, settings.get_data(as_text=True))
+            body = settings.get_json()
+            self.assertIn("connections", body)
+            self.assertEqual(calls, [])
+            overview = client.get("/api/overview")
+            self.assertEqual(overview.status_code, 200, overview.get_data(as_text=True))
+            self.assertEqual(calls, ["doctor"])
+            self.assertIn("doctor", overview.get_json())
+
+
+def _stage_run(job, sid):
+    for stage in job["stages"]:
+        if stage["id"] == sid and stage["runs"]:
+            return stage["runs"][-1]
+    return None
+
+
+def _stage_status(job, sid):
+    run = _stage_run(job, sid)
+    return run["status"] if run else None
 
 
 if __name__ == "__main__":

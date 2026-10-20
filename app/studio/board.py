@@ -17,7 +17,7 @@ NODES = {
                      "inputs": [("ad", "ad")], "outputs": [("ad", "ad")]},
     "funnel_route": {"tab": "intel", "kind": "intel", "task": "funnel",
                      "inputs": [("ad", "ad")], "outputs": [("page", "page")]},
-    "teardown": {"tab": "intel", "kind": "intel", "task": "teardown", "needs_key": "llm",
+    "teardown": {"tab": "intel", "kind": "intel", "task": "teardown",
                  "inputs": [("ad", "ad"), ("page", "page")], "outputs": [("brief", "brief")]},
     "market_timeline": {"tab": "intel", "kind": "intel", "task": "timeline",
                         "inputs": [], "outputs": [("ad", "ad")]},
@@ -372,14 +372,33 @@ def artefact_summary(artefact):
     }
 
 
+def preview_config(graph):
+    """Feed filters plus the timeline marker, which is what the canvas asks the read API for."""
+    nodes = (graph or {}).get("nodes") or []
+    feed = next((n for n in nodes if n.get("type") == "ad_feed"), None)
+    timeline = next((n for n in nodes if n.get("type") == "market_timeline"), None)
+    config = dict((feed or {}).get("config") or {})
+    event_id = ((timeline or {}).get("config") or {}).get("event_id") or ""
+    if event_id:
+        config["event_id"] = event_id
+    return config
+
+
 def preview_pack(config=None):
-    """Same builders the stages use, so the canvas can show a read before a run."""
-    config = config or {}
-    feed = feed_artefact(config)
-    breakdown = breakdown_artefact(feed)
-    funnel = funnel_artefact(feed)
-    teardown = teardown_artefact(breakdown, funnel)
+    """Same builders the stages use, so the canvas can show a read before a run.
+
+    A selected timeline marker keeps the series and passes that event's ad to
+    Breakdown, Funnel and Teardown. The feed keeps its own query.
+    """
+    config = dict(config or {})
+    feed_config = {k: v for k, v in config.items() if k != "event_id"}
     timeline = timeline_artefact(config)
+    emitted = timeline.get("ad") if config.get("event_id") else None
+    source = {"type": "ad", "ad": emitted} if emitted else None
+    feed = feed_artefact(feed_config)
+    breakdown = breakdown_artefact(source or feed)
+    funnel = funnel_artefact(source or feed)
+    teardown = teardown_artefact(breakdown, funnel)
     origin = (feed.get("evidence") or {}).get("origin")
     return {"origin": origin, "live": origin == "live",
             "label": (feed.get("evidence") or {}).get("label") or FIXTURE_LABEL,

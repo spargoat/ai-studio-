@@ -67,7 +67,7 @@ function Origin({ evidence }: { evidence?: Artefact["evidence"] }) {
   );
 }
 
-function Split({ artefact, nodeType, nodeId }: { artefact?: Artefact | null; nodeType: string; nodeId: string }) {
+function Split({ artefact, nodeType, nodeId, selectedEvent }: { artefact?: Artefact | null; nodeType: string; nodeId: string; selectedEvent?: string }) {
   const evidence = artefact?.evidence;
   const fields = evidence?.fields || {};
   const picked = (fields.picked as { headline?: string; advertiser?: string } | undefined) || artefact?.ad;
@@ -81,7 +81,7 @@ function Split({ artefact, nodeType, nodeId }: { artefact?: Artefact | null; nod
         {nodeType === "funnel_route" && steps.length > 0 && (
           <p className="text-[10px] text-zinc-400 mt-1">{steps.map((s) => s.label).filter(Boolean).join(" → ")}</p>
         )}
-        {nodeType === "market_timeline" && <TimelineChart nodeId={nodeId} artefact={artefact} />}
+        {nodeType === "market_timeline" && <TimelineChart nodeId={nodeId} artefact={artefact} selectedId={selectedEvent} />}
         {nodeType === "market_timeline" && !!fields.emitted_event && (
           <p className="text-[10px] text-zinc-200">
             <span className="text-zinc-500">Event. </span>
@@ -108,12 +108,12 @@ function Split({ artefact, nodeType, nodeId }: { artefact?: Artefact | null; nod
   );
 }
 
-function TimelineChart({ nodeId, artefact }: { nodeId: string; artefact?: Artefact | null }) {
+function TimelineChart({ nodeId, artefact, selectedId }: { nodeId: string; artefact?: Artefact | null; selectedId?: string }) {
   const { pickEvent } = useContext(BoardCtx);
   const fields = artefact?.evidence?.fields || {};
   const points = (fields.points as { date: string; reach: number; live_ads: number }[] | undefined) || [];
   const events = (fields.events as { id: string; date: string; kind: string; label: string; ad_id?: string }[] | undefined) || [];
-  const selected = (fields.emitted_event as { id?: string } | undefined)?.id;
+  const selected = selectedId || (fields.emitted_event as { id?: string } | undefined)?.id;
   if (!points.length) return <p className="text-[10px] text-zinc-500 mt-1">No series in this read.</p>;
   const w = 308, h = 128, pad = 18;
   const maxR = Math.max(...points.map((p) => Number(p.reach) || 0), 1);
@@ -190,8 +190,9 @@ export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "boa
   const preview = data.preview;
   return (
     <article data-node={data.nodeType} style={{ width: spec.width }}
-      className={`rounded-xl border bg-zinc-950/95 shadow-lg overflow-hidden ${selected ? "ring-2 ring-offset-0" : ""} ${
+      className={`rounded-xl border bg-zinc-950/95 shadow-lg ${selected ? "ring-2 ring-offset-0" : ""} ${
         intel ? "border-teal-700/80 ring-teal-400" : "border-violet-700/80 ring-violet-400"} ${data.enabled ? "" : "opacity-60"}`}>
+      <div className="overflow-hidden rounded-[11px]">
       <header className={`flex items-center gap-2 px-2.5 py-2 border-b ${intel ? "bg-teal-950/50 border-teal-900/60" : "bg-violet-950/40 border-violet-900/60"}`}>
         <span className={`shrink-0 w-8 h-8 rounded-lg flex items-center justify-center ${intel ? "bg-teal-500/15 text-teal-300" : "bg-violet-500/15 text-violet-300"}`}>
           <Icon size={16} aria-hidden />
@@ -215,7 +216,7 @@ export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "boa
           </Link>
         </div>
       )}
-      {intel ? <Split artefact={preview} nodeType={data.nodeType} nodeId={id} /> : (
+      {intel ? <Split artefact={preview} nodeType={data.nodeType} nodeId={id} selectedEvent={data.config.event_id} /> : (
         <p className="px-2.5 pb-2 text-[10px] text-zinc-500">
           {data.nodeType === "script" && "Wraps the script stage. Dry run writes [MOCK] copy."}
           {data.nodeType === "voice" && "Wraps the voice stage. Dry run is silent audio, $0."}
@@ -223,6 +224,7 @@ export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "boa
           {data.nodeType === "brief" && "Wraps the brief stage. Pattern summary stays above the decode."}
         </p>
       )}
+      </div>
       <Handles spec={spec} />
     </article>
   );

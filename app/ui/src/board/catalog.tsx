@@ -23,7 +23,7 @@ export const CATALOG: Record<string, NodeSpec> = {
     inputs: [{ id: "ad", type: "ad" }], outputs: [{ id: "ad", type: "ad" }] },
   funnel_route: { type: "funnel_route", side: "intel", headline: "Funnel", icon: Route, width: 268,
     inputs: [{ id: "ad", type: "ad" }], outputs: [{ id: "page", type: "page" }] },
-  teardown: { type: "teardown", side: "intel", headline: "Teardown", icon: Microscope, width: 280, needsKey: "llm",
+  teardown: { type: "teardown", side: "intel", headline: "Teardown", icon: Microscope, width: 280,
     inputs: [{ id: "ad", type: "ad" }, { id: "page", type: "page" }], outputs: [{ id: "brief", type: "brief" }] },
   market_timeline: { type: "market_timeline", side: "intel", headline: "Timeline", icon: ChartNoAxesCombined, width: 340,
     inputs: [], outputs: [{ id: "ad", type: "ad" }] },
