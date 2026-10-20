@@ -122,6 +122,48 @@ class T(unittest.TestCase):
         self.assertEqual(ok.status_code, 302)
         self.assertIn("blob.vercel-storage.com", ok.headers["Location"])
 
+    def test_vercel_without_database_url_fails_closed(self):
+        from studio.db import DB, DatabaseNotConfigured
+        keys = ("VERCEL", "TURSO_DATABASE_URL", "LIBSQL_URL", "STUDIO_SQLITE", "CRON_SECRET")
+        saved = {k: os.environ.get(k) for k in keys}
+
+        def restore():
+            for k, v in saved.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+        self.addCleanup(restore)
+        for k in keys:
+            os.environ.pop(k, None)
+        os.environ["VERCEL"] = "1"
+        path = TMP / "vercel-missing.db"
+        with self.assertRaises(DatabaseNotConfigured):
+            DB(path)
+        self.assertFalse(path.exists())
+        c = cfg()
+        c["_db_file"] = path
+        client = create_app(c).test_client()
+        for route in ("/", "/api/jobs", "/api/meta", "/classic"):
+            res = client.get(route)
+            self.assertEqual(res.status_code, 503, route)
+            self.assertIn("Database not configured", res.get_data(as_text=True))
+        self.assertEqual(client.post("/api/jobs", json={"brief": BRIEF}).status_code, 503)
+        os.environ["CRON_SECRET"] = "cron-test"
+        cron = client.get("/api/cron/advance", headers={"Authorization": "Bearer cron-test"})
+        self.assertEqual(cron.status_code, 503)
+        self.assertIn("Database not configured", cron.get_data(as_text=True))
+        self.assertNotIn("advanced", cron.get_data(as_text=True))
+        self.assertFalse(path.exists())
+        self.assertEqual(client.get("/healthz").status_code, 200)
+        os.environ["STUDIO_SQLITE"] = "1"
+        client = create_app(c).test_client()
+        self.assertEqual(client.get("/api/jobs").status_code, 200)
+        cron = client.get("/api/cron/advance", headers={"Authorization": "Bearer cron-test"})
+        self.assertEqual(cron.status_code, 200)
+        self.assertEqual(cron.get_json()["advanced"], [])
+        self.assertTrue(path.exists())
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -92,14 +92,37 @@ class _LibsqlConn:
         self._raw.close()
 
 
+class DatabaseNotConfigured(RuntimeError):
+    """Vercel has no Turso/libSQL URL and STUDIO_SQLITE is not set. Do not open /tmp SQLite."""
+
+
+def remote_database_url():
+    return os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL") or ""
+
+
+def missing_on_vercel():
+    """True when a Vercel instance would otherwise hide jobs in ephemeral SQLite."""
+    if os.environ.get("VERCEL") != "1":
+        return False
+    if os.environ.get("STUDIO_SQLITE") == "1":
+        return False
+    return not remote_database_url()
+
+
 def _open(path):
-    """Turso/libSQL when TURSO_DATABASE_URL or LIBSQL_URL is set, else local SQLite."""
-    url = os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL")
+    """Turso/libSQL when a URL is set. Local SQLite otherwise, except on Vercel.
+
+    On Vercel, /tmp SQLite disappears with the instance. Refuse to open it
+    unless STUDIO_SQLITE=1 is set explicitly for a test.
+    """
+    url = remote_database_url()
     if url and os.environ.get("STUDIO_SQLITE") != "1":
         import libsql
         token = os.environ.get("TURSO_AUTH_TOKEN") or os.environ.get("LIBSQL_AUTH_TOKEN") or ""
         raw = libsql.connect(database=url, auth_token=token, _check_same_thread=False)
         return _LibsqlConn(raw)
+    if missing_on_vercel():
+        raise DatabaseNotConfigured("Database not configured")
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30)

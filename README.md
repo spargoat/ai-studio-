@@ -11,7 +11,7 @@ Source lives in [`app/`](app/). Engine commands and templates are in [app/README
 | --- | --- |
 | API, login, `/file`, classic pages | Flask app `app/wsgi.py` (one Python function) |
 | Hashed UI assets | `public/assets`, copied from `app/ui/dist` at build |
-| Jobs database | Turso/libSQL when `TURSO_DATABASE_URL` is set; local SQLite otherwise (tests and CLI) |
+| Jobs database | Turso/libSQL when `TURSO_DATABASE_URL` is set. Local SQLite otherwise. On Vercel, with no URL and without `STUDIO_SQLITE=1`, the app does not open `/tmp` SQLite: app and `/api` routes return 503 `Database not configured`, and `/api/cron/advance` does not write |
 | Job files | Vercel Blob when `BLOB_READ_WRITE_TOKEN` is set. A stage pulls inputs into `/tmp`, runs, uploads outputs, and stores the Blob URL. `/file` redirects only to `*.blob.vercel-storage.com` |
 | Progress | `POST /api/jobs/<id>/advance` runs one stage, or one fal queue poll. Cron `GET /api/cron/advance` moves jobs in `created`, `running`, or `partial` |
 | Face score | Optional. Local installs use `pip install '.[score]'` (numpy + opencv-python-headless). The request function does not include them. YuNet + SFace (`yunet.onnx`, `sface.onnx`) download into `/tmp` on first score, from Blob `runtime/<name>` when that object exists, otherwise from the [OpenCV model zoo](https://github.com/opencv/opencv_zoo), then the bytes are stored in Blob |
@@ -56,7 +56,7 @@ Leave unset until a live run is intended. Caps in `app/config/config.yaml` still
 | --- | --- |
 | `STUDIO_COOKIE_SECURE` | Set to `1` to mark the cookie Secure even when the proxy header is absent. HTTPS on Vercel sets this from `X-Forwarded-Proto` |
 | `VERCEL_SUPPORT_LARGE_FUNCTIONS` | Set to `1` only if the Python bundle exceeds the 500 MB standard limit |
-| `STUDIO_SQLITE` | Set to `1` to force the local SQLite file even if a Turso URL is present (tests) |
+| `STUDIO_SQLITE` | Set to `1` to force the local SQLite file. On Vercel this is a testing override: without it, a missing Turso URL is a 503, not an ephemeral database. Also forces SQLite when a Turso URL is present |
 | `STUDIO_FETCH_FFMPEG` | Set to `1` to download the static ffmpeg outside Vercel. On Vercel this happens when `VERCEL=1` |
 
 `VERCEL` is set by the platform. Do not copy it into a local `.env`.
