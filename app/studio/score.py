@@ -8,7 +8,9 @@ import cv2
 import numpy as np
 from . import APP_DIR
 
-MODELS = APP_DIR / "models"
+def _models():
+    from .assets import model_dir
+    return model_dir()
 try:
     cv2.utils.logging.setLogLevel(cv2.utils.logging.LOG_LEVEL_ERROR)
 except Exception:
@@ -23,7 +25,7 @@ _dets = {}
 def _det(shape):
     k = (shape[1], shape[0])
     if k not in _dets:
-        _dets[k] = cv2.FaceDetectorYN.create(str(MODELS / "yunet.onnx"), "", k, 0.7)
+        _dets[k] = cv2.FaceDetectorYN.create(str(_models() / "yunet.onnx"), "", k, 0.7)
     return _dets[k]
 
 
@@ -31,7 +33,7 @@ _rec = None
 def _recog():
     global _rec
     if _rec is None:
-        _rec = cv2.FaceRecognizerSF.create(str(MODELS / "sface.onnx"), "")
+        _rec = cv2.FaceRecognizerSF.create(str(_models() / "sface.onnx"), "")
     return _rec
 
 
@@ -113,6 +115,8 @@ def visual_flags(v, q, stage=None):
 
 
 def score_file(cfg, persona, path, n_frames=5, stage=None):
+    from .storage import local
+    path = local(path)
     q = cfg.get("quality") or {}
     thr = float(q.get("identity_threshold", 0.45))
     frs = frames(path, n_frames)
@@ -145,4 +149,6 @@ def score_file(cfg, persona, path, n_frames=5, stage=None):
 
 
 def scorable(path):
+    from .storage import local
+    path = local(path) if path else path
     return bool(path) and str(path).lower().endswith(IMG + VID) and Path(path).exists()

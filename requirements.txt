@@ -1,0 +1,7 @@
+flask>=3.0.3
+pyyaml>=6.0
+requests>=2.32
+numpy>=1.26
+opencv-python-headless>=4.10
+libsql>=0.1.11
+waitress>=3.0

@@ -65,15 +65,20 @@ def export(db, out_dir, persona=None, promoted=False, job=None, ids=None, zip_it
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
     items = []
     for r in rows:
-        src = Path(r["path"] or "")
+        from .storage import local
+        src = Path(local(r["path"] or "") or "")
         if not src.exists():
             items.append({"library_id": r["id"], "skipped": f"missing file {src}"}); continue
         d = out / f"{r['job_id']}_{r['stage']}_v{r['version']}"; d.mkdir(exist_ok=True)
         run_dir = src.parent; files = []
-        meta = json.loads((run_dir / "meta.json").read_text()) if (run_dir / "meta.json").exists() else {}
+        if (run_dir / "meta.json").exists():
+            meta = json.loads((run_dir / "meta.json").read_text())
+        else:
+            stored = db.one("SELECT meta_json FROM stage_runs WHERE id=?", (r.get("stage_run_id"),))
+            meta = json.loads((stored or {}).get("meta_json") or "{}") if stored else {}
         media = list((meta.get("exports") or {}).items()) or [("source", str(src))]
         for asp, p in media:
-            p = Path(p)
+            p = Path(local(str(p)) or "")
             if not p.exists():
                 continue
             shutil.copy2(p, d / p.name); files.append(p.name)

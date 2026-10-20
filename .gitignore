@@ -3,6 +3,7 @@ node_modules/
 dist/
 .env*
 models/
+fonts/
 bin/
 __pycache__/
 *.pyc

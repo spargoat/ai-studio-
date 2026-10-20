@@ -13,6 +13,7 @@ from .db import DB, now
 from . import pricing
 from .media import duration, poster
 from .providers import make, ProviderError, NonRetryable
+from .providers.fal import FalPending
 
 READY = "succeeded"
 
@@ -39,6 +40,7 @@ class Runner:
         self.auto_check = auto_check   # live: gates pass only if automated blank/corrupt QC passes
         self.fail_inject = fail_inject or {}
         self.provider_override = provider_override or {}
+        self.async_fal = False          # advance(): one fal queue poll per request, no blocking wait
         self.db = DB(cfg["_db_file"])
         self.log_fn = log
         if live:
@@ -90,8 +92,10 @@ class Runner:
                                   f"({lock['job_id']}/{lock['stage']}: exhausted balance). Top up at fal.ai, then "
                                   "rerun with STUDIO_FAL_TOPPED_UP=1 (or price the fallback routes in config)")
 
-    def check_budget(self, job_id, est):
-        if not self.live:
+    def check_budget(self, job_id, est, live=None):
+        if live is None:
+            live = self.live
+        if not live:
             return
         g, j, d = self.caps()
         spent_job = self.db.live_spend(job_id)
@@ -111,11 +115,13 @@ class Runner:
         self.db.log(job_id, stage, level, msg)
         self.log_fn(f"[{self.mode}] {job_id} {stage or '-'} {level}: {msg}")
 
-    def fallback_route(self, stage, sc):
+    def fallback_route(self, stage, sc, live=None):
         """fal locked + a priced fallback route -> that route, else None. Never used in dry-run."""
+        if live is None:
+            live = self.live
         fb = self.cfg.get("fallback") or {}
         route = (fb.get("routes") or {}).get(stage)
-        if not (self.live and fb.get("enabled") and route and sc["provider"] == "fal"):
+        if not (live and fb.get("enabled") and route and sc["provider"] == "fal"):
             return None
         if os.environ.get("STUDIO_FAL_TOPPED_UP") == "1" or not self.db.fal_lock():
             return None
@@ -124,14 +130,16 @@ class Runner:
             return None
         return {**sc, **route}
 
-    def provider_for(self, stage):
+    def provider_for(self, stage, live=None):
+        if live is None:
+            live = self.live
         sc = self.cfg["stages"][stage]
-        fb = self.fallback_route(stage, sc)
+        fb = self.fallback_route(stage, sc, live=live)
         if fb:
             sc = fb
         name = self.provider_override.get(stage, sc["provider"])
         p = make(name, self.cfg)
-        if not self.live and p.paid:
+        if not live and p.paid:
             p = make("mock", self.cfg)   # DRY_RUN: every paid adapter is swapped for the mock
         return p, sc
 
@@ -307,6 +315,144 @@ class Runner:
             st = self.run_job(job_id)
         return st
 
+    def settle(self, job_id):
+        """Set job status from what is already stored. Does not run a stage."""
+        job = self.db.job(job_id)
+        defs = self.stage_defs(job)
+        due_any = waiting = failed = running = False
+        for sdef in defs:
+            sid = sdef["id"]
+            latest = self.db.latest(job_id, sid)
+            if latest and latest["status"] == "running":
+                running = True
+                continue
+            deps_ok = all(self.is_ready(self.db.latest(job_id, d), self.def_of(defs, d)) for d in sdef["needs"])
+            if not deps_ok:
+                continue
+            if latest and latest["status"] in ("failed", "blocked_budget"):
+                failed = True
+                continue
+            if latest and latest["status"] == READY and latest["review_status"] == "rejected":
+                waiting = True
+                continue
+            if latest is None or latest["status"] != READY or self.is_stale(job_id, latest):
+                due_any = True
+                continue
+            if sdef.get("review") and latest["review_status"] != "approved":
+                if latest["review_status"] != "pending":
+                    self.db.update_run(latest["id"], review_status="pending")
+                waiting = True
+        if running:
+            st = "running"
+        elif due_any:
+            st = "partial"
+        elif failed:
+            st = "failed"
+        elif waiting:
+            st = "awaiting_review"
+        elif self.is_complete(job_id, defs):
+            st = "done"
+        else:
+            st = "blocked"
+        self.db.set_job_status(job_id, st)
+        if st == "done":
+            from . import library
+            for sid in library.FINAL:
+                lr = self.db.latest(job_id, sid)
+                if lr and lr["status"] == READY:
+                    library.add(self.db, lr, "final output of a done job")
+        return st
+
+    def advance(self, job_id, only=None):
+        """Run one due stage, or poll one in-flight fal request. Safe to call again."""
+        job = self.db.job(job_id)
+        if not job:
+            raise BriefError(f"no job {job_id}")
+        defs = self.stage_defs(job)
+        running = [r for r in self.db.runs(job_id) if r["status"] == "running"]
+        if running:
+            run = running[-1]
+            meta = json.loads(run["meta_json"] or "{}")
+            if meta.get("fal"):
+                self._poll_fal(job, run)
+                return {"action": "poll", "stage": run["stage"], "status": self.settle(job_id)}
+            return {"action": "busy", "stage": run["stage"], "status": "running"}
+        self.async_fal = True
+        try:
+            for sdef in defs:
+                sid = sdef["id"]
+                if only and sid != only:
+                    continue
+                latest = self.db.latest(job_id, sid)
+                deps_ok = all(self.is_ready(self.db.latest(job_id, d), self.def_of(defs, d)) for d in sdef["needs"])
+                if not deps_ok:
+                    if only:
+                        self.log(job_id, sid, "warn", "cannot rerun: upstream not ready/approved")
+                    continue
+                if latest and latest["status"] == READY and latest["review_status"] == "rejected" and not only:
+                    continue
+                due = only is not None or latest is None or latest["status"] != READY or self.is_stale(job_id, latest)
+                if not due:
+                    continue
+                self.db.set_job_status(job_id, "running")
+                result = self.run_stage(job, sdef)
+                return {"action": "stage", "stage": sid, "ok": result is True or result == "pending",
+                        "pending": result == "pending", "status": self.settle(job_id)}
+        finally:
+            self.async_fal = False
+        return {"action": "idle", "status": self.settle(job_id)}
+
+    def _poll_fal(self, job, run):
+        """One status check for a submitted fal request. Downloads the output when it is done."""
+        from .providers.fal import FalProvider
+        meta = json.loads(run["meta_json"] or "{}")
+        falm = meta.get("fal") or {}
+        provider, sc = self.provider_for(run["stage"], live=True)
+        if not isinstance(provider, FalProvider):
+            provider = FalProvider("fal", self.cfg["providers"]["fal"])
+        provider.cfg = {**provider.cfg, "max_polls": 1, "poll_seconds": 0}
+        try:
+            result = provider._wait(falm["request_id"], falm["status_url"], falm["response_url"], timeout=90)
+        except FalPending as e:
+            falm["status"] = e.status
+            meta["fal"] = falm
+            self.db.update_run(run["id"], meta=meta)
+            self.log(job["id"], run["stage"], "info", f"fal {falm['request_id']} still {e.status}")
+            return False
+        except Exception as e:
+            if falm.get("aid"):
+                self.db.update_attempt(falm["aid"], status="failed", error=str(e), finished_at=now())
+            self.db.update_run(run["id"], status="failed", error=str(e), finished_at=now())
+            self.log(job["id"], run["stage"], "error", f"fal poll failed: {e}")
+            return False
+        out_dir = self.job_dir(job["id"]) / run["stage"] / f"v{run['version']}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            res = provider.save_result(falm["kind"], result, out_dir)
+        except Exception as e:
+            self.db.update_run(run["id"], status="failed", error=str(e), finished_at=now())
+            self.log(job["id"], run["stage"], "error", f"fal download failed: {e}")
+            return False
+        res["request_id"] = falm["request_id"]
+        job_live = True
+        actual = pricing.cost(self.cfg, falm.get("price_key") or sc["price_key"], falm["kind"],
+                              float(res["units_actual"]), {}) if job_live else 0.0
+        if falm.get("aid"):
+            self.db.update_attempt(falm["aid"], status="succeeded", actual_cost_usd=actual,
+                                   provider_request_id=falm["request_id"], finished_at=now())
+        out_meta = res.get("meta") or {}
+        self._thumb(res["output_path"], out_dir, out_meta)
+        (out_dir / "meta.json").write_text(json.dumps(out_meta, indent=2))
+        sdef = next((d for d in self.stage_defs(job) if d["id"] == run["stage"]), {})
+        self.db.update_run(run["id"], status=READY, output_path=res["output_path"], meta=out_meta,
+                           actual_cost_usd=actual, attempts=falm.get("attempt") or run["attempts"],
+                           finished_at=now(), review_status="pending" if sdef.get("review") else None)
+        self.score_run(run["id"])
+        from .storage import publish_run
+        publish_run(self.db, run["id"], out_dir)
+        self.log(job["id"], run["stage"], "info", f"v{run['version']} fal {falm['request_id']} completed")
+        return True
+
     def review(self, job_id, stage, verdict, note=""):
         run = self.db.latest(job_id, stage)
         if not run or run["status"] != READY:
@@ -324,19 +470,21 @@ class Runner:
         cps = (next((d for d in self.stage_defs(job) if d["kind"] == "voice"), {}).get("params") or {}).get("chars_per_second", 15)
         audio_s = pricing.est_audio_seconds(brief["script"], cps)
         if not dry_estimate:
+            from .storage import local
             v = self.db.latest(job["id"], "voice")
             if v and v["status"] == READY and v["output_path"]:
-                audio_s = duration(v["output_path"]) or audio_s
+                audio_s = duration(local(v["output_path"])) or audio_s
         vid_param = sdef["params"].get("duration", "auto") if sdef["kind"] == "video" else "auto"
         video_s = pricing.auto_video_seconds(audio_s) if vid_param in (None, "auto") else int(vid_param)
         fmt = {"look": persona.get("look", ""), "setting": brief.get("setting", ""),
                "persona": persona.get("display", brief["persona"]), "script": brief["script"]}
         fmt.update({k: v for k, v in brief.items() if isinstance(v, str) and k not in fmt})
         script_txt = brief["script"]
+        from .storage import local
         for d, pth in (inputs or {}).items():
             if pth and str(pth).endswith(".json") and d != "brief":
                 try:
-                    t = json.loads(Path(pth).read_text())
+                    t = json.loads(Path(local(pth)).read_text())
                 except Exception:
                     continue
                 fmt[d] = t.get("text", ""); fmt[f"{d}_first"] = (t.get("items") or [""])[0]
@@ -347,7 +495,7 @@ class Runner:
                 if sd["kind"] == "script":
                     lr = self.db.latest(job["id"], sd["id"])
                     if lr and lr["status"] == READY and lr["output_path"]:
-                        script_txt = json.loads(Path(lr["output_path"]).read_text()).get("script") or script_txt
+                        script_txt = json.loads(Path(local(lr["output_path"])).read_text()).get("script") or script_txt
 
         class _Keep(dict):
             def __missing__(self, k):
@@ -372,12 +520,17 @@ class Runner:
         job_id, sid, kind = job["id"], sdef["id"], sdef["kind"]
         if kind == "brief":
             return self._run_brief(job, sdef)
-        provider, sc = self.provider_for(sdef.get("uses", sid))
+        from .storage import local
+        job_live = self.live or job.get("mode") == "live"
+        mode = "live" if job_live else "dry"
+        provider, sc = self.provider_for(sdef.get("uses", sid), live=job_live)
+        if self.async_fal and provider.name == "fal":
+            provider.cfg = {**provider.cfg, "max_polls": 1, "poll_seconds": 0}
         inputs_ids, inputs = {}, {}
         for d in sdef["needs"]:
             r = self.db.latest(job_id, d)
             inputs_ids[d] = r["id"]
-            inputs[d] = r["output_path"]
+            inputs[d] = local(r["output_path"])
         ctx = self.build_ctx(job, sdef, inputs)
         sc = self.apply_lora_route(job, sdef, sc, ctx)
         if sdef.get("model"):
@@ -390,16 +543,18 @@ class Runner:
         if kind == "compose":     # exact caption timings when the voice result stored an ElevenLabs alignment
             v = self.db.latest(job_id, "voice")
             ap = v and json.loads(v["meta_json"] or "{}").get("alignment_path")
+            if ap:
+                ap = local(ap)
             if ap and Path(ap).exists():
                 ls_def = next((d for d in self.stage_defs(job) if d["kind"] == "lipsync"), None)
                 al_off = float(((ls_def or {}).get("params") or {}).get("audio_lead_in_s") or 0)
                 ctx["params"]["_alignment"], ctx["params"]["_alignment_offset"] = ap, al_off
-        ctx["live"] = self.live
+        ctx["live"] = job_live
         if lead:
             ctx["audio_seconds"] = round(ctx["audio_seconds"] + float(lead), 2)
         units = pricing.units_for(kind, ctx["params"] if kind != "video" else sdef["params"], ctx)
         est = pricing.cost(self.cfg, sc["price_key"], kind, units, ctx["params"])
-        rid, ver = self.db.new_run(job_id, sid, self.mode, provider.name if self.live else
+        rid, ver = self.db.new_run(job_id, sid, mode, provider.name if job_live else
                                    f"mock (dry-run of {sc['provider']})" if provider.name == "mock" else provider.name,
                                    sc["model"], sc["price_key"], ctx["prompt"],
                                    {**ctx["params"], **({"duration": ctx["video_seconds"]} if kind == "video" else {})},
@@ -416,33 +571,33 @@ class Runner:
         (out_dir / "request.json").write_text(json.dumps(
             {k: v for k, v in ctx.items() if k not in ("fail_inject",)}, indent=2, default=str))
         self.log(job_id, sid, "info", f"v{ver} est ${est:.4f} ({units:.3g} x {pricing.describe(self.cfg, sc['price_key'])})"
-                 + ("" if self.live or not provider.paid and provider.name != "mock" else " [DRY_RUN: mock, $0 charged]"))
+                 + ("" if job_live or not provider.paid and provider.name != "mock" else " [DRY_RUN: mock, $0 charged]"))
         rcfg = self.cfg.get("retries") or {}
         max_try = 1 + int(rcfg.get("max_retries", 2))
-        backoff = rcfg.get("backoff_seconds", [2, 8]) if self.live else [rcfg.get("dry_run_backoff_seconds", 0.1)] * 5
+        backoff = rcfg.get("backoff_seconds", [2, 8]) if job_live else [rcfg.get("dry_run_backoff_seconds", 0.1)] * 5
         last_err = None
         for attempt in range(1, max_try + 1):
             ctx["attempt"] = attempt
-            att_est = est if (self.live and provider.paid) else 0.0
+            att_est = est if (job_live and provider.paid) else 0.0
             try:
-                self.check_budget(job_id, att_est)
+                self.check_budget(job_id, att_est, live=job_live)
             except SpendGuardError as e:
                 self.db.update_run(rid, status="blocked_budget", error=str(e), attempts=attempt - 1, finished_at=now())
                 self.log(job_id, sid, "error", f"SPEND GUARD: {e} - no call made")
                 return False
-            aid = self.db.add_attempt(stage_run_id=rid, job_id=job_id, stage=sid, attempt=attempt, mode=self.mode,
+            aid = self.db.add_attempt(stage_run_id=rid, job_id=job_id, stage=sid, attempt=attempt, mode=mode,
                                       provider=provider.name, model=sc["model"], status="running",
                                       est_cost_usd=att_est, started_at=now())
             t0 = time.time()
             try:
                 res = provider.run(kind, ctx)
                 actual = pricing.cost(self.cfg, sc["price_key"], kind, float(res["units_actual"]), ctx["params"]) \
-                    if (self.live and provider.paid) else 0.0
+                    if (job_live and provider.paid) else 0.0
                 self.db.update_attempt(aid, status="succeeded", actual_cost_usd=actual,
                                        provider_request_id=res.get("request_id"), finished_at=now(),
                                        latency_s=round(time.time() - t0, 2))
                 basis = ("computed from output units x price table; reconcile with provider dashboard"
-                         if self.live and provider.paid else
+                         if job_live and provider.paid else
                          "DRY_RUN mock: $0 charged" if provider.name == "mock" else "local: $0")
                 meta = res.get("meta") or {}
                 self._thumb(res["output_path"], out_dir, meta)
@@ -453,7 +608,18 @@ class Runner:
                                    review_status="pending" if sdef.get("review") else None)
                 self.log(job_id, sid, "info", f"v{ver} ok in {time.time()-t0:.1f}s, actual ${actual:.4f}, attempt {attempt}/{max_try}")
                 self.score_run(rid)
+                from .storage import publish_run
+                publish_run(self.db, rid, out_dir)
                 return True
+            except FalPending as e:
+                meta = {"fal": {"request_id": e.request_id, "status_url": e.status_url,
+                                "response_url": e.response_url, "status": e.status, "kind": kind,
+                                "model": sc["model"], "attempt": attempt, "aid": aid,
+                                "price_key": sc["price_key"], "version": ver}}
+                self.db.update_attempt(aid, status="running", provider_request_id=e.request_id)
+                self.db.update_run(rid, status="running", meta=meta, attempts=attempt)
+                self.log(job_id, sid, "info", f"v{ver} submitted to fal ({e.request_id}); poll on the next advance")
+                return "pending"
             except NonRetryable as e:
                 last_err = f"attempt {attempt}: {e}"
                 # provider rejected the request (4xx validation/auth): no output, logged as $0; reconcile on dashboard
@@ -547,6 +713,8 @@ class Runner:
         self.db.update_run(rid, status=READY, output_path=str(p), actual_cost_usd=0.0, cost_basis="local: $0",
                            attempts=1, finished_at=now())
         self.log(job["id"], "brief", "info", f"v{ver} resolved prompts saved")
+        from .storage import publish_run
+        publish_run(self.db, rid, out_dir)
         return True
 
     def set_override(self, job_id, stage, params=None, model=None, price_key=None, prompt=None):

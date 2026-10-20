@@ -1,8 +1,10 @@
 import json
+import os
 import sqlite3
 import threading
 import time
 import datetime as dt
+from pathlib import Path
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -49,11 +51,65 @@ def now():
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+class _Row(dict):
+    """Mapping row so `dict(row)` and `row["col"]` match sqlite3.Row."""
+
+
+class _Cursor:
+    def __init__(self, cur):
+        self._cur = cur
+        self.lastrowid = cur.lastrowid
+
+    def fetchall(self):
+        desc = self._cur.description or ()
+        names = [d[0] for d in desc]
+        rows = self._cur.fetchall()
+        if not names:
+            return rows
+        return [_Row(zip(names, row)) for row in rows]
+
+    def fetchone(self):
+        rows = self.fetchall()
+        return rows[0] if rows else None
+
+
+class _LibsqlConn:
+    """sqlite3-shaped wrapper around a libSQL connection (no row_factory)."""
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def execute(self, sql, args=()):
+        return _Cursor(self._raw.execute(sql, args))
+
+    def executescript(self, sql):
+        self._raw.executescript(sql)
+
+    def commit(self):
+        self._raw.commit()
+
+    def close(self):
+        self._raw.close()
+
+
+def _open(path):
+    """Turso/libSQL when TURSO_DATABASE_URL or LIBSQL_URL is set, else local SQLite."""
+    url = os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL")
+    if url and os.environ.get("STUDIO_SQLITE") != "1":
+        import libsql
+        token = os.environ.get("TURSO_AUTH_TOKEN") or os.environ.get("LIBSQL_AUTH_TOKEN") or ""
+        raw = libsql.connect(database=url, auth_token=token, _check_same_thread=False)
+        return _LibsqlConn(raw)
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 class DB:
     def __init__(self, path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
-        self.conn.row_factory = sqlite3.Row
+        self.conn = _open(path)
         self.conn.executescript(SCHEMA)
         self.conn.commit()
 

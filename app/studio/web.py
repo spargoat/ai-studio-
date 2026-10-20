@@ -143,9 +143,16 @@ def create_app(cfg, live=False):
 
     @app.get("/file")
     def file():
-        p = Path(request.args["p"]).resolve()
-        if data_dir not in p.parents:
+        from .storage import allowed_redirect
+        raw = request.args["p"]
+        if allowed_redirect(raw):
+            return redirect(raw)
+        p = Path(raw).resolve()
+        roots = [data_dir, Path("/tmp")]
+        if not any(root == p or root in p.parents for root in roots):
             abort(403)
+        if not p.exists():
+            abort(404)
         return send_file(p)
 
     from .api import register

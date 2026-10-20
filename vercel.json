@@ -1,0 +1,13 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "python3 scripts/fetch_runtime_assets.py && cd app/ui && npm ci && npm run build && cd ../.. && python3 scripts/stage_static.py",
+  "functions": {
+    "app/wsgi.py": {
+      "maxDuration": 300,
+      "excludeFiles": "{app/ui/node_modules/**,app/ui/dist/**,app/tests/**,app/screens/**,app/tools/**,public/**,**/.git/**}"
+    }
+  },
+  "crons": [
+    { "path": "/api/cron/advance", "schedule": "* * * * *" }
+  ]
+}

@@ -1,5 +1,5 @@
 """JSON API for the React UI. Thin layer over Runner / DB / library / export / persona. Dry runs only from the UI."""
-import contextlib, io, json, threading, time
+import contextlib, hmac, io, json, os, threading, time
 from pathlib import Path
 from flask import Blueprint, abort, jsonify, request, send_file, send_from_directory
 from . import library, persona as P
@@ -9,6 +9,11 @@ from .runner import BriefError, SpendGuardError
 UI_DIST = Path(__file__).resolve().parent.parent / "ui" / "dist"
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 _doctor_lock = threading.Lock()
+
+
+def one_stage():
+    """Vercel cannot keep a background thread alive after the response. One stage per request."""
+    return os.environ.get("VERCEL") == "1" or os.environ.get("STUDIO_ONE_STAGE") == "1"
 
 
 def register(app, cfg, runner, live, bg):
@@ -182,25 +187,65 @@ def register(app, cfg, runner, live, bg):
     def create():
         body = request.get_json(force=True)
         if body.get("mode") == "live":
-            lock = db.fal_lock()
-            if lock:
-                return err(f"Live runs are blocked: the fal account has been locked (exhausted balance) since {lock['started_at']} "
-                           f"on {lock['job_id']}/{lock['stage']}. Top up at fal.ai, then run live from the CLI with STUDIO_FAL_TOPPED_UP=1.", 409)
-            return err("Live runs are started from the CLI (studio --live new ...) so the spend guards and approval stay explicit. "
-                       "This app starts dry runs only.", 409)
+            if os.environ.get("STUDIO_ALLOW_LIVE") != "1":
+                lock = db.fal_lock()
+                if lock:
+                    return err(f"Live runs are blocked: the fal account has been locked (exhausted balance) since {lock['started_at']} "
+                               f"on {lock['job_id']}/{lock['stage']}. Top up at fal.ai, then run live from the CLI with STUDIO_FAL_TOPPED_UP=1.", 409)
+                return err("Live runs are blocked. Set STUDIO_ALLOW_LIVE=1 to allow them from this app. "
+                           "Otherwise start them from the CLI (studio --live new ...) so the spend guards stay explicit.", 409)
+            try:
+                from .runner import Runner
+                with Runner(cfg, live=True, log=lambda m: None) as lr:
+                    jid = lr.create_job(brief_from(body.get("brief")))
+            except (BriefError, SpendGuardError, KeyError, ValueError) as e:
+                return err(e, 400)
+            return jsonify({"id": jid}), 201
         if live:
             return err("this server was started with --live; the UI only starts dry runs", 409)
         try:
             jid = runner.create_job(brief_from(body.get("brief")))
         except (BriefError, KeyError, ValueError) as e:
             return err(e)
-        run_bg(jid, runner.run_job, jid)
+        if not one_stage():
+            run_bg(jid, runner.run_job, jid)
         return jsonify({"id": jid}), 201
+
+    @bp.post("/api/jobs/<jid>/advance")
+    def advance(jid):
+        job = db.job(jid) or abort(404)
+        if job["mode"] == "live" and os.environ.get("STUDIO_ALLOW_LIVE") != "1":
+            return err("Live runs are blocked. Set STUDIO_ALLOW_LIVE=1 to advance them.", 409)
+        try:
+            return jsonify(runner.advance(jid))
+        except BriefError as e:
+            return err(e, 409)
+
+    @bp.route("/api/cron/advance", methods=["GET", "POST"])
+    def cron_advance():
+        secret = os.environ.get("CRON_SECRET") or ""
+        if not secret:
+            return err("CRON_SECRET is not set", 503)
+        if not hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {secret}"):
+            return err("unauthorized", 401)
+        rows = db.q("SELECT id, mode FROM jobs WHERE status IN ('created','running','partial') ORDER BY updated_at LIMIT 3")
+        out = []
+        for row in rows:
+            if row["mode"] == "live" and os.environ.get("STUDIO_ALLOW_LIVE") != "1":
+                out.append({"id": row["id"], "skipped": "live blocked"})
+                continue
+            try:
+                out.append({"id": row["id"], **runner.advance(row["id"])})
+            except Exception as e:
+                out.append({"id": row["id"], "error": str(e)})
+        return jsonify({"ok": True, "advanced": out})
 
     @bp.post("/api/jobs/<jid>/resume")
     def resume(jid):
         db.job(jid) or abort(404)
         try:
+            if one_stage():
+                return jsonify(runner.advance(jid))
             run_bg(jid, runner.run_job, jid)
         except BriefError as e:
             return err(e, 409)
@@ -210,6 +255,8 @@ def register(app, cfg, runner, live, bg):
     def rerun(jid, stage):
         db.job(jid) or abort(404)
         try:
+            if one_stage():
+                return jsonify(runner.advance(jid, only=stage))
             run_bg(jid, runner.rerun, jid, stage)
         except BriefError as e:
             return err(e, 409)
@@ -230,7 +277,11 @@ def register(app, cfg, runner, live, bg):
         resumed = False
         if v == "approved" and jid not in active and db.job(jid)["status"] in ("awaiting_review", "partial"):
             try:
-                run_bg(jid, runner.run_job, jid); resumed = True        # carry on to the next gate (dry runs only)
+                if one_stage():
+                    runner.db.set_job_status(jid, "partial")
+                    runner.advance(jid); resumed = True
+                else:
+                    run_bg(jid, runner.run_job, jid); resumed = True        # carry on to the next gate (dry runs only)
             except BriefError:
                 pass
         return jsonify({"ok": True, "resumed": resumed, "pending": [p for p in pending_reviews() if p["job_id"] == jid]})
