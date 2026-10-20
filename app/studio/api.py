@@ -228,6 +228,7 @@ def register(app, cfg, runner, live, bg):
             return err("CRON_SECRET is not set", 503)
         if not hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {secret}"):
             return err("unauthorized", 401)
+        # failed jobs stay failed. partial here means more stages are still due, not a recorded stage error.
         rows = db.q("SELECT id, mode FROM jobs WHERE status IN ('created','running','partial') ORDER BY updated_at LIMIT 3")
         out = []
         for row in rows:

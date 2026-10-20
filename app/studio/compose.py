@@ -10,7 +10,6 @@ import subprocess
 from pathlib import Path
 from .media import ff, duration
 
-FONT_DIR = "/workspace/creative/fonts/twf_caption"
 ASPECTS = {"9:16": (1080, 1920), "1:1": (1080, 1080), "16:9": (1920, 1080)}
 
 
@@ -171,8 +170,25 @@ def frame_filter(sw, sh, tw, th, mode, center, pad_color="black", zoom=0.5, side
     return f"scale={w2}:{h2},crop={tw}:{th}:{x}:{y},setsar=1"
 
 
+def caption_face(cap):
+    """(fonts directory, ASS family, drawtext font file).
+
+    A configured fonts_dir is used only when it exists and contains a .ttf.
+    Otherwise the bundled DejaVu Sans faces are used. libass then resolves the
+    family from fontsdir, and drawtext gets fontfile=, with no fontconfig lookup.
+    """
+    from .assets import FONT_FAMILY, font_dir, font_file
+    requested = Path((cap or {}).get("fonts_dir") or "")
+    faces = sorted(requested.glob("*.ttf")) if requested.is_dir() else []
+    if faces:
+        bold = next((p for p in faces if "bold" in p.name.lower()), None)
+        return requested, (cap.get("font_name") or FONT_FAMILY), str(bold or faces[0])
+    return font_dir(), FONT_FAMILY, font_file()
+
+
 def overlay_filters(overlays, w, h, font):
     out = []
+    font = _esc(font)
     for o in overlays or []:
         y = {"top": "h*0.08", "center": "(h-text_h)/2", "bottom": "h*0.86"}.get(o.get("pos", "top"), "h*0.08")
         size = int(o.get("size_pct", 7.5 if h > w else 5) / 100 * min(w, h))   # 9:16 default bigger (was 5%)
@@ -186,9 +202,9 @@ def overlay_filters(overlays, w, h, font):
 # ---------- main
 def compose(src, out_dir, params, script=None, fast=False):
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    cap = params.get("captions") or {}
-    fonts = cap.get("fonts_dir", FONT_DIR)
-    bold = str(Path(fonts) / "TWFCaption-Bold.ttf")
+    cap = dict(params.get("captions") or {})
+    fonts, font_name, fontfile = caption_face(cap)
+    cap["font_name"] = font_name
     words = []
     is_img = str(src).lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
     if cap.get("enabled", True) and not is_img:
@@ -196,7 +212,6 @@ def compose(src, out_dir, params, script=None, fast=False):
         words = word_times(script=None if cap.get("vtt") else script, vtt=cap.get("vtt"), media=src,
                            alignment=al, offset=float(params.get("_alignment_offset") or 0))
     from .assets import ffmpeg_bin
-    from .media import FONT
     sw, sh = map(int, subprocess.run([ffmpeg_bin("ffprobe"), "-v", "error", "-select_streams", "v:0", "-show_entries",
                                       "stream=width,height", "-of", "csv=p=0", str(src)],
                                      capture_output=True, text=True).stdout.strip().split(",")[:2])
@@ -213,7 +228,7 @@ def compose(src, out_dir, params, script=None, fast=False):
         if words:
             ass = ass_file(words, tw, th, out_dir / f"captions_{tag}.ass", cap)
             vf.append(f"subtitles='{_esc(ass)}':fontsdir='{_esc(fonts)}'")
-        vf += overlay_filters(params.get("overlays"), tw, th, bold if Path(bold).exists() else FONT)
+        vf += overlay_filters(params.get("overlays"), tw, th, fontfile)
         if is_img:
             out = out_dir / f"compose_{tag}.png"
             ff(["-i", str(src), "-vf", ",".join(vf), "-frames:v", "1", str(out)])

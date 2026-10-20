@@ -2,13 +2,7 @@ import json
 import subprocess
 from pathlib import Path
 
-from .assets import ffmpeg_bin, font_path
-
-FONT = font_path()
-if FONT is None:
-    import glob
-    c = sorted(glob.glob("/usr/share/fonts/**/*.ttf", recursive=True))
-    FONT = c[0] if c else None
+from .assets import ffmpeg_bin, font_file
 
 
 def ff(args, timeout=300):

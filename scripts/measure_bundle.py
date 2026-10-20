@@ -42,7 +42,6 @@ EXCLUDES = [
     "app/tools/**",
     "app/models/**",
     "app/bin/**",
-    "app/fonts/**",
     "app/data/**",
     "public/**",
     "**/.git/**",

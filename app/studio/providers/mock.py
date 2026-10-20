@@ -2,7 +2,8 @@
 import os
 from pathlib import Path
 from .base import Provider, ProviderError
-from ..media import ff, FONT, esc, duration
+from ..assets import font_file
+from ..media import ff, esc, duration
 
 # STUDIO_MOCK_FAST=1: render placeholders small/low-fps (tests); outputs are throwaway either way
 FAST = os.environ.get("STUDIO_MOCK_FAST") == "1"
@@ -12,9 +13,11 @@ BG = {"marco": "0x1d2b3a", "maksim": "0x2f3a24", "callum": "0x3a2430"}
 
 
 def _label(lines, size=46, y0=120):
+    """drawtext with an explicit font file. The Vercel runtime has no fontconfig."""
+    font = esc(font_file())
     parts = []
     for i, line in enumerate(lines):
-        parts.append(f"drawtext=fontfile='{FONT}':text='{esc(line)}':fontcolor=white:fontsize={size}:"
+        parts.append(f"drawtext=fontfile='{font}':text='{esc(line)}':fontcolor=white:fontsize={size}:"
                      f"x=(w-text_w)/2:y={y0 + i * int(size * 1.5)}:box=1:boxcolor=black@0.55:boxborderw=12")
     return ",".join(parts)
 

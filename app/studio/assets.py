@@ -24,6 +24,8 @@ MODELS = {
 }
 FFMPEG_URL = "https://github.com/BtbN/FFmpeg-Builds/releases/download/latest/ffmpeg-n8.1-latest-linux64-gpl-8.1.tar.xz"
 FONT_URL = "https://github.com/dejavu-fonts/dejavu-fonts/raw/master/ttf/DejaVuSans-Bold.ttf"
+FONT_FAMILY = "DejaVu Sans"
+FONT_FILES = ("DejaVuSans.ttf", "DejaVuSans-Bold.ttf")
 FFMPEG_ARCHIVE = "ffmpeg-linux64.tar.xz"
 
 
@@ -71,22 +73,31 @@ def model_dir(session=None):
     return dest_dir
 
 
+def font_dir(session=None):
+    """Directory of caption faces. The committed DejaVu files win; download is a fallback."""
+    bundled = APP_DIR / "fonts"
+    if _ready(bundled, FONT_FILES, 1000):
+        return bundled
+    dest = Path("/tmp/studio-fonts/DejaVuSans-Bold.ttf")
+    cached_download(dest, FONT_URL, "runtime/DejaVuSans-Bold.ttf", 1000, session=session)
+    return dest.parent
+
+
 def font_path(session=None):
-    candidates = [
-        APP_DIR / "fonts" / "DejaVuSans-Bold.ttf",
-        Path("/tmp/studio-fonts/DejaVuSans-Bold.ttf"),
-        Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"),
-        Path("/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf"),
-    ]
-    for path in candidates:
+    """Bold face for drawtext. Regular DejaVu Sans sits beside it for libass."""
+    directory = font_dir(session=session)
+    for name in ("DejaVuSans-Bold.ttf", "DejaVuSans.ttf"):
+        path = directory / name
         if path.is_file() and path.stat().st_size > 1000:
             return str(path)
-    dest = Path("/tmp/studio-fonts/DejaVuSans-Bold.ttf")
-    try:
-        cached_download(dest, FONT_URL, "runtime/DejaVuSans-Bold.ttf", 1000, session=session)
-    except Exception:
-        return None
-    return str(dest) if dest.is_file() else None
+    return None
+
+
+def font_file(session=None):
+    path = font_path(session=session)
+    if not path:
+        raise RuntimeError("caption font missing: app/fonts/DejaVuSans-Bold.ttf")
+    return path
 
 
 def _fetch_ffmpeg():

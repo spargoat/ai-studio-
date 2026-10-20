@@ -344,10 +344,10 @@ class Runner:
                 waiting = True
         if running:
             st = "running"
-        elif due_any:
-            st = "partial"
         elif failed:
             st = "failed"
+        elif due_any:
+            st = "partial"
         elif waiting:
             st = "awaiting_review"
         elif self.is_complete(job_id, defs):
@@ -382,6 +382,14 @@ class Runner:
                     body["error"] = fresh["error"]
                 return body
             return {"action": "busy", "stage": run["stage"], "status": "running"}
+        if not only:
+            bad = self._failed_stage(job_id)
+            if bad:
+                message = bad.get("error") or f"{bad['stage']} {bad['status']}"
+                if job["status"] != "failed":
+                    self.log(job_id, bad["stage"], "error", f"not advancing: {message}")
+                return {"action": "stopped", "stage": bad["stage"], "ok": False, "pending": False,
+                        "error": message, "status": self.settle(job_id)}
         self.async_fal = True
         try:
             for sdef in defs:
@@ -422,6 +430,15 @@ class Runner:
         finally:
             self.async_fal = False
         return {"action": "idle", "status": self.settle(job_id)}
+
+    def _failed_stage(self, job_id):
+        """Latest run of a stage that already failed. Advance does not start another version."""
+        job = self.db.job(job_id)
+        for sdef in self.stage_defs(job):
+            latest = self.db.latest(job_id, sdef["id"])
+            if latest and latest["status"] in ("failed", "blocked_budget"):
+                return latest
+        return None
 
     def _poll_fal(self, job, run):
         """One status check for a submitted fal request. Downloads the output when it is done."""

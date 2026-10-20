@@ -137,8 +137,10 @@ class DB:
         self.conn.commit()
 
     def close(self):
-        if self.conn is not None:
-            self.conn.close(); self.conn = None
+        with _lock:
+            if self.conn is not None:
+                self.conn.close()
+                self.conn = None
 
     def __enter__(self):
         return self

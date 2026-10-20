@@ -198,6 +198,45 @@ class T(unittest.TestCase):
         self.assertEqual(brief["runs"][-1]["status"], "failed")
         self.assertIn("Invalid pathname", brief["runs"][-1]["error"])
 
+    def test_failed_stage_is_not_advanced_again(self):
+        from studio.providers.base import ProviderError
+        from studio.providers.mock import MockProvider
+        r = Runner(cfg(), log=lambda m: None)
+        self.addCleanup(r.close)
+        jid = r.create_job(dict(BRIEF, id="t-stop"))
+        self.assertEqual(r.advance(jid)["stage"], "brief")
+        orig = MockProvider.do_image
+
+        def boom(self, ctx):
+            raise ProviderError("Fontconfig error: Cannot find a valid font for the family Sans")
+
+        MockProvider.do_image = boom
+        self.addCleanup(setattr, MockProvider, "do_image", orig)
+        step = r.advance(jid)
+        self.assertFalse(step["ok"])
+        self.assertEqual(step["status"], "failed")
+        self.assertEqual(step["stage"], "still")
+        self.assertIn("family Sans", step["error"])
+        self.assertEqual(r.db.latest(jid, "still")["version"], 1)
+        r.db.set_job_status(jid, "partial")
+        again = r.advance(jid)
+        self.assertEqual(again["action"], "stopped")
+        self.assertFalse(again["ok"])
+        self.assertEqual(again["status"], "failed")
+        self.assertIn("family Sans", again["error"])
+        self.assertEqual(len(r.db.runs(jid, "still")), 1)
+        os.environ["CRON_SECRET"] = "cron-test"
+        os.environ["STUDIO_ONE_STAGE"] = "1"
+        cron = create_app(cfg()).test_client().get(
+            "/api/cron/advance", headers={"Authorization": "Bearer cron-test"})
+        self.assertEqual(cron.status_code, 200, cron.data)
+        self.assertNotIn(jid, [row["id"] for row in cron.get_json()["advanced"]])
+        MockProvider.do_image = orig
+        retried = r.advance(jid, only="still")
+        self.assertTrue(retried["ok"], retried)
+        self.assertEqual(r.db.latest(jid, "still")["status"], "succeeded")
+        self.assertEqual(r.db.latest(jid, "still")["version"], 2)
+
     def test_hashed_ui_assets_are_served_without_a_session(self):
         os.environ["STUDIO_APP_PASSWORD"] = "pw"
         os.environ["STUDIO_SESSION_SECRET"] = "secret"
