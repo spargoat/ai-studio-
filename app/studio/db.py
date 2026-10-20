@@ -278,10 +278,12 @@ class DB:
         return sum(v["effective"] for v in self.spend_summary().values())
 
     def save_score(self, run, persona, path, s):
+        passed = s.get("passed")
+        passed_i = None if passed is None else int(bool(passed))
         self.x("INSERT OR REPLACE INTO scores VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (run["id"], run["job_id"], run["stage"], run["version"], persona, path, s.get("identity"),
                 s.get("identity_min"), s.get("identity_threshold"), s.get("identity_note"), json.dumps(s.get("visual")),
-                None, None, None, json.dumps(s.get("flags", [])), int(bool(s.get("passed"))), now()))
+                None, None, None, json.dumps(s.get("flags", [])), passed_i, now()))
 
     def score(self, stage_run_id):
         r = self.one("SELECT * FROM scores WHERE stage_run_id=?", (stage_run_id,))

@@ -27,7 +27,10 @@ def parse_fail(v):
 
 
 def fmt_score(sc):
-    idt = "n/a" if sc["identity"] is None else f"{sc['identity']:.3f} (thr {sc['identity_threshold']})"
+    if sc["identity"] is None and str(sc.get("identity_note") or "").startswith("not scored"):
+        idt = "not scored"
+    else:
+        idt = "n/a" if sc["identity"] is None else f"{sc['identity']:.3f} (thr {sc['identity_threshold']})"
     v = sc["visual"] or {}
     return (f"{'PASS' if sc['passed'] else 'FLAGGED'} identity {idt} | visual {v.get('width')}x{v.get('height')} "
             f"sharp {v.get('sharpness')} luma {v.get('luma_mean')} | copy/brand/engagement: not scored (no LLM key)"

@@ -29,9 +29,9 @@ button.ok{background:#1d4d2b}button.no{background:#5a1f1f}
 <header><span class=mode>{{'LIVE' if live else 'DRY RUN'}}</span><h2><a href="/classic">AI Studio</a></h2>
 <nav><a href="/">App</a><a href="/classic" class="{{'on' if tab=='jobs' else ''}}">Jobs</a><a href="/classic/library" class="{{'on' if tab=='library' else ''}}">Library</a></nav>
 <div class=sm>spend ${{'%.2f'|format(spend)}} of ${{caps[0]}} cap</div></header><main>
-{% macro badges(sc) %}{% if sc %}<span class="b {{'pass' if sc.passed else 'flag'}}">{{'PASS' if sc.passed else 'FLAG'}}</span>
-<span class=b style="background:#223">identity {{'%.2f'|format(sc.identity) if sc.identity is not none else 'n/a'}}</span>
-{% if sc.visual %}<span class="b ns">{{sc.visual.width}}x{{sc.visual.height}} · sharp {{sc.visual.sharpness|int}}</span>{% endif %}
+{% macro badges(sc) %}{% if sc %}{% if sc.passed is not none %}<span class="b {{'pass' if sc.passed else 'flag'}}">{{'PASS' if sc.passed else 'FLAG'}}</span>{% endif %}
+<span class=b style="background:#223">identity {% if sc.identity is not none %}{{'%.2f'|format(sc.identity)}}{% elif (sc.identity_note or '').startswith('not scored') or sc.passed is none %}not scored{% else %}n/a{% endif %}</span>
+{% if sc.visual %}<span class="b ns">{{sc.visual.width}}x{{sc.visual.height}} · sharp {{sc.visual.sharpness|int}}</span>{% else %}<span class="b ns">visual not scored</span>{% endif %}
 <span class="b ns" title="needs an LLM key">copy/brand/engagement: not scored</span>
 {% for f in sc.flags %}<div class=err>{{f}}</div>{% endfor %}{% endif %}{% endmacro %}
 {% macro media(p, poster=None) %}{% set u = '/file?p=' ~ p %}
@@ -56,12 +56,12 @@ button.ok{background:#1d4d2b}button.no{background:#5a1f1f}
 <b>v{{r.version}}</b> <span class="b {{r.status}}">{{r.status}}</span> <span class=sm>{{r.model}}</span>
 {% if r.review_status %}<span class="b {{r.review_status}}">{{r.review_status}}</span>{% endif %}{% if r.stale %}<span class="b stale">stale</span>{% endif %}
 {% if r.output_path %}<div style="margin:6px 0">{{media(r.output_path, r.poster)}}</div>{% endif %}
-{{badges(r.score)}}
+{% if r.score %}{{badges(r.score)}}{% elif s.id in ('still', 'video', 'lipsync', 'finish', 'compose') and r.output_path %}<span class="b ns">identity not scored</span> <span class="b ns">visual not scored</span>{% endif %}
 {% if r.exports %}<div class=sm>exports: {% for a,p in r.exports.items() %}<a href="/file?p={{p}}">{{a}}</a> {% endfor %}</div>{% endif %}
 <div class=sm>{{r.mode}} · ${{'%.3f'|format(r.actual_cost_usd or 0)}} · tries {{r.attempts}}</div>
 {% if r.review_note %}<div class=sm>note: {{r.review_note}}</div>{% endif %}
 {% if r.error and r.status!='succeeded' %}<div class=err>{{r.error[:300]}}</div>{% endif %}</div>{% endfor %}</div>
-{% if s.runs and s.runs[-1].status == 'succeeded' %}<form class=rv method=post action="/job/{{job.id}}/review/{{s.id}}">
+{% if s.show_review %}<form class=rv method=post action="/job/{{job.id}}/review/{{s.id}}">
 <input name=note placeholder="Reason (required to reject)"><button class=ok name=v value=approved>Approve v{{s.runs[-1].version}}</button>
 <button class=no name=v value=rejected>Reject</button></form>{% endif %}
 <form method=post action="/job/{{job.id}}/rerun/{{s.id}}" style="margin-top:6px"><button>Rerun {{s.id}}</button></form></div>{% endif %}{% endfor %}
@@ -114,6 +114,7 @@ def create_app(cfg, live=False):
     @app.get("/job/<jid>")
     def job(jid):
         j = runner.db.job(jid) or abort(404)
+        from .gates import show_review
         stages = []
         for d in runner.stage_defs(j):
             sc = cfg["stages"].get(d["id"], {"provider": "local", "model": "brief-resolver"})
@@ -126,6 +127,8 @@ def create_app(cfg, live=False):
                 r["stale"] = r["status"] == "succeeded" and runner.is_stale(jid, r)
             last = runs[-1] if runs else None             # what this job actually ran, not the template default
             stages.append({"id": d["id"], "review": d.get("review"),
+                           "show_review": show_review(d["id"], d.get("review"),
+                                                      (last or {}).get("status"), (last or {}).get("review_status")),
                            "provider": (last or {}).get("provider") or sc["provider"],
                            "model": (last or {}).get("model") or sc["model"],
                            "default_model": sc["model"], "runs": runs})

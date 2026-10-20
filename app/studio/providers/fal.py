@@ -10,22 +10,42 @@ from ..config import get_key
 from ..media import duration
 
 
-def data_uri(path):
+def _local_file(path, sha256=None):
+    """A filesystem path. Blob URLs are cached under /tmp by storage.local."""
+    from ..storage import is_url, local
+    if is_url(str(path)):
+        path = local(path, sha256=sha256)
+    path = Path(path)
+    if not path.exists():
+        return None
+    return path
+
+
+def data_uri(path, sha256=None):
+    path = _local_file(path, sha256)
+    if path is None:
+        raise ProviderError(f"reference file missing: {path}")
     mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-    return f"data:{mime};base64," + base64.b64encode(Path(path).read_bytes()).decode()
+    return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode()
 
 
-def upload(path, key_headers):
-    """Upload a local file to fal storage (free) and return its public URL.
-    Needed because some endpoints (lipsync) reject data: URIs."""
+def upload(path, key_headers, sha256=None):
+    """Upload a local file or Blob URL to fal storage (free) and return its public URL.
+    Needed because some endpoints (lipsync) reject data: URIs. Large images are
+    downscaled before the PUT."""
+    from ..images import prepare_for_fal
+    path = _local_file(path, sha256)
+    if path is None:
+        raise ProviderError("reference file missing")
+    path = Path(prepare_for_fal(path))
     mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
     r = requests.post("https://rest.alpha.fal.ai/storage/upload/initiate?storage_type=fal-cdn-v3",
-                      json={"content_type": mime, "file_name": Path(path).name},
+                      json={"content_type": mime, "file_name": path.name},
                       headers=key_headers, timeout=60)
     if r.status_code >= 400:
         raise ProviderError(f"fal upload initiate {r.status_code}: {r.text[:200]}")
     j = r.json()
-    put = requests.put(j["upload_url"], data=Path(path).read_bytes(), headers={"Content-Type": mime}, timeout=300)
+    put = requests.put(j["upload_url"], data=path.read_bytes(), headers={"Content-Type": mime}, timeout=300)
     if put.status_code >= 400:
         raise ProviderError(f"fal upload PUT {put.status_code}: {put.text[:200]}")
     return j["file_url"]
@@ -138,9 +158,15 @@ class FalProvider(Provider):
             return {"output_path": out, "meta": {"url": img["url"], "seed": res.get("seed"), "lora": True},
                     "units_actual": 1, "request_id": rid}
         payload = {"prompt": ctx["prompt"], **p}
-        refs = [r for r in (ctx.get("refs") or []) if Path(r).exists()]
+        sha = ctx.get("ref_sha256") or {}
+        refs = []
+        for r in ctx.get("refs") or []:
+            if not isinstance(r, str):
+                continue
+            if _local_file(r, sha.get(r) if sha else None):
+                refs.append(r)
         if refs:
-            payload["image_urls"] = [upload(r, self._headers()) for r in refs]
+            payload["image_urls"] = [upload(r, self._headers(), sha.get(r)) for r in refs]
         rid, res = self._call(ctx["model"], payload)
         imgs = res.get("images") or []
         if not imgs:

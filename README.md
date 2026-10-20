@@ -65,13 +65,14 @@ Leave unset until a live run is intended. Caps in `app/config/config.yaml` still
 ## Local checks
 
 ```bash
-# from the repository root; the score extra is local only
+# from the repository root. numpy, onnxruntime and Pillow are in the request function.
+# The score extra (OpenCV) is optional; the quality-gate test uses it when it is installed.
 pip install -r requirements.txt '.[score]'
 cd app
-python3 -m unittest tests.test_dryrun tests.test_storage tests.test_advance tests.test_assets tests.test_static tests.test_fonts
+python3 -m unittest tests.test_dryrun tests.test_storage tests.test_advance tests.test_assets tests.test_static tests.test_fonts tests.test_refs
 ```
 
-Dry-run tests use a throwaway SQLite file and mock providers. They do not call fal or ElevenLabs. The `score` extra is what the quality-gate tests import; it is not installed into the Vercel function.
+Dry-run tests use a throwaway SQLite file and mock providers. They do not call fal or ElevenLabs. OpenCV is not part of the Vercel function; identity and visual scores there use the ONNX runtime.
 
 ## What Aaron still does in the dashboard
 
@@ -85,8 +86,8 @@ Dry-run tests use a throwaway SQLite file and mock providers. They do not call f
 
 - One Python function. Default max duration is **300 seconds** (Hobby maximum). A single stage that runs longer than that, usually compose/finish on a long clip, returns 504. Pro can raise `maxDuration` up to 800s in `vercel.json`.
 - Request bodies are capped at **4.5 MB**. Job media is uploaded to Blob, not through the function body.
-- This project's Python builder packs the function to about **225 MB** uncompressed (`LAMBDA_SIZE_EXCEEDED` at 236.69 MB, 405.79 MB before that pack). opencv-python-headless and numpy are not dependencies of the request function. Face models and ffmpeg are fetched into `/tmp` at runtime, and `excludeFiles` drops tests, UI source, `node_modules`, screenshots, and `app/models`. The hashed UI files stay in the function (`includeFiles`: `app/ui/dist/**`) so Flask can serve them, and the same bytes are copied to `public/assets` for the CDN. `python3 scripts/measure_bundle.py` reprints that uncompressed size (pip wheels plus the project files the builder would zip). Measured on Python 3.12: **22.0 MB** (19.4 MB of wheels, 2.5 MB of source, including the Vite assets and the DejaVu faces). The builder also adds its small runtime shim; that is not in the 22.0 MB.
-- On Vercel, identity and visual scores are not computed, and compose framing uses the geometric center instead of a detected face. The stage still finishes; the quality gate only flags, it does not block. Locally, with the `score` extra installed, scoring and face framing are unchanged.
+- This project's Python builder packs the function to about **225 MB** uncompressed (`LAMBDA_SIZE_EXCEEDED` at 236.69 MB, 405.79 MB before that pack). opencv-python-headless stays out of the request function. Identity and visual scores use onnxruntime, numpy and Pillow on the same YuNet and SFace models, which are fetched into `/tmp` at runtime along with ffmpeg. `excludeFiles` drops tests, UI source, `node_modules`, screenshots, and `app/models`. The hashed UI files stay in the function (`includeFiles`: `app/ui/dist/**`) so Flask can serve them, and the same bytes are copied to `public/assets` for the CDN. `python3 scripts/measure_bundle.py` reprints that uncompressed size (pip wheels plus the project files the builder would zip). Measured on Python 3.12: **158.7 MB** (156.1 MB of wheels, 2.6 MB of source). onnxruntime is the largest wheel, at 61.5 MB. That is under the 180 MB headroom target. The builder also adds its small runtime shim, which is not in the 158.7 MB.
+- If the scoring runtime cannot run, the job page says **not scored** for identity and visual instead of leaving the field blank. Copy, brand and engagement stay not scored until an LLM key exists. The quality gate only flags, it does not block. When OpenCV is installed locally it is still the scorer the quality-gate tests use.
 - The first compose or finish on a cold instance downloads the ffmpeg archive (about 150 MB) before it encodes. Later requests on that instance reuse `/tmp`. A new instance downloads again, from Blob when `runtime/ffmpeg-linux64.tar.xz` was stored.
 - fal generations do not block the request. Advance submits, stores the request id, and the next advance or the cron polls once.
 - Blob objects are public unguessable URLs so `<img>` and `<video>` can load them after `/file` redirects. The password gates the app and the `/file` route, not a URL someone already has. The same store holds the runtime ffmpeg and model cache under `runtime/`.

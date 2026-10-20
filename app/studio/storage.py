@@ -60,19 +60,34 @@ def allowed_redirect(url):
     return host == "blob.vercel-storage.com" or host.endswith(".blob.vercel-storage.com")
 
 
-def local(path, getter=None):
-    """Filesystem path for a stored output. Blob URLs are downloaded under /tmp."""
+def _sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def local(path, getter=None, sha256=None):
+    """Filesystem path for a stored output. Blob URLs are downloaded under /tmp.
+
+    The cache key is the content sha256 when the caller knows it, otherwise
+    the sha256 of the URL. A cached file whose bytes do not match sha256 is
+    discarded and fetched again.
+    """
     if not path or not is_url(str(path)):
         return path
     url = str(path)
     suffix = Path(urlparse(url).path).suffix
-    dest = cache_dir() / (hashlib.sha256(url.encode()).hexdigest() + suffix)
+    key = sha256 or hashlib.sha256(url.encode()).hexdigest()
+    dest = cache_dir() / (key + suffix)
     if dest.exists() and dest.stat().st_size > 0:
-        return str(dest)
+        if not sha256 or _sha256(dest.read_bytes()) == sha256:
+            return str(dest)
+        dest.unlink()
     http = getter or requests
     res = http.get(url, timeout=120)
     res.raise_for_status()
-    dest.write_bytes(res.content)
+    data = res.content
+    if sha256 and _sha256(data) != sha256:
+        raise BlobError(f"Blob download sha256 mismatch for {url}")
+    dest.write_bytes(data)
     return str(dest)
 
 
@@ -114,6 +129,16 @@ def _check(res, action):
         message = f"Blob {action} failed: {_response_text(res) or e}"
         log.error(message)
         raise BlobError(message) from e
+
+
+def list_prefix(prefix, session=None):
+    """Blob objects whose pathname starts with prefix. Empty when Blob is off."""
+    if not enabled() or not prefix:
+        return []
+    http = session or requests
+    res = http.get(BLOB_PUT, params={"prefix": prefix, "limit": "100"}, headers=_headers(), timeout=60)
+    _check(res, "list")
+    return (res.json() or {}).get("blobs") or []
 
 
 def blob_url(pathname, session=None):

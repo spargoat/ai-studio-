@@ -542,15 +542,18 @@ class Runner:
         if sdef["kind"] == "script":
             from .frameworks import prompt as fw_prompt
             prompt = (prompt + " " if prompt else "") + fw_prompt(sdef.get("params") or {}, persona, brief)
-        from .persona import lock_text
+        from .persona import face_lock_entries, location, lock_text
         lt = lock_text(persona, sdef["kind"])
         if lt and prompt:
             prompt = f"{prompt} {lt}"
         params = {k: v for k, v in sdef["params"].items() if k not in ("duration", "chars_per_second")} \
             if sdef["kind"] in ("video", "voice") else dict(sdef["params"])
+        locked = face_lock_entries(persona.get("refs"))
+        ref_sha = {location(e): e.get("sha256") for e in locked if location(e) and e.get("sha256")}
         return {"stage": sdef["id"], "kind": sdef["kind"], "prompt": prompt, "params": params,
                 "inputs": inputs, "persona": brief["persona"], "persona_display": persona.get("display"),
-                "refs": persona.get("refs") or [], "voice_id": persona.get("voice_id"),
+                "refs": [location(e) for e in locked if location(e)], "ref_sha256": ref_sha,
+                "voice_id": persona.get("voice_id"),
                 "voice_settings": persona.get("voice_settings"), "script": script_txt, "brief": brief,
                 "audio_seconds": audio_s, "video_seconds": video_s, "fail_inject": self.fail_inject}
 
@@ -689,9 +692,10 @@ class Runner:
         try:
             s = score.score_file(self.cfg, persona, run["output_path"], n_frames or q.get("frames", 5), run["stage"])
         except Exception as e:
-            self.log(run["job_id"], run["stage"], "warn", f"quality score failed: {e}"); return None
-        if "error" in s:
-            return None
+            self.log(run["job_id"], run["stage"], "warn", f"quality score failed: {e}")
+            s = score.unscored(self.cfg, str(e))
+        if s.get("error"):
+            s = score.unscored(self.cfg, s["error"])
         self.db.save_score(run, persona, run["output_path"], s)
         meta = json.loads(run["meta_json"] or "{}")
         if len(meta.get("exports") or {}) > 1:      # compose: score every aspect export, keep in run meta
@@ -699,14 +703,25 @@ class Runner:
             meta["export_scores"] = {}
             for asp, pth in meta["exports"].items():
                 es = s if pth == run["output_path"] else _sc.score_file(self.cfg, persona, pth, n_frames or q.get("frames", 5), run["stage"])
+                if es.get("error"):
+                    es = _sc.unscored(self.cfg, es["error"])
                 meta["export_scores"][asp] = {k: es.get(k) for k in ("identity", "passed", "flags", "visual")}
             self.db.update_run(run_id, meta=meta)
-            bad = [a for a, v in meta["export_scores"].items() if not v["passed"]]
+            bad = [a for a, v in meta["export_scores"].items() if v.get("passed") is False]
             if bad:
                 self.log(run["job_id"], run["stage"], "warn", f"compose exports flagged: {', '.join(bad)}")
-        idt = "n/a" if s["identity"] is None else f"{s['identity']:.3f}"
-        self.log(run["job_id"], run["stage"], "warn" if s["flags"] else "info",
-                 f"v{run['version']} quality: identity {idt} " + ("PASS" if s["passed"] else "FLAGGED: " + "; ".join(s["flags"])))
+        if s.get("identity") is None and str(s.get("identity_note") or "").startswith("not scored"):
+            idt = "not scored"
+        else:
+            idt = "n/a" if s["identity"] is None else f"{s['identity']:.3f}"
+        if s.get("passed") is True:
+            verdict = "PASS"
+        elif s.get("passed") is False:
+            verdict = "FLAGGED: " + "; ".join(s["flags"])
+        else:
+            verdict = "not scored"
+        self.log(run["job_id"], run["stage"], "warn" if s.get("passed") is False else "info",
+                 f"v{run['version']} quality: identity {idt} " + verdict)
         return s
 
     def apply_lora_route(self, job, sdef, sc, ctx):

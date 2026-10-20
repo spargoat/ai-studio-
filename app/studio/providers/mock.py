@@ -32,10 +32,26 @@ class MockProvider(Provider):
             raise ProviderError(f"MOCK forced failure at {stage} (attempt {ctx['attempt']}): "
                                 f"simulated provider 503 Service Unavailable")
 
+    def _ref_files(self, ctx):
+        """Local paths for face refs. A Blob URL is downloaded; a failure skips that ref."""
+        from ..storage import is_url, local
+        sha = ctx.get("ref_sha256") or {}
+        out = []
+        for r in ctx.get("refs") or []:
+            if not isinstance(r, str):
+                continue
+            try:
+                path = local(r, sha256=sha.get(r)) if is_url(r) else r
+            except Exception:
+                continue
+            if path and os.path.exists(path):
+                out.append(path)
+        return out
+
     def do_image(self, ctx):
         self._maybe_fail(ctx)
         out = Path(ctx["out_dir"]) / "still.png"
-        refs = [r for r in (ctx.get("refs") or []) if os.path.exists(r)]
+        refs = self._ref_files(ctx)
         label = _label(["DRY RUN - MOCK STILL", f"{ctx['persona_display']}", f"would call {ctx['model']}"], 40, 1500)
         if refs:
             vf = (f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
