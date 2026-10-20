@@ -203,6 +203,33 @@ class Tmp(unittest.TestCase):
         self.assertTrue(str(run["output_path"]).startswith("https://"))
         self.assertFalse((data / "jobs" / jid).exists())
 
+    def test_export_names_mp4_by_aspect_and_fills_caption(self):
+        from studio import library
+        from studio.export import export
+        data = Path(tempfile.mkdtemp())
+        runner = Runner(_cfg(data), log=lambda m: None)
+        self.addCleanup(runner.close)
+        jid = runner.create_job({"id": "t-cap", "persona": "marco", "template": "talking_head",
+                                 "script": "Decide your stop before you enter.",
+                                 "caption": "Stop first.", "hashtags": ["#risk"]})
+        cache = Path(tempfile.mkdtemp())
+        media = cache / "deadbeef.mp4"
+        media.write_bytes(b"\x00" * 64)
+        rid, _ver = runner.db.new_run(jid, "compose", "dry", "local", "ffmpeg", "local", "", {}, {}, 0)
+        runner.db.update_run(rid, status="succeeded", output_path=str(media),
+                             meta={"exports": {"9:16": str(media), "1:1": str(media)}})
+        library.add(runner.db, runner.db.run(rid), "test")
+        man, _z = export(runner.db, data / "bundle", job=jid)
+        item = next(i for i in man["items"] if "files" in i)
+        folder = data / "bundle" / item["folder"]
+        self.assertIn("compose_9x16.mp4", item["files"])
+        self.assertIn("compose_1x1.mp4", item["files"])
+        self.assertFalse(any(name.startswith("deadbeef") for name in item["files"]))
+        caption = (folder / "caption.txt").read_text()
+        self.assertIn("Stop first.", caption)
+        self.assertIn("#risk", caption)
+        self.assertGreater(len(caption.strip()), 1)
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

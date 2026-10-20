@@ -324,7 +324,12 @@ class T(unittest.TestCase):
         it = [i for i in man["items"] if "files" in i]
         self.assertEqual([i["stage"] for i in it], ["compose"])                    # compose supersedes finish
         f = it[0]["files"]
-        self.assertIn("caption.txt", f); self.assertTrue(any(x.endswith(".mp4") for x in f))
+        self.assertIn("caption.txt", f)
+        self.assertIn("compose_9x16.mp4", f)
+        folder = out / it[0]["folder"]
+        caption = (folder / "caption.txt").read_text()
+        self.assertGreater(len(caption.strip()), 1)
+        self.assertIn("Decide your stop", caption)
         self.assertTrue(Path(z).exists() and json.loads((out / "manifest.json").read_text())["count"] == 1)
         self.assertEqual(export(r.db, Path(tempfile.mkdtemp()) / "b", job="t-e2e", live_only=True)[0]["count"], 0)
         a = Path(tempfile.mkdtemp()) / "c.ass"
