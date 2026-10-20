@@ -49,7 +49,9 @@ class T(unittest.TestCase):
 
     def test_blob_put_materialize_and_redirect(self):
         os.environ["BLOB_READ_WRITE_TOKEN"] = "test-token"
+        os.environ["STUDIO_TMP"] = tempfile.mkdtemp()
         self.addCleanup(os.environ.pop, "BLOB_READ_WRITE_TOKEN", None)
+        self.addCleanup(os.environ.pop, "STUDIO_TMP", None)
         http = HTTP()
         url = storage.put_file("jobs/j/still/v1/still.png", b"png", "image/png", session=http)
         self.assertEqual(url, "https://abc123.public.blob.vercel-storage.com/jobs/a.png")
