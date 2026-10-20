@@ -1,0 +1,16 @@
+maksim:
+  active: 1
+  versions:
+  - version: 1
+    trainer: fal-ai/wan-22-image-trainer
+    trigger: mksmptrv man
+    steps: 1000
+    high_noise_lora: https://v3b.fal.media/files/b/0aaf0795/mA89coN0_EpMNnJS3W8Pn_adapter_model.safetensors
+    low_noise_lora: https://v3b.fal.media/files/b/0aaf0796/WsMYpB6w8NCIL8zMF3flJ_adapter_model.safetensors
+    config_file: https://v3b.fal.media/files/b/0aaf0796/r4y5eW9Yj3fCHotRYIZEr_config.json
+    dataset_hash: 42a3db14450f
+    images: 18
+    cost_usd: 4.5
+    request_id: 01a154e4-522f-75c0-825b-fa01371d96e7
+    created: '2026-10-19T17:57:09+01:00'
+    status: trained (unreviewed)

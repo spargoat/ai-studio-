@@ -1,0 +1,36 @@
+# Ported from spargoat/amn-production-os backend/app/templates/ "Script -> Scene Beats Gen" (Weavy graph):
+#   outline picks (genre, structure, audience, length, pacing, tone, depth/beats) + protagonist/premise -> Any LLM
+#   (scriptwriter) -> beat list -> per-beat image (Flux Kontext) -> per-beat video (Seedance). Here: our own models,
+#   one keyframe + one B-roll clip from beat 1 per run; rerun with overrides for further beats.
+name: script_to_scene_beats
+version: 1
+stages:
+  - id: brief
+    kind: brief
+  - id: script
+    kind: script
+    uses: llm
+    prompt: >-
+      You are an expert narrative architect, scriptwriter and copywriter with deep expertise in visual storytelling,
+      brand narrative and AI-powered content workflows. Premise: {premise}. Protagonist: {persona} ({look}).
+      Structure: {structure}. Audience: {audience}. Length: {length}. Pacing: {pacing}. Tone: {tone}.
+    params: {task: script, framework: PAS, hooks: 3}
+  - id: beats
+    kind: llm
+    uses: llm
+    needs: [script]
+    prompt: >-
+      Break this script into scene beats. For each beat give one shot as JSON: composition, camera_motion, lighting,
+      background, duration_s. Script: {script}
+    params: {task: scene_beats, beats: 4}
+  - id: still
+    kind: image
+    needs: [beats]
+    review: true
+    prompt: "{beats_first}. Photoreal keyframe of {look}, {setting}. No text."
+    params: {aspect_ratio: "9:16", resolution: "1K", num_images: 1, output_format: png}
+  - id: video
+    kind: video
+    needs: [still, beats]
+    prompt: "{beats_first}. Natural motion, steady camera, {setting}. No cuts, no text."
+    params: {duration: 5, generate_audio: false}

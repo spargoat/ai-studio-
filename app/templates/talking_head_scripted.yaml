@@ -1,0 +1,66 @@
+# Reusable template: persona talking-head ad. Prompts use {placeholders}
+# filled from the brief + persona. Params are passed to the stage adapter.
+name: talking_head_scripted
+version: 1
+# talking_head + a script/hook stage (PAS or AIDA + hook variants) before the voice. The voice speaks the
+# generated script. Dry run: mock text. Live: needs an LLM key (ANTHROPIC_API_KEY or OPENAI_API_KEY); until then
+# the script stage stops the job with 'needs key' before anything paid runs.
+# voice is scheduled before video (deps unchanged) so Kling's duration matches the real audio length.
+stages:
+  - id: brief
+    kind: brief
+  - id: script
+    kind: script
+    uses: llm
+    review: true            # approve the script + pick a hook before any voice spend
+    params: {task: script, framework: PAS, hooks: 5, max_words: 45}
+  - id: still
+    kind: image
+    needs: [script]          # nothing paid starts until the script is approved
+    review: true            # review gate: video waits for an approved still
+    prompt: >-
+      Photoreal vertical 9:16 selfie-style still of {look}, {setting}.
+      Natural daylight, phone-camera realism, mouth closed, looking at lens.
+      Same person as the reference images. No text, no watermark.
+    params: {aspect_ratio: "9:16", resolution: "1K", num_images: 1, output_format: png}
+  - id: voice
+    kind: voice
+    needs: [script]
+    review: true            # review gate: lip-sync waits for an approved voice
+    params: {chars_per_second: 15}
+  - id: video
+    kind: video
+    needs: [still]
+    prompt: >-
+      The person is speaking calmly to camera, lips parting and moving as if talking,
+      small natural head nods on emphasis, steady eye contact with the lens, relaxed blinks,
+      phone held steady at eye level, {setting}. Crisp detail on skin, stubble and knit. No camera cuts.
+    params: {duration: auto, generate_audio: false, cfg_scale: 0.5,
+             negative_prompt: "blur, distort, low quality, text, extra fingers"}
+  - id: lipsync
+    kind: lipsync
+    needs: [video, voice]
+    # Default since 2026-10-19 (live-maksim-01 v4): sync-3 + 0.3 s audio lead-in.
+    # lipqc: mouth/audio corr 0.47 vs 0.26 (lipsync-2-pro), onset ratio 0.89 vs 0.44. Costs $0.1333/s.
+    # Fallback: model fal-ai/sync-lipsync/v2/pro, price_key fal_lipsync_2_pro (sharper beard, weaker sync).
+    model: fal-ai/sync-lipsync/v3
+    price_key: fal_sync3_lipsync
+    params: {sync_mode: bounce, audio_lead_in_s: 0.3}
+  - id: finish
+    kind: finish
+    needs: [lipsync]
+    params: {width: 1080, height: 1920, fps: 30, grade: hf_warm, grain: 5, loudnorm_i: -16, send_mb: 18}
+  - id: compose
+    kind: compose
+    needs: [finish]
+    # Local, $0. Per-template: captions, overlays, music bed (ducked), aspect exports framed on the face.
+    params:
+      captions: {enabled: true, words_per_chunk: 3, size_pct: 6.2, y_pct: 72, highlight: "&H0000D7FF",
+                 font_name: TWF Caption, fonts_dir: /workspace/creative/fonts/twf_caption}   # vtt: /path.vtt to time from a VTT
+      overlays: []            # e.g. [{text: "Free guide", start: 0, end: 3, pos: top}]
+      music: {}               # e.g. {path: /workspace/creative/music/tracks/x.m4a, volume: 0.18, duck: true}
+      formats: ["9:16", "1:1", "16:9"]
+      framing: {"9:16": crop, "1:1": crop, "16:9": zoom}   # zoom | side | pad | crop (no blur)
+      zoom: 0.6               # 0 = whole frame with bars, 1 = full crop; face-centred
+      side: left              # for framing "side"
+      pad_color: "0x141414"

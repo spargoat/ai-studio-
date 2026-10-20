@@ -1,0 +1,8 @@
+id: live-maksim-01
+persona: maksim
+setting: a calm home study, soft window daylight from the side, bookshelves softly out of focus behind
+script: >-
+  Before any trade, I decide one thing. Where am I wrong? If price reaches that level, I am out.
+  No hoping. No moving the stop. Small loss, clear head, next decision.
+overrides:
+  still: {params: {resolution: "2K"}}

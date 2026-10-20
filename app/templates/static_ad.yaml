@@ -1,0 +1,45 @@
+# Ported from spargoat/amn-production-os backend/app/templates/
+#   "Static Ad Workflow (Part 1 of the Four-Grade Ad System)" (Weavy graph):
+#   brand images -> Visual Bible (LLM) ; idea + product/persona image -> Creative Director (LLM, 10 prompts, '*'-separated)
+#   -> Nano Banana Pro per prompt. Here: one still per run from the director's first prompt (rerun for more),
+#   then a local compose with headline/CTA and 9:16 / 1:1 / 4:5-style exports. System prompts kept verbatim below.
+name: static_ad
+version: 1
+stages:
+  - id: brief
+    kind: brief
+  - id: visual_bible
+    kind: llm
+    uses: llm
+    prompt: >-
+      You have been given a brand's images.
+      Create a visual guide that can be used to produce more visuals in the style of this brand.
+      Brand/topic: {topic}. Persona: {persona}.
+    params: {task: visual_bible}
+  - id: creative_director
+    kind: llm
+    uses: llm
+    needs: [visual_bible]
+    prompt: >-
+      You are a professional magazine photographer who specialises in creating art directed prompts for AI image
+      generators such as Nano Banana Pro. You will be given an idea for a prompt and an image of a product.
+      Your task is to generate 10 diverse, high-end prompts for image generation. Take the user prompt into high
+      account when creating your new prompts. FORMAT: Separate each prompt by a *. Output as a list: prompt1* prompt2*
+      prompt3*. No additional context, commentary, thoughts, analysis (just the raw prompts).
+      Idea: {idea}. Visual guide: {visual_bible}
+    params: {task: creative_director, n: 10}
+  - id: still
+    kind: image
+    needs: [creative_director]
+    review: true
+    prompt: "{creative_director_first}. Photoreal, of {look}, real-photo look, no text, no watermark."
+    params: {aspect_ratio: "4:5", resolution: "1K", num_images: 1, output_format: png}
+  - id: compose
+    kind: compose
+    needs: [still]
+    params:
+      captions: {enabled: false}
+      overlays: [{text: "{headline}", pos: top, size_pct: 6}, {text: "{cta}", pos: bottom, size_pct: 5}]
+      formats: ["9:16", "1:1", "16:9"]
+      framing: {"9:16": crop, "1:1": crop, "16:9": pad}
+      pad_color: black

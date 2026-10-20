@@ -1,0 +1,259 @@
+marco:
+  display: Marco Sterling
+  voice_id: nPczCjzI2devNBz1zQrb
+  voice_name: Brian
+  voice_settings:
+    stability: 0.5
+    similarity_boost: 0.8
+    style: 0.0
+    use_speaker_boost: true
+  refs:
+  - /workspace/personas/marco/ref_lock/face_sheet/marco_face_sheet_LOCKED.jpg
+  look: early-to-mid-20s man, dark brown loose wavy curls, light stubble, navy knit, calm and economical
+  lora:
+    trigger: mrcstrlng man
+    status: 'not trained: waiting for Aaron to review the Maksim LoRA'
+    dataset:
+    - glob: /workspace/personas/marco/ref_lock/face_sheet/*LOCKED*.jpg
+      tags:
+      - face sheet
+    - glob: /workspace/personas/marco/char_sheet/*.jpg
+      tags:
+      - character sheet
+    todo: curate individual source images behind marcus_update/hq/01a_marco_faces (currently a contact sheet)
+  lock:
+    sources:
+    - personas/marco/vibe_ref/look_brief.md
+    - personas/marco/face_sheet/notes.md
+    - personas/marco/ref_lock/face_sheet/LOCKED.md
+    - personas/marco/char_sheet/notes.md
+    - tgp/docs/marco.md
+    - marco_worldbuilding_plan.md
+    - Aaron, 20 Oct 2026 (age)
+    age: early to mid 20s
+    face: real pores and freckles, slight redness, patchy stubble; R96 smile
+    skin_tone: light with freckles and slight redness (face sheet notes); exact tone unknown
+    eye_colour: warm brown (MF8 edit)
+    hair: dark brown loose wavy curls with warm highlights, volume on top
+    build: slim, sleek
+    wardrobe_signatures:
+    - all-black fitted knit polo / tee / hoodie, black tailored trousers
+    - navy cashmere crew, mid-grey wool trousers, tobacco suede loafers (char sheet)
+    - one statement watch at night (Richard Mille in look brief); small gold dress watch on char sheet
+    - no visible logos
+    voice_cadence: economical, few words, low-key, never victorious (DM voice); spoken voice not locked (Brian pending Aaron)
+    banned_traits:
+    - waxy/painterly skin
+    - hand at the face
+    - tight crops
+    banned_context:
+    - farmhouse/Lake Como/Engadin (Maksim lane)
+    - lifestyle shown as proof of trading income
+    identity_ref_note: locked face sheet v4 (MF3 + MF8 eyes), 15 Oct
+maksim:
+  display: Maksim Petrov
+  voice_id: 6sXsAlJKKBf265ucBSRt
+  voice_name: Maksim Raw
+  voice_settings:
+    stability: 0.55
+    similarity_boost: 0.8
+    style: 0.0
+    use_speaker_boost: true
+  refs:
+  - /workspace/ai_studio/app/refs/maksim/01_front.jpg
+  - /workspace/ai_studio/app/refs/maksim/02_34_left.jpg
+  - /workspace/ai_studio/app/refs/maksim/03_selfie_v3.jpg
+  look: the man in the reference images, early 50s, swept-back ash-blond/grey hair, salt-and-pepper 3-5mm stubble, deep forehead
+    lines, grey crew-neck knit, calm and precise
+  pronunciation: Mak-seem, never Maxime
+  lora:
+    trigger: mksmptrv man
+    dataset:
+    - path: /workspace/aar58/ref_lock/face_sheet/panels/01_front.jpg
+      tags:
+      - head and shoulders
+      - front view
+      - grey studio background
+      - grey crew-neck knit
+    - path: /workspace/aar58/ref_lock/face_sheet/panels/02_three_quarter_left.jpg
+      tags:
+      - head and shoulders
+      - three-quarter left view
+      - grey studio background
+    - path: /workspace/aar58/ref_lock/face_sheet/panels/03_three_quarter_right.jpg
+      tags:
+      - head and shoulders
+      - three-quarter right view
+      - grey studio background
+    - path: /workspace/aar58/ref_lock/face_sheet/panels/04_profile_left.jpg
+      tags:
+      - head and shoulders
+      - left profile
+      - grey studio background
+    - path: /workspace/aar58/ref_lock/face_sheet/panels/05_profile_right.jpg
+      tags:
+      - head and shoulders
+      - right profile
+      - grey studio background
+    - path: /workspace/aar58/ref_lock/face_sheet/panels/06_tilt_up.jpg
+      tags:
+      - close-up
+      - head tilted up
+      - grey studio background
+    - path: /workspace/aar58/ref_lock/face_sheet/panels/07_tilt_down.jpg
+      tags:
+      - close-up
+      - head tilted down
+      - grey studio background
+    - path: /workspace/aar58/ref_lock/face_sheet/panels/08_front_smile.jpg
+      tags:
+      - head and shoulders
+      - front view
+      - slight smile
+      - grey studio background
+    - path: /workspace/aar58/ref_lock/char_sheet/panels_v3/01_full_front.jpg
+      tags:
+      - full body
+      - front view
+      - grey crew-neck knit
+      - navy chinos
+      - studio
+    - path: /workspace/aar58/ref_lock/char_sheet/panels_v3/02_full_three_quarter_left.jpg
+      tags:
+      - full body
+      - three-quarter left
+      - grey knit
+      - studio
+    - path: /workspace/aar58/ref_lock/char_sheet/panels_v3/03_full_three_quarter_right.jpg
+      tags:
+      - full body
+      - three-quarter right
+      - grey knit
+      - studio
+    - path: /workspace/aar58/ref_lock/char_sheet/panels_v3/04_full_profile_left.jpg
+      tags:
+      - full body
+      - left profile
+      - grey knit
+      - studio
+    - path: /workspace/aar58/ref_lock/char_sheet/panels_v3/06_selfie_front_camera.jpg
+      tags:
+      - selfie
+      - front camera
+      - upper body
+      - grey knit
+      - studio
+    - path: /workspace/aar58/ref_lock/char_sheet/panels_v3/07_upper_three_quarter_desk.jpg
+      tags:
+      - upper body
+      - three-quarter
+      - sitting at a desk
+      - grey knit
+    - path: /workspace/aar58/maksim/gen/a2.jpg
+      tags:
+      - selfie
+      - boat deck
+      - warm low sun
+      - grey knit
+    - path: /workspace/aar58/maksim/gen/a9.jpg
+      tags:
+      - garden terrace
+      - soft daylight
+      - looking down
+      - grey knit
+    - path: /workspace/review_bundle/aleks_ready_to_post/post1/05.jpg
+      tags:
+      - farm gate
+      - afternoon sun
+      - olive wax jacket
+      - navy t-shirt
+    - path: /workspace/review_bundle/aleks_ready_to_post_batch2/post6_alt/03.jpg
+      tags:
+      - seated in a car
+      - olive jacket
+      - daylight
+    holdout:
+    - /workspace/review_bundle/aleks_ready_to_post/post3/05.jpg
+    - /workspace/review_bundle/aleks_ready_to_post_batch2/post4/01.jpg
+    identity_refs:
+    - /workspace/ai_studio/app/refs/maksim/01_front.jpg
+    - /workspace/ai_studio/app/refs/maksim/02_34_left.jpg
+    - /workspace/ai_studio/app/refs/maksim/03_selfie_v3.jpg
+  lock:
+    sources:
+    - aar58/ref_lock/candidates.md
+    - personas/batch2_plan/plan.md
+    - personas/batch2/QC_NOTES.md
+    - maksim-vsl/script.md
+    - config/personas.yaml look
+    age: early 50s
+    face: deep forehead lines, crow's feet and lines intact; salt-and-pepper / grey stubble 3-5 mm with moustache
+    skin_tone: unknown
+    hair: swept-back ash-blond/grey, medium length
+    build: slim
+    wardrobe_signatures:
+    - grey crew-neck knit
+    - olive wax jacket over navy t-shirt
+    - navy knit / navy blazer with white shirt (rotation)
+    voice_cadence: calm, measured, plain English; slow ~100-110 wpm; short sentences, deliberate pauses; no hype
+    pronunciation: Mak-seem, never Maxime
+    banned_traits:
+    - full beard or big hair (stubble only)
+    - dark hair
+    - sunglasses hiding the eyes on identity shots
+    - hands at the face
+    - AI backdrops
+    eye_colour: unknown
+    banned_context:
+    - quoting third-party P&L as his own
+    - yachts/Riviera/jets/Alpine (Marco lane)
+callum:
+  display: Callum
+  voice_id: eOI2ur2q3RYLvOJKFn3s
+  voice_name: Ollie
+  voice_settings:
+    stability: 0.45
+    similarity_boost: 0.8
+    style: 0.1
+    use_speaker_boost: true
+  refs:
+  - /workspace/personas/callum/ref_lock/face_sheet/callum_face_sheet_LOCKED.jpg
+  look: British man, 23-25, padel kit, candid and dry
+  lora:
+    trigger: clmbrt man
+    status: 'not trained: waiting for Aaron to review the Maksim LoRA'
+    dataset:
+    - glob: /workspace/personas/callum/ref_lock/face_sheet/*LOCKED*.jpg
+      tags:
+      - face sheet
+    - glob: /workspace/personas/callum/char_sheet_v3/*.jpg
+      tags:
+      - character sheet
+    todo: curate panels and approved batch1_v3 stills; sheets must be split into single images before training
+  lock:
+    sources:
+    - personas/callum/callum_world_plan.md
+    - personas/callum/aar59_linear_comment_draft.md
+    - personas/callum/ref_lock/face_sheet/LOCKED.md
+    - config/personas.yaml look
+    age: 23-25
+    face: unknown
+    skin_tone: unknown
+    eye_colour: unknown
+    hair: dark, swept back
+    build: unknown
+    wardrobe_signatures:
+    - tobacco suede overshirt over a cream crew knit
+    - 'rotation: bottle-green crew, navy cable knit, grey flannel suit + knit tie (club), padel kit, stone chinos, dark brown
+      suede chukkas, loafers'
+    - Cartier Tank on brown leather, the only watch
+    - no logos
+    voice_cadence: tone dry, self-deprecating, quietly proud; British; cadence unknown
+    banned_traits:
+    - a dog
+    - AI backdrops
+    banned_context:
+    - Alpine, yachts/Riviera, jets, Richard Mille, Royal Oak (Marco)
+    - farmhouse, springer spaniel, Lake Como, Engadin (Maksim)
+    identity_ref_note: 'locked face sheet FS-D6 (15 Oct) is the only identity ref; known gaps: no slit in the 09 close-up,
+      panel 12 hair sweeps back'

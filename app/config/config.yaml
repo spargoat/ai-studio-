@@ -1,0 +1,217 @@
+# AI Studio M1 config. Edit this file, not the code.
+# Mode: DRY_RUN is the default. Real provider calls need BOTH `--live` on the
+# command line AND budget caps (> 0) below. Nothing here holds a secret:
+# keys are read from the environment by NAME only.
+
+data_dir: data                 # SQLite job log + files, relative to app/
+db_file: data/studio.db
+
+budget:
+  # Leave null until Aaron approves spend. --live refuses to start while null/0.
+  global_cap_usd: 75           # Aaron approved $75 total fal+ElevenLabs for M1 (19 Oct 2026, via parent agent)
+  per_job_cap_usd: 15          # live spend per job (all stages, all attempts)
+  daily_cap_usd: null          # optional; null = no daily cap
+
+retries:
+  max_retries: 2               # retry x2 => 3 attempts max per stage run
+  backoff_seconds: [2, 8]      # live backoff per retry
+  dry_run_backoff_seconds: 0.1
+
+providers:
+  mock:       {kind: mock}
+  ffmpeg:     {kind: ffmpeg}   # local, free, always real
+  fal:
+    kind: fal
+    key_env: [FAL_KEY]
+    queue_base: https://queue.fal.run
+    poll_seconds: 5
+    timeout_seconds: 1200
+  higgsfield:
+    kind: higgsfield
+    key_env: [HIGGSFIELD_API_KEY]
+    optional_key: true          # fallback only; transport not wired yet
+  llm:
+    kind: llm
+    key_env: [ANTHROPIC_API_KEY, OPENAI_API_KEY]
+    optional_key: true          # live preflight doesn't require it; LLM stages fail cleanly with "needs key"
+  elevenlabs:
+    kind: elevenlabs
+    key_env: [ELEVENLABS_API_KEY, ELEVENLABS]
+    base: https://api.elevenlabs.io/v1
+    output_format: mp3_44100_128
+    with_timestamps: false      # true = /with-timestamps endpoint, saves alignment.json for exact caption timing
+                                # (same price per char per ElevenLabs docs; not yet exercised live)
+    timeout_seconds: 180
+
+# Per-stage adapter: swap provider/model/price_key here to change models.
+stages:
+  still:
+    provider: fal
+    model: fal-ai/nano-banana-2/edit           # refs-in, persona still
+    price_key: fal_nano_banana_2
+    # Used when the template/brief sets still.params.use_lora: true and the persona has an active LoRA
+    lora_route:
+      model: fal-ai/wan/v2.2-a14b/text-to-image/lora
+      price_key: fal_wan22_t2i_lora
+      scale: 1.0
+      params: {image_size: {width: 1088, height: 1920}, num_inference_steps: 27, guidance_scale: 3.5,
+               image_format: png, negative_prompt: "cartoon, cgi, plastic skin, airbrushed, text, watermark"}
+    alternatives:
+      - {provider: fal, model: fal-ai/nano-banana-pro/edit, price_key: fal_nano_banana_pro, note: "hero finals; endpoint id to confirm before first live call"}
+  video:
+    provider: fal
+    model: fal-ai/kling-video/v3/pro/image-to-video
+    price_key: fal_kling_v3_pro_i2v_silent
+    # Optional video LoRA route (same Wan 2.2 persona LoRA), set video.params.use_lora: true. Not yet tested live.
+    lora_route:
+      model: fal-ai/wan/v2.2-a14b/image-to-video/lora
+      price_key: fal_wan22_i2v_lora
+      scale: 1.0
+      params: {resolution: "720p", aspect_ratio: "9:16", num_frames: 161, frames_per_second: 16}
+  voice:
+    provider: elevenlabs
+    model: eleven_multilingual_v2
+    price_key: elevenlabs_multilingual_v2
+  lipsync:
+    provider: fal
+    model: fal-ai/sync-lipsync/v2/pro
+    price_key: fal_lipsync_2_pro
+  finish:
+    provider: ffmpeg
+    model: ffmpeg-realism-pass-v1
+    price_key: local_ffmpeg
+  compose:
+    provider: ffmpeg
+    model: ffmpeg-compose-v1
+    price_key: local_ffmpeg
+  llm:                          # generic text stage (templates point at it with `uses: llm`)
+    provider: llm
+    model: unset (no LLM key yet)
+    price_key: llm_unpriced
+
+# Price table. USD ex-VAT. Every row carries its source and check date
+# (Phase 0 assessment, AAR-72, sources S1-S9). Re-check monthly (risk #6).
+# Fallback routing: when fal is locked (exhausted balance), fal stages with a `fallback` entry below route to it.
+# A fallback is only used if its price row is > 0 (so the spend guard still bites). Higgsfield is credit-priced;
+# the USD rows are placeholders to confirm, set to 0 = fallback disabled until Aaron sets real numbers.
+fallback:
+  enabled: true
+  when: fal_locked
+  routes:
+    still:   {provider: higgsfield, model: "nano_banana_2 (to confirm)", price_key: hf_image}
+    video:   {provider: higgsfield, model: "wan_3_0 (to confirm)", price_key: hf_video}
+    lipsync: {provider: higgsfield, model: "lipsync (to confirm)", price_key: hf_lipsync}
+
+prices:
+  hf_image:   {unit: image, usd_per_unit: 0.0, source: "Higgsfield credits; USD per credit to confirm", checked: 2026-10-20}
+  hf_video:   {unit: second, usd_per_unit: 0.0, source: "Higgsfield credits; USD per credit to confirm", checked: 2026-10-20}
+  hf_lipsync: {unit: second, usd_per_unit: 0.0, source: "Higgsfield credits; USD per credit to confirm", checked: 2026-10-20}
+  llm_unpriced:
+    unit: call
+    usd_per_unit: 0.0
+    source: "placeholder: no LLM key/provider chosen yet; price unknown"
+    checked: 2026-10-20
+  fal_nano_banana_2:
+    unit: image
+    usd_per_unit: 0.08
+    resolution_multipliers: {"0.5K": 0.75, "1K": 1.0, "2K": 1.5, "4K": 2.0}
+    source: "https://fal.ai/models/fal-ai/nano-banana-2 (Phase 0 S1; re-read 19 Oct 2026)"
+    checked: 2026-10-19
+  fal_nano_banana_pro:
+    unit: image
+    usd_per_unit: 0.15
+    source: "https://fal.ai/pricing (Phase 0 S1)"
+    checked: 2026-10-19
+  fal_flux_2:
+    unit: megapixel
+    usd_per_unit: 0.012
+    source: "https://fal.ai/pricing (Phase 0 S1)"
+    checked: 2026-10-19
+  fal_kling_v3_pro_i2v_silent:
+    unit: second
+    usd_per_unit: 0.112
+    note: "audio off; $0.168/s with generate_audio=true"
+    source: "https://fal.ai/models/fal-ai/kling-video/v3/pro/image-to-video (Phase 0 S2)"
+    checked: 2026-10-19
+  fal_minimax_h3_max:
+    unit: second
+    usd_per_unit: 0.05
+    source: "https://fal.ai/pricing (Phase 0 S1)"
+    checked: 2026-10-19
+  elevenlabs_multilingual_v2:
+    unit: 1k_chars
+    usd_per_unit: 0.08
+    note: "pay-as-you-go API rate; a subscription's included characters would make this $0 at the margin"
+    source: "https://elevenlabs.io/pricing/api (Phase 0 S7; v2 Multilingual row re-read 19 Oct 2026)"
+    checked: 2026-10-19
+  fal_lipsync_2_pro:
+    unit: second
+    usd_per_unit: 0.0833
+    note: "$5 per output minute"
+    source: "https://fal.ai/models/fal-ai/sync-lipsync/v2/pro (Phase 0 S4)"
+    checked: 2026-10-19
+  fal_sync3_lipsync:
+    unit: second
+    usd_per_unit: 0.1333
+    note: "$8 per output minute"
+    source: "https://fal.ai/models/fal-ai/sync-lipsync/v3/llms.txt"
+    checked: 2026-10-19
+  fal_topaz_video_1080:
+    unit: second
+    usd_per_unit: 0.02
+    note: "optional finals upscale, not in default template"
+    source: "https://fal.ai/models/fal-ai/topaz/upscale/video (Phase 0 S5)"
+    checked: 2026-10-19
+  fal_wan22_image_trainer:
+    unit: step
+    usd_per_unit: 0.0045
+    min_units: 100
+    note: "1000 steps = $4.50; outputs high- and low-noise LoRA files"
+    source: "https://fal.ai/models/fal-ai/wan-22-image-trainer/llms.txt"
+    checked: 2026-10-19
+  fal_wan22_t2i_lora:
+    unit: image
+    usd_per_unit: 0.05
+    source: "https://fal.ai/models/fal-ai/wan/v2.2-a14b/text-to-image/lora/llms.txt"
+    checked: 2026-10-19
+  fal_wan22_i2v_lora:
+    unit: second
+    usd_per_unit: 0.10
+    source: "https://fal.ai/models/fal-ai/wan/v2.2-a14b/image-to-video/lora/llms.txt"
+    checked: 2026-10-19
+  fal_flux2_trainer:
+    unit: step
+    usd_per_unit: 0.0064
+    source: "https://fal.ai/models/fal-ai/flux-2-trainer/llms.txt"
+    checked: 2026-10-19
+  fal_flux2_lora:
+    unit: megapixel
+    usd_per_unit: 0.021
+    source: "https://fal.ai/models/fal-ai/flux-2/lora"
+    checked: 2026-10-19
+  local_ffmpeg:
+    unit: call
+    usd_per_unit: 0.0
+    source: "local ffmpeg on the box"
+    checked: 2026-10-19
+
+# Persona LoRA training (studio train-lora PERSONA). Registry of trained versions: config/loras.yaml
+lora:
+  trainer:
+    model: fal-ai/wan-22-image-trainer
+    price_key: fal_wan22_image_trainer
+    steps: 1000
+    params: {use_face_detection: true, use_masks: true, include_synthetic_captions: false, learning_rate: 0.0007}
+
+# Local quality gate (studio/score.py): identity + visual measured offline; copy/brand/engagement not scored
+# until an LLM key exists. Flags never block a stage; they show in status/doctor/review page.
+quality:
+  enabled: true
+  stages: [still, video, lipsync, finish, compose]
+  frames: 5                    # frames sampled per video
+  identity_threshold: 0.50     # tuned 20 Oct on local data (tools/tune_identity.py): wrong faces max 0.374, Maksim min 0.614
+  min_short_side: 1080         # checked on resolution_stages only (model intermediates are 1072x1928)
+  resolution_stages: [still, finish, compose]
+  min_sharpness: 50            # variance of Laplacian, median over frames
+  luma_range: [40, 210]
+  max_clipped_pct: 5

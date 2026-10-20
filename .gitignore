@@ -1,0 +1,10 @@
+data/
+node_modules/
+dist/
+.env*
+models/
+bin/
+__pycache__/
+*.pyc
+.vercel/
+public/
