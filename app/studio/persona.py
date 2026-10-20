@@ -101,6 +101,19 @@ def face_lock_locations(raw_refs):
     return [location(e) for e in face_lock_entries(raw_refs) if location(e)]
 
 
+def refs_for_stage(raw_refs, kind):
+    """Refs whose bytes this stage may download.
+
+    image is the only kind that sends a face to a model. voice, video,
+    lipsync, finish and compose use the upstream output, not the persona
+    sheets. outfit, character, detail, handwriting and backstory are never
+    downloaded for a stage.
+    """
+    if kind != "image":
+        return []
+    return face_lock_entries(raw_refs)
+
+
 def is_image(entry):
     name = (entry or {}).get("name") or ""
     return name.lower().endswith(IMAGE_SUFFIXES)

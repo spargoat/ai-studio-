@@ -413,7 +413,8 @@ class Runner:
                 except (BriefError, SpendGuardError):
                     raise
                 except Exception as e:
-                    message = str(e)
+                    from .storage import space_note
+                    message = space_note(e)
                     latest = self.db.latest(job_id, sid)
                     if latest and latest["status"] == "running":
                         self.db.update_run(latest["id"], status="failed", error=message, finished_at=now())
@@ -460,16 +461,22 @@ class Runner:
         except Exception as e:
             if falm.get("aid"):
                 self.db.update_attempt(falm["aid"], status="failed", error=str(e), finished_at=now())
-            self.db.update_run(run["id"], status="failed", error=str(e), finished_at=now())
-            self.log(job["id"], run["stage"], "error", f"fal poll failed: {e}")
+            from .storage import space_note
+            message = space_note(e)
+            self.db.update_run(run["id"], status="failed", error=message, finished_at=now())
+            self.log(job["id"], run["stage"], "error", f"fal poll failed: {message}")
             return False
+        from .assets import reclaim_tmp
+        reclaim_tmp()
         out_dir = self.job_dir(job["id"]) / run["stage"] / f"v{run['version']}"
         out_dir.mkdir(parents=True, exist_ok=True)
         try:
             res = provider.save_result(falm["kind"], result, out_dir)
         except Exception as e:
-            self.db.update_run(run["id"], status="failed", error=str(e), finished_at=now())
-            self.log(job["id"], run["stage"], "error", f"fal download failed: {e}")
+            from .storage import space_note
+            message = space_note(e)
+            self.db.update_run(run["id"], status="failed", error=message, finished_at=now())
+            self.log(job["id"], run["stage"], "error", f"fal download failed: {message}")
             return False
         res["request_id"] = falm["request_id"]
         job_live = True
@@ -542,13 +549,13 @@ class Runner:
         if sdef["kind"] == "script":
             from .frameworks import prompt as fw_prompt
             prompt = (prompt + " " if prompt else "") + fw_prompt(sdef.get("params") or {}, persona, brief)
-        from .persona import face_lock_entries, location, lock_text
+        from .persona import location, lock_text, refs_for_stage
         lt = lock_text(persona, sdef["kind"])
         if lt and prompt:
             prompt = f"{prompt} {lt}"
         params = {k: v for k, v in sdef["params"].items() if k not in ("duration", "chars_per_second")} \
             if sdef["kind"] in ("video", "voice") else dict(sdef["params"])
-        locked = face_lock_entries(persona.get("refs"))
+        locked = refs_for_stage(persona.get("refs"), sdef["kind"])
         ref_sha = {location(e): e.get("sha256") for e in locked if location(e) and e.get("sha256")}
         return {"stage": sdef["id"], "kind": sdef["kind"], "prompt": prompt, "params": params,
                 "inputs": inputs, "persona": brief["persona"], "persona_display": persona.get("display"),
@@ -561,17 +568,22 @@ class Runner:
         job_id, sid, kind = job["id"], sdef["id"], sdef["kind"]
         if kind == "brief":
             return self._run_brief(job, sdef)
-        from .storage import local
+        from .assets import reclaim_tmp
+        from .storage import is_url, local
+        reclaim_tmp()
         job_live = self.live or job.get("mode") == "live"
         mode = "live" if job_live else "dry"
         provider, sc = self.provider_for(sdef.get("uses", sid), live=job_live)
         if self.async_fal and provider.name == "fal":
             provider.cfg = {**provider.cfg, "max_polls": 1, "poll_seconds": 0}
-        inputs_ids, inputs = {}, {}
+        inputs_ids, inputs, downloaded = {}, {}, []
         for d in sdef["needs"]:
             r = self.db.latest(job_id, d)
             inputs_ids[d] = r["id"]
-            inputs[d] = local(r["output_path"])
+            src = r["output_path"]
+            inputs[d] = local(src)
+            if is_url(src):
+                downloaded.append(inputs[d])
         ctx = self.build_ctx(job, sdef, inputs)
         sc = self.apply_lora_route(job, sdef, sc, ctx)
         if sdef.get("model"):
@@ -601,7 +613,13 @@ class Runner:
                                    {**ctx["params"], **({"duration": ctx["video_seconds"]} if kind == "video" else {})},
                                    inputs_ids, est)
         out_dir = self.job_dir(job_id) / sid / f"v{ver}"
-        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            from .storage import NoSpace
+            if getattr(e, "errno", None) == 28:
+                raise NoSpace(out_dir) from e
+            raise
         ctx["out_dir"] = str(out_dir)
         if lead:   # local, free: pad silence before speech so the mouth model has a run-up
             from .media import ff as _ff
@@ -649,7 +667,7 @@ class Runner:
                                    review_status="pending" if sdef.get("review") else None)
                 self.log(job_id, sid, "info", f"v{ver} ok in {time.time()-t0:.1f}s, actual ${actual:.4f}, attempt {attempt}/{max_try}")
                 self.score_run(rid)
-                if not self._publish(rid, out_dir):
+                if not self._publish(rid, out_dir, downloaded):
                     return False
                 return True
             except FalPending as e:
@@ -669,12 +687,15 @@ class Runner:
                 self.log(job_id, sid, "error", f"non-retryable: {e}")
                 break
             except Exception as e:  # provider failure, network, ffmpeg...
-                last_err = f"attempt {attempt}: {type(e).__name__}: {e}"
+                from .storage import space_note
+                last_err = space_note(f"attempt {attempt}: {type(e).__name__}: {e}")
                 self.db.update_attempt(aid, status="failed", error=str(e), finished_at=now(), latency_s=round(time.time()-t0, 2))
                 self.log(job_id, sid, "error", last_err + (f"; retrying in {backoff[min(attempt-1, len(backoff)-1)]}s" if attempt < max_try else "; giving up"))
                 if attempt < max_try:
                     time.sleep(backoff[min(attempt - 1, len(backoff) - 1)])
-        self.db.update_run(rid, status="failed", error=last_err, attempts=attempt, finished_at=now())
+        from .storage import space_note
+        self.db.update_run(rid, status="failed", error=space_note(last_err), attempts=attempt, finished_at=now())
+        self._free_scratch(out_dir, downloaded)
         return False
 
     def score_run(self, run_id, n_frames=None):
@@ -752,6 +773,8 @@ class Runner:
             meta["poster_error"] = str(e)
 
     def _run_brief(self, job, sdef):
+        from .assets import reclaim_tmp
+        reclaim_tmp()
         rid, ver = self.db.new_run(job["id"], "brief", self.mode, "local", "brief-resolver", "local_ffmpeg",
                                    "", {}, {}, 0.0)
         out_dir = self.job_dir(job["id"]) / "brief" / f"v{ver}"
@@ -770,17 +793,37 @@ class Runner:
             return False
         return True
 
-    def _publish(self, run_id, out_dir):
+    def _free_scratch(self, out_dir, downloaded=None):
+        """Drop a stage directory and its downloaded inputs once Blob has them.
+
+        Local runs keep the files: the DB path is the file itself.
+        """
+        from . import storage
+        if not storage.enabled():
+            return
+        out_dir = Path(out_dir)
+        shutil.rmtree(out_dir, ignore_errors=True)
+        for directory in (out_dir.parent, out_dir.parent.parent):
+            try:
+                directory.rmdir()
+            except OSError:
+                break
+        for path in downloaded or []:
+            storage.release_local(path)
+
+    def _publish(self, run_id, out_dir, downloaded=None):
         """Upload the stage directory. A Blob rejection fails this run instead of raising."""
-        from .storage import publish_run
+        from .storage import publish_run, space_note
         try:
-            publish_run(self.db, run_id, out_dir)
+            url = publish_run(self.db, run_id, out_dir)
         except Exception as e:
-            message = str(e)
+            message = space_note(e)
             self.db.update_run(run_id, status="failed", error=message, finished_at=now())
             run = self.db.run(run_id)
             self.log(run["job_id"] if run else "?", run["stage"] if run else None, "error", message)
             return False
+        if url:
+            self._free_scratch(out_dir, downloaded)
         return True
 
     def set_override(self, job_id, stage, params=None, model=None, price_key=None, prompt=None):

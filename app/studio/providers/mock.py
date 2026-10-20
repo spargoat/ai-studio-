@@ -46,6 +46,7 @@ class MockProvider(Provider):
                 continue
             if path and os.path.exists(path):
                 out.append(path)
+                break  # the mock still paints the primary face only
         return out
 
     def do_image(self, ctx):

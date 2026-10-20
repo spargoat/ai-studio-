@@ -333,14 +333,19 @@ def register(app, cfg, runner, live, bg):
         if not man["count"]:
             return err("nothing to export: the selected items are not final outputs (tick 'include intermediate stages') or their files are missing")
         from . import storage
+        zpath = Path(z)
         url, stored = f"/file?p={z}", z
+        size = zpath.stat().st_size
         if storage.enabled():
             try:
-                blob = storage.put_file(f"exports/{Path(z).name}", Path(z).read_bytes(), "application/zip")
+                blob = storage.put_file(f"exports/{zpath.name}", zpath.read_bytes(), "application/zip")
             except storage.BlobError as e:
                 return err(str(e), 502)
             url = stored = blob
-        return jsonify({"zip": stored, "url": url, "name": Path(z).name, "size": Path(z).stat().st_size, "manifest": man})
+            zpath.unlink(missing_ok=True)
+            import shutil
+            shutil.rmtree(zpath.with_suffix(""), ignore_errors=True)
+        return jsonify({"zip": stored, "url": url, "name": zpath.name, "size": size, "manifest": man})
 
     @bp.get("/api/exports")
     def exports():
