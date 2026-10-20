@@ -6,6 +6,7 @@ import random
 import shutil
 import string
 import time
+import uuid
 from pathlib import Path
 
 from .config import key_status, load_template
@@ -326,11 +327,11 @@ class Runner:
             if latest and latest["status"] == "running":
                 running = True
                 continue
-            deps_ok = all(self.is_ready(self.db.latest(job_id, d), self.def_of(defs, d)) for d in sdef["needs"])
-            if not deps_ok:
-                continue
             if latest and latest["status"] in ("failed", "blocked_budget"):
                 failed = True
+                continue
+            deps_ok = all(self.is_ready(self.db.latest(job_id, d), self.def_of(defs, d)) for d in sdef["needs"])
+            if not deps_ok:
                 continue
             if latest and latest["status"] == READY and latest["review_status"] == "rejected":
                 waiting = True
@@ -363,11 +364,77 @@ class Runner:
                     library.add(self.db, lr, "final output of a done job")
         return st
 
+    def _run_timeout_s(self):
+        """Past the 300s function limit, so a stage that is still writing is not failed underneath itself."""
+        try:
+            return max(1, int(os.environ.get("STUDIO_RUN_TIMEOUT_S") or 360))
+        except ValueError:
+            return 360
+
+    def _lease_ttl_s(self):
+        try:
+            raw = os.environ.get("STUDIO_LEASE_TTL_S")
+            return max(1, int(raw)) if raw else self._run_timeout_s()
+        except ValueError:
+            return self._run_timeout_s()
+
+    def _run_age_s(self, started_at):
+        if not started_at:
+            return None
+        try:
+            started = dt.datetime.fromisoformat(started_at)
+        except ValueError:
+            return None
+        if started.tzinfo is None:
+            started = started.astimezone()
+        return (dt.datetime.now().astimezone() - started.astimezone()).total_seconds()
+
+    def _stale_reason(self, run):
+        age = self._run_age_s(run.get("started_at"))
+        waited = f" after {int(age)}s" if age is not None else ""
+        return f"instance was killed or the run timed out{waited} (left running with no result)"
+
+    def _run_is_stale(self, run):
+        """A fal poll stays running between requests. Any other row still running past the timeout died with the instance."""
+        meta = json.loads(run.get("meta_json") or "{}")
+        if meta.get("fal"):
+            return False
+        age = self._run_age_s(run.get("started_at"))
+        if age is None:
+            return True
+        return age >= self._run_timeout_s()
+
+    def reconcile(self, job_id=None):
+        """Fail stage runs left running past the timeout, and drop expired compose leases.
+
+        Cron calls this across every job. A killed function cannot record its own failure,
+        so the row stays `running` until this path marks it failed. Re-run starts a new version.
+        """
+        sql = "SELECT * FROM stage_runs WHERE status='running'"
+        args = ()
+        if job_id:
+            sql += " AND job_id=?"
+            args = (job_id,)
+        failed = []
+        for run in self.db.q(sql, args):
+            if not self._run_is_stale(run):
+                continue
+            reason = self._stale_reason(run)
+            self.db.update_run(run["id"], status="failed", error=reason, finished_at=now())
+            if run["stage"] == "compose":
+                self.db.x("DELETE FROM leases WHERE name='compose' AND job_id=?", (run["job_id"],))
+            self.log(run["job_id"], run["stage"], "error", reason)
+            self.settle(run["job_id"])
+            failed.append({"id": run["id"], "job_id": run["job_id"], "stage": run["stage"], "error": reason})
+        return {"failed": failed, "leases_released": self.db.release_expired_leases()}
+
     def advance(self, job_id, only=None):
         """Run one due stage, or poll one in-flight fal request. Safe to call again."""
         job = self.db.job(job_id)
         if not job:
             raise BriefError(f"no job {job_id}")
+        self.reconcile(job_id)
+        job = self.db.job(job_id)
         defs = self.stage_defs(job)
         running = [r for r in self.db.runs(job_id) if r["status"] == "running"]
         if running:
@@ -407,27 +474,39 @@ class Runner:
                 due = only is not None or latest is None or latest["status"] != READY or self.is_stale(job_id, latest)
                 if not due:
                     continue
+                lease = None
+                if sdef["kind"] == "compose":
+                    lease = f"{job_id}:{uuid.uuid4().hex}"
+                    if not self.db.acquire_lease("compose", lease, job_id, self._lease_ttl_s()):
+                        held = self.db.lease("compose") or {}
+                        whose = held.get("job_id")
+                        return {"action": "busy", "stage": sid, "status": job["status"],
+                                "reason": "compose lease held" + (f" by {whose}" if whose else "")}
                 self.db.set_job_status(job_id, "running")
                 try:
-                    result = self.run_stage(job, sdef)
-                except (BriefError, SpendGuardError):
-                    raise
-                except Exception as e:
-                    from .storage import space_note
-                    message = space_note(e)
-                    latest = self.db.latest(job_id, sid)
-                    if latest and latest["status"] == "running":
-                        self.db.update_run(latest["id"], status="failed", error=message, finished_at=now())
-                    self.log(job_id, sid, "error", message)
-                    return {"action": "stage", "stage": sid, "ok": False, "pending": False,
-                            "error": message, "status": self.settle(job_id)}
-                body = {"action": "stage", "stage": sid, "ok": result is True or result == "pending",
-                        "pending": result == "pending", "status": self.settle(job_id)}
-                if result is False:
-                    latest = self.db.latest(job_id, sid)
-                    if latest and latest.get("error"):
-                        body["error"] = latest["error"]
-                return body
+                    try:
+                        result = self.run_stage(job, sdef)
+                    except (BriefError, SpendGuardError):
+                        raise
+                    except Exception as e:
+                        from .storage import space_note
+                        message = space_note(e)
+                        latest = self.db.latest(job_id, sid)
+                        if latest and latest["status"] == "running":
+                            self.db.update_run(latest["id"], status="failed", error=message, finished_at=now())
+                        self.log(job_id, sid, "error", message)
+                        return {"action": "stage", "stage": sid, "ok": False, "pending": False,
+                                "error": message, "status": self.settle(job_id)}
+                    body = {"action": "stage", "stage": sid, "ok": result is True or result == "pending",
+                            "pending": result == "pending", "status": self.settle(job_id)}
+                    if result is False:
+                        latest = self.db.latest(job_id, sid)
+                        if latest and latest.get("error"):
+                            body["error"] = latest["error"]
+                    return body
+                finally:
+                    if lease:
+                        self.db.release_lease("compose", lease)
         finally:
             self.async_fal = False
         return {"action": "idle", "status": self.settle(job_id)}
@@ -717,6 +796,8 @@ class Runner:
             s = score.unscored(self.cfg, str(e))
         if s.get("error"):
             s = score.unscored(self.cfg, s["error"])
+        if run["stage"] == "still" and run.get("mode") == "dry":
+            s = score.mark_dry_still(s)
         self.db.save_score(run, persona, run["output_path"], s)
         meta = json.loads(run["meta_json"] or "{}")
         if len(meta.get("exports") or {}) > 1:      # compose: score every aspect export, keep in run meta
@@ -731,7 +812,10 @@ class Runner:
             bad = [a for a, v in meta["export_scores"].items() if v.get("passed") is False]
             if bad:
                 self.log(run["job_id"], run["stage"], "warn", f"compose exports flagged: {', '.join(bad)}")
-        if s.get("identity") is None and str(s.get("identity_note") or "").startswith("not scored"):
+        note = str(s.get("identity_note") or "")
+        if note == score.DRY_RUN_IDENTITY:
+            idt = note
+        elif s.get("identity") is None and note.startswith("not scored"):
             idt = "not scored"
         else:
             idt = "n/a" if s["identity"] is None else f"{s['identity']:.3f}"

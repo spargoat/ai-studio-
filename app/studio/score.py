@@ -35,6 +35,16 @@ def available():
         return False
 
 
+DRY_RUN_IDENTITY = "dry run, self-reference"
+
+
+def mark_dry_still(score):
+    """A dry-run still is painted from the persona's own reference, so the cosine is not a match."""
+    flags = [f for f in (score.get("flags") or []) if not str(f).startswith("identity")]
+    return {**score, "identity": None, "identity_min": None, "identity_note": DRY_RUN_IDENTITY,
+            "flags": flags, "passed": False if flags else None}
+
+
 def unscored(cfg, reason, visual=None, flags=None):
     """A stored score for a file we could not measure. The UI says 'not scored'."""
     q = (cfg or {}).get("quality") or {} if isinstance(cfg, dict) else {}

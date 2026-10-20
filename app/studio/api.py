@@ -245,6 +245,8 @@ def register(app, cfg, runner, live, bg):
             return err("CRON_SECRET is not set", 503)
         if not hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {secret}"):
             return err("unauthorized", 401)
+        # A killed instance leaves its stage_run `running`. Recover those before picking the next three jobs.
+        reconciled = runner.reconcile()
         # failed jobs stay failed. partial here means more stages are still due, not a recorded stage error.
         rows = db.q("SELECT id, mode FROM jobs WHERE status IN ('created','running','partial') ORDER BY updated_at LIMIT 3")
         out = []
@@ -256,7 +258,7 @@ def register(app, cfg, runner, live, bg):
                 out.append({"id": row["id"], **runner.advance(row["id"])})
             except Exception as e:
                 out.append({"id": row["id"], "error": str(e)})
-        return jsonify({"ok": True, "advanced": out})
+        return jsonify({"ok": True, "reconciled": reconciled, "advanced": out})
 
     @bp.post("/api/jobs/<jid>/resume")
     def resume(jid):

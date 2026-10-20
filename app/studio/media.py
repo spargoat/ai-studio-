@@ -6,10 +6,11 @@ from .assets import ffmpeg_bin, font_file
 
 
 def ff(args, timeout=300):
+    """Run ffmpeg. Stdout is discarded so a chatty filter cannot fill the function's memory."""
     cmd = [ffmpeg_bin("ffmpeg"), "-v", "error", "-y", *args]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True, timeout=timeout)
     if r.returncode != 0:
-        raise RuntimeError(f"ffmpeg failed: {r.stderr.strip()[-600:]}")
+        raise RuntimeError(f"ffmpeg failed: {(r.stderr or '').strip()[-600:]}")
 
 
 _dur = {}

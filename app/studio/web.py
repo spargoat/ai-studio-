@@ -30,7 +30,7 @@ button.ok{background:#1d4d2b}button.no{background:#5a1f1f}
 <nav><a href="/">App</a><a href="/classic" class="{{'on' if tab=='jobs' else ''}}">Jobs</a><a href="/classic/library" class="{{'on' if tab=='library' else ''}}">Library</a></nav>
 <div class=sm>spend ${{'%.2f'|format(spend)}} of ${{caps[0]}} cap</div></header><main>
 {% macro badges(sc) %}{% if sc %}{% if sc.passed is not none %}<span class="b {{'pass' if sc.passed else 'flag'}}">{{'PASS' if sc.passed else 'FLAG'}}</span>{% endif %}
-<span class=b style="background:#223">identity {% if sc.identity is not none %}{{'%.2f'|format(sc.identity)}}{% elif (sc.identity_note or '').startswith('not scored') or sc.passed is none %}not scored{% else %}n/a{% endif %}</span>
+<span class=b style="background:#223">identity {% if (sc.identity_note or '') == 'dry run, self-reference' %}dry run, self-reference{% elif sc.identity is not none %}{{'%.2f'|format(sc.identity)}}{% elif (sc.identity_note or '').startswith('not scored') or sc.passed is none %}not scored{% else %}n/a{% endif %}</span>
 {% if sc.visual %}<span class="b ns">{{sc.visual.width}}x{{sc.visual.height}} · sharp {{sc.visual.sharpness|int}}</span>{% else %}<span class="b ns">visual not scored</span>{% endif %}
 <span class="b ns" title="needs an LLM key">copy/brand/engagement: not scored</span>
 {% for f in sc.flags %}<div class=err>{{f}}</div>{% endfor %}{% endif %}{% endmacro %}
@@ -41,7 +41,7 @@ button.ok{background:#1d4d2b}button.no{background:#5a1f1f}
 <form method=get><input name=q value="{{q or ''}}" placeholder="search prompts, jobs, templates" style="width:100%;padding:10px;border-radius:6px;border:1px solid #444;background:#222;color:#eee"></form>
 <div class=grid>{% for r in lib %}<div class=ver>{{media(r.path)}}<div class=sm>{% if r.promoted %}<span class="b approved">★ promoted</span>{% endif %}
 {{r.persona}} · {{r.template}}<br><a href="/job/{{r.job_id}}">{{r.job_id}}</a>/{{r.stage}} v{{r.version}} [{{r.mode}}]</div>
-{% if r.identity is not none %}<span class="b {{'pass' if r.passed else 'flag'}}">id {{'%.2f'|format(r.identity)}}</span>{% endif %}
+{% if r.scores_json and 'dry run, self-reference' in r.scores_json %}<span class="b ns">identity dry run, self-reference</span>{% elif r.identity is not none %}<span class="b {{'pass' if r.passed else 'flag'}}">id {{'%.2f'|format(r.identity)}}</span>{% endif %}
 {% if not r.promoted %}<form method=post action="/classic/library/{{r.id}}/promote"><button style="padding:6px 10px;font-size:13px">Promote</button></form>{% endif %}</div>
 {% else %}<p>Library empty. Run <code>studio library backfill</code>.</p>{% endfor %}</div>
 {% elif not job %}<div class=jobs>{% for j in jobs %}<a class=j href="/job/{{j.id}}"><b>{{j.id}}</b> <span class="b {{j.status}}">{{j.status}}</span>

@@ -14,8 +14,10 @@ class T(unittest.TestCase):
     def test_real_build_assets_are_copied(self):
         public = Path(tempfile.mkdtemp())
         refs = stage_static.stage(ROOT / "app" / "ui" / "dist", public)
-        self.assertIn("/assets/index-CDkQMb1V.js", refs)
+        self.assertIn("/assets/index-DWHte4Qj.js", refs)
         self.assertIn("/assets/index-C4dCJhso.css", refs)
+        built = " ".join(p.read_text(errors="ignore") for p in (ROOT / "app" / "ui" / "dist" / "assets").glob("*.js"))
+        self.assertIn("dry run, self-reference", built)
         for ref in refs:
             copied = public / ref.lstrip("/")
             self.assertTrue(copied.is_file(), ref)

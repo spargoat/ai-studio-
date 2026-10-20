@@ -42,6 +42,9 @@ CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, stage TEXT,
   level TEXT, message TEXT, created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS leases (
+  name TEXT PRIMARY KEY, owner TEXT, job_id TEXT, expires_at TEXT
+);
 """
 
 _lock = threading.Lock()
@@ -303,3 +306,34 @@ class DB:
 
     def events(self, job_id, limit=200):
         return self.q("SELECT * FROM events WHERE job_id=? ORDER BY id DESC LIMIT ?", (job_id, limit))
+
+    # --- leases (one compose at a time across instances; Turso when that is the database)
+    def acquire_lease(self, name, owner, job_id, ttl_s):
+        """Take `name` unless another owner still holds an unexpired lease. True when this owner holds it."""
+        exp = (dt.datetime.now().astimezone() + dt.timedelta(seconds=int(ttl_s))).isoformat(timespec="seconds")
+        with _lock:
+            self.conn.execute(
+                """INSERT INTO leases (name, owner, job_id, expires_at) VALUES (?,?,?,?)
+                   ON CONFLICT(name) DO UPDATE SET
+                     owner=excluded.owner, job_id=excluded.job_id, expires_at=excluded.expires_at
+                   WHERE leases.expires_at <= ? OR leases.owner = excluded.owner""",
+                (name, owner, job_id, exp, now()))
+            self.conn.commit()
+            row = self.conn.execute("SELECT owner FROM leases WHERE name=?", (name,)).fetchone()
+        if row is None:
+            return False
+        got = row["owner"] if not isinstance(row, tuple) else row[0]
+        return got == owner
+
+    def lease(self, name):
+        return self.one("SELECT * FROM leases WHERE name=?", (name,))
+
+    def release_lease(self, name, owner):
+        self.x("DELETE FROM leases WHERE name=? AND owner=?", (name, owner))
+
+    def release_expired_leases(self):
+        stamp = now()
+        rows = self.q("SELECT name, job_id, owner FROM leases WHERE expires_at <= ?", (stamp,))
+        if rows:
+            self.x("DELETE FROM leases WHERE expires_at <= ?", (stamp,))
+        return [{"name": r["name"], "job_id": r["job_id"]} for r in rows]

@@ -27,14 +27,23 @@ def parse_fail(v):
 
 
 def fmt_score(sc):
-    if sc["identity"] is None and str(sc.get("identity_note") or "").startswith("not scored"):
+    note = str(sc.get("identity_note") or "")
+    if note == "dry run, self-reference":
+        idt = note
+    elif sc["identity"] is None and note.startswith("not scored"):
         idt = "not scored"
     else:
         idt = "n/a" if sc["identity"] is None else f"{sc['identity']:.3f} (thr {sc['identity_threshold']})"
+    if sc["passed"] is True:
+        verdict = "PASS"
+    elif sc["passed"] is False:
+        verdict = "FLAGGED"
+    else:
+        verdict = "not scored"
     v = sc["visual"] or {}
-    return (f"{'PASS' if sc['passed'] else 'FLAGGED'} identity {idt} | visual {v.get('width')}x{v.get('height')} "
+    return (f"{verdict} identity {idt} | visual {v.get('width')}x{v.get('height')} "
             f"sharp {v.get('sharpness')} luma {v.get('luma_mean')} | copy/brand/engagement: not scored (no LLM key)"
-            + ("" if sc["passed"] else " | " + "; ".join(sc["flags"])))
+            + ("" if sc["passed"] is not False else " | " + "; ".join(sc["flags"])))
 
 
 def doctor(cfg):

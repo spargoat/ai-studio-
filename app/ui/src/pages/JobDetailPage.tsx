@@ -12,6 +12,7 @@ import { api, usd, ts, fileUrl } from "../lib/api";
 const SCORED_STAGES = ["still", "video", "lipsync", "finish", "compose"];
 
 function identityText(sc: any) {
+  if (String(sc.identity_note || "") === "dry run, self-reference") return "dry run, self-reference";
   if (sc.identity != null) return sc.identity.toFixed(2);
   if (String(sc.identity_note || "").startsWith("not scored") || sc.passed == null) return "not scored";
   return "n/a";
