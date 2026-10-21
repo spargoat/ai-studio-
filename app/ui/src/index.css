@@ -660,6 +660,13 @@ a, button, input, select, textarea {
 .v3-btn.pri { background: var(--acc); border-color: transparent; color: #fff; box-shadow: 0 0 0 1px #ffffff14 inset, 0 4px 16px #7c6cff40; }
 .v3-kbd { font-size: 10px; padding: 1px 5px; border-radius: 4px; background: #ffffff14; color: var(--tx3); }
 .v3-board-body { flex: 1; min-height: 0; display: flex; }
+.v3-funnel-bar { display: flex; flex: none; align-items: center; gap: 12px; padding: 7px 16px; border-bottom: 1px solid var(--line); background: var(--panel); overflow-x: auto; white-space: nowrap; }
+.v3-funnel-bar label { display: inline-flex; align-items: center; gap: 5px; color: var(--tx3); font-size: 11px; }
+.v3-funnel-bar input, .v3-funnel-bar select { width: 130px; min-width: 90px; border: 1px solid var(--line2); border-radius: 5px; background: var(--bg2); color: var(--tx); padding: 4px 6px; font-size: 11px; }
+.v3-funnel-bar span { color: var(--tx2); font-size: 11px; }
+.v3-dir-item { display: block; width: 100%; text-align: left; margin: 4px 0; padding: 7px; border: 1px solid var(--line2); border-radius: 7px; background: var(--bg2); color: var(--tx); }
+.v3-dir-item b, .v3-dir-item small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.v3-dir-item small { color: var(--tx3); font-size: 10px; }
 .v3-canvas { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: row; background: var(--bg); }
 .v3-flow { flex: 1; min-width: 0; min-height: 0; position: relative; }
 .v3-pal {
@@ -914,10 +921,13 @@ a, button, input, select, textarea {
   .v3-snav { width: 100%; display: flex; gap: 4px; overflow: auto; border-right: 0; border-bottom: 1px solid var(--line); padding: 8px; }
   .v3-snav h6 { display: none; }
   .v3-si { width: auto; white-space: nowrap; }
-  .v3-board-body { flex-direction: column; }
-  .v3-inspector { width: 100%; max-height: 38vh; border-left: 0; border-top: 1px solid var(--line); }
-  .v3-canvas { flex-direction: column; }
-  .v3-pal { width: auto; align-self: stretch; margin: 8px; max-height: 148px; }
+  .v3-board-body { flex-direction: column; overflow: auto; }
+  .v3-inspector { width: 100%; height: 220px; flex: none; border-left: 0; border-top: 1px solid var(--line); }
+  .v3-canvas { flex-direction: column; flex: none; }
+  .v3-flow { height: 52vh; min-height: 360px; flex: none; }
+  .v3-shell .react-flow__minimap { width: 112px !important; height: 76px !important; right: 8px !important; bottom: 48px !important; }
+  .v3-shell .react-flow__minimap svg { width: 100%; height: 100%; }
+  .v3-pal { width: auto; align-self: stretch; margin: 8px; max-height: 100px; }
   .v3-top { padding-left: 48px; height: auto; min-height: 56px; flex-wrap: wrap; padding-top: 8px; padding-bottom: 8px; }
   .v3-main { padding: 16px; }
 }

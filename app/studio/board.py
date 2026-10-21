@@ -6,7 +6,7 @@ Disabled nodes pass a value through when an input type matches an output type.
 """
 import copy
 
-from .adintel import (FIXTURE_LABEL, LONGEVITY_NOTE, REFERENCE_LABEL, AdIntelError,
+from .adintel import (FIXTURE_LABEL, LONGEVITY_NOTE, REFERENCE_LABEL, AdIntelError, AdIntelNotFound,
                       ad_by_id, funnel_for, market, query_ads)
 from .config import load_template
 
@@ -32,8 +32,15 @@ NODES = {
                "outputs": [("script", "script"), ("hooks", "hooks")]},
     "voice": {"tab": "create", "kind": "stage", "template": "talking_head", "stage_id": "voice",
               "needs_key": "elevenlabs", "inputs": [("script", "script")], "outputs": [("audio", "audio")]},
+    "still": {"tab": "create", "kind": "stage", "template": "talking_head", "stage_id": "still",
+              "needs_key": "fal", "inputs": [("brief", "brief")], "outputs": [("still", "still")]},
     "video": {"tab": "create", "kind": "stage", "template": "talking_head", "stage_id": "video",
               "needs_key": "fal", "inputs": [("audio", "audio"), ("still", "still")], "outputs": [("video", "video")]},
+    # Planning objects persist on the graph but never become paid or dry-run stages.
+    "note": {"tab": "create", "kind": "canvas", "inputs": [], "outputs": []},
+    "quick_link": {"tab": "create", "kind": "canvas", "inputs": [], "outputs": []},
+    "funnel_stage": {"tab": "create", "kind": "canvas", "inputs": [("flow", "flow")], "outputs": [("flow", "flow")]},
+    "ad_reference": {"tab": "intel", "kind": "canvas", "inputs": [], "outputs": []},
 }
 
 # Mechanism only. No wardrobe, palette, or scene. The decode stays under these.
@@ -172,6 +179,8 @@ def compile_board(graph):
     for nid in _topo(nodes, edges):
         node = by_id[nid]
         spec = NODES[node["type"]]
+        if spec["kind"] == "canvas":
+            continue
         incoming = [e for e in edges if e["target"] == nid]
         needs, port_of = [], {}
         for edge in incoming:
@@ -193,6 +202,12 @@ def compile_board(graph):
                         stage.setdefault("input_alias", {})["still"] = edge["source"]
             params = stage.get("params") or {}
             cfg = node.get("config") or {}
+            if node["type"] == "still":
+                if cfg.get("prompt"):
+                    stage["prompt"] = cfg["prompt"]
+                for key in ("aspect_ratio", "resolution"):
+                    if cfg.get(key):
+                        params[key] = cfg[key]
             if cfg.get("framework"):
                 params["framework"] = cfg["framework"]
             if node["type"] == "video":
@@ -202,6 +217,8 @@ def compile_board(graph):
                     params["format"] = cfg["format"]
             stage["params"] = params
         stages.append(stage)
+    if not stages:
+        raise BoardError("Add an executable block before running this board")
     return stages
 
 
@@ -263,22 +280,26 @@ def _pick_ad(pack, ad_id):
         if chosen:
             return chosen
         # The query filter may hide the selected id; still resolve that record.
-        return ad_by_id(ad_id)
+        try:
+            return ad_by_id(ad_id) or (ads[0] if ads else None)
+        except AdIntelNotFound:
+            return ads[0] if ads else None
     return ads[0] if ads else None
 
 
 def _observed_ad(ad):
     if not ad:
         return {}
-    return {k: ad.get(k) for k in ("id", "advertiser", "status", "first_seen", "last_seen", "longevity_days",
-                                   "primary_text", "headline", "cta", "media", "landing_url", "creative_family", "platforms")}
+    return {k: ad.get(k) for k in ("id", "advertiser", "status", "status_label", "first_seen", "last_seen", "longevity_days",
+                                   "primary_text", "headline", "cta", "media", "format", "landing_url", "library_url",
+                                   "creative_family", "platforms", "page_id", "funnel", "assigned_funnel", "as_of")}
 
 
 def _panels(ad):
     """Six cards. Evidence is what the record states. Inference is our reading, kept in its own list."""
     ad = ad or {}
     media = ad.get("media") if isinstance(ad.get("media"), list) and ad.get("media") else [{}]
-    kind = (media[0] or {}).get("type") or "unknown"
+    kind = ad.get("format") or (media[0] or {}).get("type") or "unknown"
     family = ad.get("creative_family") or ""
     pattern = PATTERNS.get(family) or DEFAULT_PATTERN
     days = ad.get("longevity_days")
@@ -303,11 +324,9 @@ def _panels(ad):
 
 
 def _waterfall(ads):
-    rows = []
-    for ad in (ads or [])[:8]:
-        route = funnel_for(ad["id"])
-        rows.append({**_observed_ad(ad), "steps": route.get("steps") or [], "landing_page": route.get("landing_page") or {}})
-    return rows
+    # Route reads are requested for the ad the user opens. A 40-ad scan must
+    # remain one paginated list call rather than 40 detail and route calls.
+    return [_observed_ad(ad) for ad in (ads or [])]
 
 
 def feed_artefact(config):
@@ -317,9 +336,11 @@ def feed_artefact(config):
         "type": "ad",
         "ad": chosen,
         "evidence": _evidence(pack, {"ads": [_observed_ad(a) for a in pack["ads"]], "picked": _observed_ad(chosen),
-                                     "waterfall": _waterfall(pack["ads"])}),
+                                     "waterfall": _waterfall(pack["ads"]), "matched": pack.get("matched"),
+                                     "limit": pack.get("limit"), "offset": pack.get("offset")}),
         "inference": {"note": "Picking one ad out of the query is our choice, not a tracker field.",
-                      "match_count": len(pack["ads"]), "picked_id": (chosen or {}).get("id")},
+                      "match_count": pack.get("matched", len(pack["ads"])), "picked_id": (chosen or {}).get("id"),
+                      "requested_id": (config or {}).get("ad_id")},
     }
 
 
@@ -369,7 +390,9 @@ def funnel_artefact(ad_blob):
     return {
         "type": "page",
         "page": route.get("landing_page") or {},
-        "evidence": _evidence(probe, {"ad_id": ad_id, "steps": route.get("steps") or [], "landing_page": route.get("landing_page") or {}}),
+        "evidence": _evidence(probe, {"ad_id": ad_id, "funnel_id": route.get("funnel_id"),
+                                    "steps": route.get("steps") or [], "landing_page": route.get("landing_page") or {},
+                                    "note": route.get("note")}),
         "inference": {"note": "The route steps and landing page are the tracker's map. Reading a step as persuasive is our inference, and this node does not add one."},
     }
 
@@ -402,7 +425,7 @@ def timeline_artefact(config):
     pack = market()
     config = config or {}
     event = next((e for e in pack["events"] if e["id"] == config.get("event_id")), None)
-    ad_id = (event or {}).get("ad_id") or config.get("ad_id") or ""
+    ad_id = ((event or {}).get("ad_id") or config.get("ad_id") or "") if pack["points"] else ""
     if not event and pack["events"]:
         event = pack["events"][0]
         ad_id = ad_id or event.get("ad_id")
@@ -412,7 +435,8 @@ def timeline_artefact(config):
         "ad": ad,
         "emitted_ad_id": (ad or {}).get("id"),
         "evidence": _evidence(pack, {"points": pack["points"], "events": pack["events"], "emitted_event": event}),
-        "inference": {"note": "The September reach step-up sits beside two ads in market. That alignment is our reading, not a tracker field. Reach and the live count are the recorded series."},
+        "inference": {"note": ("The September reach step-up sits beside two ads in market. That alignment is our reading, not a tracker field. Reach and the live count are the recorded series."
+                               if pack["points"] else pack.get("note") or "No timeline is recorded in this read.")},
     }
 
 
@@ -424,7 +448,7 @@ def step_artefact(config):
         "evidence": {"source": "board", "origin": "copy", "live": False,
                      "label": "Copied from the funnel read onto the canvas",
                      "data_as_of": config.get("data_as_of") or "",
-                     "fields": {k: config.get(k) for k in ("n", "kind", "label", "url", "ad_id")}},
+                     "fields": {k: config.get(k) for k in ("n", "kind", "label", "url", "ad_id", "state", "source")}},
         "inference": {"note": "Placing the step on the canvas does not add a reading."},
     }
 

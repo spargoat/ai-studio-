@@ -1,12 +1,11 @@
 """Read-only client for the ads-tracker API.
 
-The tracker stays a separate repo. This module calls its read endpoints when
-ADINTEL_API_URL and ADINTEL_API_SECRET are both set. Otherwise it serves a
-fixture of recorded sample rows. Fixture results are labelled and never
-reported as a live read. The secret is sent as a bearer token and is never
-logged or returned.
+The tracker stays a separate repo. This module adapts its /api/board read
+contract when ADINTEL_API_URL and ADINTEL_API_SECRET are both set. Otherwise
+it serves labelled fixtures. No failed live read falls back to a fixture.
 """
 import os
+from urllib.parse import quote
 
 import requests
 
@@ -163,72 +162,87 @@ class AdIntelError(RuntimeError):
     pass
 
 
+class AdIntelNotFound(AdIntelError):
+    pass
+
+
 def configured():
     return bool(os.environ.get("ADINTEL_API_URL") and os.environ.get("ADINTEL_API_SECRET"))
 
 
-def _envelope(origin, data_as_of=None):
+def _envelope(origin, data_as_of=None, source=None):
     if origin == "live":
-        return {"origin": "live", "live": True, "label": LIVE_LABEL, "source": LIVE_SOURCE,
-                "data_as_of": data_as_of or FIXTURE_AS_OF}
+        return {"origin": "live", "live": True, "label": LIVE_LABEL,
+                "source": f"{LIVE_SOURCE} · {source}" if source else LIVE_SOURCE,
+                "data_as_of": data_as_of}
     return {"origin": "fixture", "live": False, "label": FIXTURE_LABEL, "source": FIXTURE_SOURCE,
             "data_as_of": FIXTURE_AS_OF}
 
 
 def _get(path, params=None):
     base = (os.environ.get("ADINTEL_API_URL") or "").rstrip("/")
+    if not base.endswith("/api/board"):
+        base += "/api/board"
     secret = os.environ.get("ADINTEL_API_SECRET") or ""
     query = {k: v for k, v in (params or {}).items() if v not in ("", None)}
     try:
         res = requests.get(base + path, params=query, timeout=20,
-                           headers={"Authorization": f"Bearer {secret}", "Accept": "application/json"})
+                           headers={"x-adintel-secret": secret, "Accept": "application/json"})
     except requests.RequestException as e:
         raise AdIntelError(f"ads-tracker read failed: {type(e).__name__}") from None
+    if res.status_code == 404:
+        raise AdIntelNotFound("This record is not in the current tracker snapshot")
     if res.status_code >= 400:
         raise AdIntelError(f"ads-tracker read failed ({res.status_code})")
     try:
-        return res.json()
+        body = res.json()
     except ValueError:
         raise AdIntelError("ads-tracker read failed: response was not JSON") from None
+    if not isinstance(body, dict) or body.get("ok") is not True:
+        raise AdIntelError("ads-tracker read failed: invalid board API response")
+    return body
 
 
-def _rows(body):
-    if isinstance(body, list):
-        return body
-    if isinstance(body, dict):
-        for key in ("ads", "records", "data"):
-            if isinstance(body.get(key), list):
-                return body[key]
-    return []
+def _meta(body):
+    evidence = body.get("evidence") or {}
+    return _envelope("live", evidence.get("asOf"), evidence.get("source"))
 
 
 def normalize_ad(raw):
     if not isinstance(raw, dict):
         return None
-    status = str(raw.get("status") or "").lower()
-    if status in ("active", "running"):
-        status = "live"
-    elif status in ("inactive", "deleted", "paused"):
-        status = "removed"
+    status = str(raw.get("status") or "unknown").lower()
+    if status not in ("live", "stopped", "missing", "removed", "unknown"):
+        status = "unknown"
     media = raw.get("media")
     if isinstance(media, str):
         media = [{"type": "unknown", "url": media}]
     if not media and raw.get("media_url"):
         media = [{"type": raw.get("media_type") or "unknown", "url": raw["media_url"]}]
+    platforms = raw.get("platforms") or []
+    if isinstance(platforms, str):
+        platforms = [p.strip() for p in platforms.split(",") if p.strip()]
     ad = {
         "id": str(raw.get("id") or raw.get("ad_id") or ""),
         "advertiser": raw.get("advertiser") or raw.get("page_name") or "",
-        "status": status or "live",
-        "first_seen": raw.get("first_seen") or raw.get("start_date") or "",
-        "last_seen": raw.get("last_seen") or raw.get("end_date") or "",
-        "longevity_days": raw.get("longevity_days") if raw.get("longevity_days") is not None else raw.get("days"),
-        "primary_text": raw.get("primary_text") or raw.get("body") or raw.get("copy") or "",
+        "status": status,
+        "status_label": raw.get("statusLabel") or status,
+        "first_seen": raw.get("firstSeen") or raw.get("first_seen") or "",
+        "last_seen": raw.get("lastObserved") or raw.get("last_seen") or "",
+        "longevity_days": raw.get("daysRunning") if raw.get("daysRunning") is not None else raw.get("longevity_days"),
+        "primary_text": raw.get("copy") or raw.get("primary_text") or "",
         "headline": raw.get("headline") or "",
         "cta": raw.get("cta") or raw.get("call_to_action") or "",
         "media": media or [],
-        "landing_url": raw.get("landing_url") or raw.get("destination") or "",
-        "creative_family": raw.get("creative_family") or raw.get("family") or "",
-        "platforms": raw.get("platforms") or [],
+        "format": raw.get("format") or "",
+        "landing_url": raw.get("destinationUrl") or raw.get("landing_url") or "",
+        "library_url": raw.get("libraryUrl") or "",
+        "creative_family": raw.get("treatment") or raw.get("creative_family") or "",
+        "platforms": platforms,
+        "page_id": raw.get("pageId") or "",
+        "funnel": raw.get("funnel") or "",
+        "assigned_funnel": raw.get("assignedFunnel") or "",
+        "as_of": raw.get("asOf"),
     }
     return ad if ad["id"] else None
 
@@ -239,7 +253,7 @@ def _match(ad, filters):
     if advertiser and advertiser not in (ad.get("advertiser") or "").lower():
         return False
     status = (filters.get("status") or "").strip().lower()
-    if status in ("live", "removed") and ad.get("status") != status:
+    if status in ("live", "stopped", "missing", "removed", "unknown") and ad.get("status") != status:
         return False
     if filters.get("date_from") and ad.get("last_seen") and ad["last_seen"] < filters["date_from"]:
         return False
@@ -254,27 +268,33 @@ def _match(ad, filters):
     return True
 
 
-def _as_of(body):
-    if isinstance(body, dict):
-        return body.get("data_as_of") or body.get("as_of")
-    return None
-
-
 def query_ads(filters=None):
     filters = filters or {}
+    try:
+        limit = min(max(int(filters.get("limit") or 40), 1), 200)
+        offset = max(int(filters.get("offset") or 0), 0)
+    except (TypeError, ValueError):
+        raise AdIntelError("limit and offset must be numbers") from None
     if not configured():
         pack = _envelope("fixture")
-        pack["ads"] = [dict(a) for a in FIXTURE_ADS if _match(a, filters)]
+        matches = [dict(a) for a in FIXTURE_ADS if _match(a, filters)]
+        pack["ads"] = matches[offset:offset + limit]
+        pack.update(matched=len(matches), limit=limit, offset=offset)
         return pack
     body = _get("/ads", {
         "advertiser": filters.get("advertiser"),
-        "date_from": filters.get("date_from"),
-        "date_to": filters.get("date_to"),
+        "from": filters.get("date_from"),
+        "to": filters.get("date_to"),
         "status": filters.get("status"),
-        "longevity_min": filters.get("longevity_min") or filters.get("longevity_min_days"),
+        "min_days": filters.get("longevity_min") or filters.get("longevity_min_days"),
+        "limit": limit,
+        "offset": offset,
     })
-    pack = _envelope("live", _as_of(body))
-    pack["ads"] = [a for a in (normalize_ad(r) for r in _rows(body)) if a and _match(a, filters)]
+    pack = _meta(body)
+    pack["ads"] = [a for a in (normalize_ad(r) for r in (body.get("observed") or {}).get("ads") or []) if a]
+    pack["matched"] = body.get("matched", len(pack["ads"]))
+    pack["offset"] = body.get("offset", 0)
+    pack["limit"] = body.get("limit", 40)
     return pack
 
 
@@ -283,9 +303,8 @@ def ad_by_id(ad_id):
         return None
     if not configured():
         return next((dict(a) for a in FIXTURE_ADS if a["id"] == ad_id), None)
-    body = _get(f"/ads/{ad_id}")
-    raw = body.get("ad") if isinstance(body, dict) and isinstance(body.get("ad"), dict) else body
-    return normalize_ad(raw)
+    body = _get(f"/ads/{quote(str(ad_id), safe='')}")
+    return normalize_ad(body.get("observed"))
 
 
 def funnel_for(ad_id):
@@ -293,16 +312,52 @@ def funnel_for(ad_id):
     if not configured():
         mapped = FIXTURE_FUNNELS.get(ad_id) or {"steps": [], "landing_page": {"url": ad.get("landing_url") or "", "title": ""}}
         return {"ad_id": ad_id, **mapped}
-    body = _get(f"/ads/{ad_id}/funnel")
-    if not isinstance(body, dict):
-        body = {}
-    steps = body.get("steps") or body.get("route") or []
-    landing = body.get("landing_page") or {"url": ad.get("landing_url") or body.get("url") or "", "title": body.get("landing_title") or ""}
-    return {"ad_id": ad_id, "steps": steps, "landing_page": landing}
+    funnel_id = ad.get("assigned_funnel") or ad.get("funnel")
+    if not funnel_id:
+        return {"ad_id": ad_id, "funnel_id": None, "steps": [],
+                "landing_page": {"url": ad.get("landing_url") or "", "title": ""},
+                "note": "No funnel is assigned to this ad in the tracker."}
+    return route_for_funnel(funnel_id, ad_id=ad_id, landing_url=ad.get("landing_url") or "")
+
+
+def route_for_funnel(funnel_id, ad_id=None, landing_url=""):
+    """Read one named tracker funnel without first resolving an ad."""
+    if not configured():
+        raise AdIntelError("Funnel directory requires a configured tracker")
+    try:
+        body = _get(f"/funnels/{quote(str(funnel_id), safe='')}/route")
+    except AdIntelNotFound:
+        return {"ad_id": ad_id, "funnel_id": funnel_id, "steps": [],
+                "landing_page": {"url": landing_url, "title": ""},
+                "note": "The assigned funnel is not in the current tracker snapshot."}
+    steps = []
+    for state in ("observed", "inferred", "unknown"):
+        section = body.get(state) or {}
+        for raw in (section.get("storedSteps") or []) + (section.get("laneSteps") or []):
+            steps.append({"n": len(steps) + 1, "kind": raw.get("role") or "step",
+                          "label": raw.get("title") or raw.get("next") or raw.get("role") or "Untitled step",
+                          "url": raw.get("url") or "", "state": state,
+                          "source": raw.get("source") or "", "checked_on": raw.get("checkedOn"),
+                          "lane_id": raw.get("laneId"), "branch": raw.get("branch")})
+    if not steps and landing_url:
+        steps.append({"n": 1, "kind": "destination", "label": "Destination URL on ad record",
+                      "url": landing_url, "state": "observed", "source": "Ads.Destination URL"})
+    return {"ad_id": ad_id, "funnel_id": (body.get("funnel") or {}).get("id"), "steps": steps,
+            "funnel_name": (body.get("funnel") or {}).get("name"),
+            "landing_page": {"url": landing_url, "title": ""},
+            "data_as_of": (body.get("evidence") or {}).get("asOf")}
 
 
 def accounts():
     """Advertisers in the current read, with how many ads each one has. Same origin rules as query_ads."""
+    if configured():
+        body = _get("/advertisers")
+        pack = _meta(body)
+        pack["accounts"] = [{"advertiser": a.get("name") or a.get("pageId") or "Unknown",
+                             "page_id": a.get("pageId"), "ads": a.get("ads") or 0,
+                             "funnel": a.get("funnel") or "", "as_of": a.get("asOf")}
+                            for a in (body.get("observed") or {}).get("advertisers") or []]
+        return pack
     pack = query_ads({})
     counts, order = {}, []
     for ad in pack["ads"]:
@@ -315,27 +370,42 @@ def accounts():
     return pack
 
 
+def directory():
+    """Stored funnel inventory. Older tracker deployments get a labelled partial list."""
+    if configured():
+        try:
+            body = _get("/funnels")
+        except AdIntelNotFound:
+            partial = accounts()
+            names = {}
+            for account in partial["accounts"]:
+                name = account.get("funnel")
+                if name:
+                    names.setdefault(name, []).append(account["advertiser"])
+            partial["funnels"] = [{"id": name, "name": name, "advertisers": advertisers, "ads": None}
+                                  for name, advertisers in sorted(names.items())]
+            partial["coverage"] = "advertiser records only"
+            return partial
+        pack = _meta(body)
+        pack["funnels"] = [dict(row) for row in (body.get("observed") or {}).get("funnels") or []]
+        pack["coverage"] = "stored funnel directory"
+        return pack
+    pack = _envelope("fixture")
+    pack["funnels"] = []
+    pack["coverage"] = "fixture has no named funnel directory"
+    return pack
+
+
 def market():
     if not configured():
         pack = _envelope("fixture")
         pack["points"] = [dict(p) for p in FIXTURE_POINTS]
         pack["events"] = [dict(e) for e in FIXTURE_EVENTS]
         return pack
-    body = _get("/market")
-    if not isinstance(body, dict):
-        body = {}
-    pack = _envelope("live", _as_of(body))
-    points, events = [], []
-    for raw in body.get("points") or body.get("series") or []:
-        if not isinstance(raw, dict) or not raw.get("date"):
-            continue
-        points.append({"date": raw["date"], "reach": raw.get("reach") or 0, "live_ads": raw.get("live_ads") or raw.get("live") or 0})
-    for raw in body.get("events") or []:
-        if not isinstance(raw, dict):
-            continue
-        events.append({"id": str(raw.get("id") or raw.get("date") or ""), "date": raw.get("date") or "",
-                       "kind": raw.get("kind") or "event", "ad_id": raw.get("ad_id") or "",
-                       "label": raw.get("label") or raw.get("kind") or "event"})
-    pack["points"] = points
-    pack["events"] = events
+    # PR #98 does not expose historical reach or live-ad series. Do not invent
+    # points from a current snapshot or show the fixture as live history.
+    pack = _envelope("live", None)
+    pack["points"] = []
+    pack["events"] = []
+    pack["note"] = "The live tracker API does not expose a market timeline yet."
     return pack

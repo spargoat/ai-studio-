@@ -2,6 +2,7 @@ data/
 node_modules/
 dist/
 .env*
+.venv*/
 models/
 bin/
 __pycache__/

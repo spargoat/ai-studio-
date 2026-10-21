@@ -13,7 +13,7 @@ for k in ("FAL_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS", "ADINTEL_API_URL", "ADI
           "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
     os.environ.pop(k, None)
 
-from studio.adintel import FIXTURE_LABEL, LONGEVITY_NOTE, REFERENCE_LABEL, query_ads
+from studio.adintel import FIXTURE_ADS, FIXTURE_LABEL, LONGEVITY_NOTE, REFERENCE_LABEL, query_ads
 from studio.board import (BoardError, compile_board, migrate_talking_head_layout, preview_config, preview_pack,
                           talking_head_preset, timeline_artefact as board_timeline)
 from studio.config import connection_status, load_config
@@ -79,6 +79,49 @@ class T(unittest.TestCase):
         with self.assertRaises(BoardError):
             compile_board(graph)
 
+    def test_canvas_objects_persist_without_becoming_run_stages(self):
+        graph = talking_head_preset()
+        graph["funnel"] = {"name": "VSL", "stage": "mapping", "sourceAdIds": ["rec_4c91e2"]}
+        graph["nodes"].append({"id": "research", "type": "quick_link", "position": {"x": 1800, "y": 0},
+                               "config": {"title": "Ad record", "url": "https://example.test/ad"}})
+        self.assertNotIn("research", {s["id"] for s in compile_board(graph)})
+        from studio.db import DB
+        db = DB(cfg()["_db_file"])
+        db.save_board("test-funnel", "VSL", graph, preset=False)
+        saved = db.board("test-funnel")["graph"]
+        self.assertEqual(saved["funnel"]["sourceAdIds"], ["rec_4c91e2"])
+        self.assertEqual(saved["nodes"][-1]["config"]["url"], "https://example.test/ad")
+
+    def test_planning_handoff_wires_persist_without_becoming_run_dependencies(self):
+        graph = talking_head_preset()
+        for index in (1, 2):
+            graph["nodes"].append({"id": f"plan-{index}", "type": "funnel_stage",
+                                   "position": {"x": 1800 + index * 300, "y": 0},
+                                   "config": {"title": f"Step {index}"}})
+        graph["edges"].append({"id": "plan-handoff", "source": "plan-1", "sourceHandle": "flow",
+                               "target": "plan-2", "targetHandle": "flow", "label": "qualified lead"})
+        stages = compile_board(graph)
+        self.assertNotIn("plan-1", {stage["id"] for stage in stages})
+        self.assertNotIn("plan-2", {stage["id"] for stage in stages})
+        from studio.db import DB
+        db = DB(cfg()["_db_file"])
+        db.save_board("test-map", "Map", graph, preset=False)
+        self.assertEqual(db.board("test-map")["graph"]["edges"][-1]["label"], "qualified lead")
+
+    def test_image_node_feeds_video_and_preserves_prompt(self):
+        graph = talking_head_preset()
+        graph["nodes"].append({"id": "still", "type": "still", "position": {"x": 1800, "y": 0},
+                               "config": {"prompt": "Owned product still", "aspect_ratio": "4:5"}})
+        graph["edges"].append({"id": "e-brief-still", "source": "brief", "sourceHandle": "brief",
+                               "target": "still", "targetHandle": "brief"})
+        graph["edges"].append({"id": "e-still-video", "source": "still", "sourceHandle": "still",
+                               "target": "video", "targetHandle": "still"})
+        by = {stage["id"]: stage for stage in compile_board(graph)}
+        self.assertEqual(by["still"]["kind"], "image")
+        self.assertEqual(by["still"]["prompt"], "Owned product still")
+        self.assertEqual(by["still"]["params"]["aspect_ratio"], "4:5")
+        self.assertEqual(by["video"]["input_alias"]["still"], "still")
+
     def test_disabled_breakdown_passes_the_ad_through(self):
         graph = talking_head_preset()
         for node in graph["nodes"]:
@@ -130,17 +173,98 @@ class T(unittest.TestCase):
             class Resp:
                 status_code = 200
                 def json(self):
-                    return {"data_as_of": "2026-10-19", "ads": [{"id": "live1", "advertiser": "Northline Markets",
-                             "status": "active", "headline": "From the API"}]}
+                    return {"ok": True, "evidence": {"source": "sqlite", "asOf": "2026-10-19"},
+                            "matched": 1, "count": 1, "limit": 40, "offset": 0,
+                            "observed": {"ads": [{"id": "live1", "advertiser": "Northline Markets",
+                                                 "status": "missing", "headline": "From the API", "daysRunning": 13,
+                                                 "destinationUrl": "https://example.test/page", "libraryUrl": "https://example.test/ad"}]}}
             with patch("studio.adintel.requests.get", return_value=Resp()) as get:
                 pack = query_ads({"advertiser": "Northline"})
             self.assertEqual(pack["origin"], "live")
             self.assertIs(pack["live"], True)
             self.assertEqual(pack["ads"][0]["id"], "live1")
-            self.assertEqual(pack["ads"][0]["status"], "live")
+            self.assertEqual(pack["ads"][0]["status"], "missing")
+            self.assertEqual(pack["ads"][0]["longevity_days"], 13)
+            self.assertEqual(pack["matched"], 1)
+            self.assertEqual(get.call_args.args[0], "https://tracker.example/api/board/ads")
             headers = get.call_args.kwargs["headers"]
-            self.assertEqual(headers["Authorization"], "Bearer super-secret-value")
+            self.assertEqual(headers["x-adintel-secret"], "super-secret-value")
             self.assertNotIn("super-secret-value", json.dumps({k: v for k, v in pack.items() if k != "ads"}))
+        finally:
+            os.environ.pop("ADINTEL_API_URL", None)
+            os.environ.pop("ADINTEL_API_SECRET", None)
+
+    def test_live_funnel_route_preserves_observed_inferred_unknown(self):
+        from studio.adintel import funnel_for
+        os.environ["ADINTEL_API_URL"] = "https://tracker.example/api/board"
+        os.environ["ADINTEL_API_SECRET"] = "secret"
+        class Resp:
+            status_code = 200
+            def __init__(self, data): self.data = data
+            def json(self): return self.data
+        detail = {"ok": True, "evidence": {"source": "sqlite", "asOf": "2026-10-19"},
+                  "observed": {"id": "a1", "status": "stopped", "assignedFunnel": "Funnel A", "destinationUrl": "https://example.test"}}
+        route = {"ok": True, "evidence": {"source": "sqlite", "asOf": "2026-10-19"},
+                 "funnel": {"id": "f1", "name": "Funnel A"},
+                 "observed": {"storedSteps": [{"role": "landing", "title": "Page", "url": "https://example.test", "source": "route"}], "laneSteps": []},
+                 "inferred": {"storedSteps": [], "laneSteps": [{"role": "booking", "title": "Likely booking"}]},
+                 "unknown": {"storedSteps": [{"role": "thank_you", "title": "Unopened"}], "laneSteps": []}}
+        try:
+            with patch("studio.adintel.requests.get", side_effect=[Resp(detail), Resp(route)]) as get:
+                result = funnel_for("a1")
+            self.assertEqual([s["state"] for s in result["steps"]], ["observed", "inferred", "unknown"])
+            self.assertEqual(result["funnel_id"], "f1")
+            self.assertEqual(get.call_args.args[0], "https://tracker.example/api/board/funnels/Funnel%20A/route")
+        finally:
+            os.environ.pop("ADINTEL_API_URL", None)
+            os.environ.pop("ADINTEL_API_SECRET", None)
+
+    def test_old_preset_ids_do_not_break_a_new_live_snapshot(self):
+        from studio.adintel import AdIntelNotFound
+        from studio.board import _pick_ad, timeline_artefact
+        pack = {"ads": [{"id": "current", "headline": "Current ad"}]}
+        with patch("studio.board.ad_by_id", side_effect=AdIntelNotFound("not found")):
+            self.assertEqual(_pick_ad(pack, "rec_old_fixture")["id"], "current")
+        live_timeline = {"origin": "live", "live": True, "source": "ads-tracker", "label": "Live tracker",
+                         "data_as_of": None, "points": [], "events": [], "note": "No timeline API"}
+        with patch("studio.board.market", return_value=live_timeline), patch("studio.board.ad_by_id", side_effect=AssertionError("must not read a stale marker")):
+            art = timeline_artefact({"event_id": "old_event", "ad_id": "rec_old_fixture"})
+        self.assertIsNone(art["ad"])
+        self.assertEqual(art["inference"]["note"], "No timeline API")
+
+    def test_feed_pagination_and_failed_live_read_do_not_use_fixtures(self):
+        page = query_ads({"limit": "2", "offset": "1"})
+        self.assertEqual(page["matched"], 5)
+        self.assertEqual(len(page["ads"]), 2)
+        self.assertEqual(page["ads"][0]["id"], FIXTURE_ADS[1]["id"])
+        from studio.adintel import AdIntelError
+        os.environ["ADINTEL_API_URL"] = "https://tracker.example"
+        os.environ["ADINTEL_API_SECRET"] = "secret"
+        class Failed:
+            status_code = 500
+        try:
+            with patch("studio.adintel.requests.get", return_value=Failed()):
+                with self.assertRaises(AdIntelError):
+                    query_ads({"limit": "40"})
+        finally:
+            os.environ.pop("ADINTEL_API_URL", None)
+            os.environ.pop("ADINTEL_API_SECRET", None)
+
+    def test_funnel_directory_reads_stored_funnels(self):
+        from studio.adintel import directory
+        os.environ["ADINTEL_API_URL"] = "https://tracker.example"
+        os.environ["ADINTEL_API_SECRET"] = "secret"
+        class Resp:
+            status_code = 200
+            def json(self):
+                return {"ok": True, "evidence": {"source": "sqlite", "asOf": "2026-10-21"},
+                        "observed": {"funnels": [{"id": "f1", "name": "VSL", "ads": 8, "advertisers": ["Desk"]}]}}
+        try:
+            with patch("studio.adintel.requests.get", return_value=Resp()) as get:
+                result = directory()
+            self.assertEqual(result["funnels"][0]["ads"], 8)
+            self.assertEqual(result["coverage"], "stored funnel directory")
+            self.assertEqual(get.call_args.args[0], "https://tracker.example/api/board/funnels")
         finally:
             os.environ.pop("ADINTEL_API_URL", None)
             os.environ.pop("ADINTEL_API_SECRET", None)
@@ -237,7 +361,11 @@ class T(unittest.TestCase):
             client = app.test_client()
             listed = client.get("/api/boards").get_json()
             self.assertTrue(any(b["id"] == "talking_head" for b in listed))
-            saved = client.put("/api/boards/talking_head", json={"name": "Talking head", "graph": talking_head_preset()}).get_json()
+            graph = talking_head_preset()
+            graph["funnel"] = {"name": "Northline VSL", "stage": "mapping", "sourceAdIds": ["rec_4c91e2"]}
+            graph["nodes"].append({"id": "source-link", "type": "quick_link", "position": {"x": 1600, "y": 0},
+                                   "config": {"title": "Source", "url": "https://example.test/ad"}})
+            saved = client.put("/api/boards/talking_head", json={"name": "Talking head", "graph": graph}).get_json()
             self.assertEqual(saved["id"], "talking_head")
             self.assertIn("ad_feed", {n["id"] for n in saved["graph"]["nodes"]})
             preview = client.get("/api/intel/preview?advertiser=Northline%20Markets&ad_id=rec_4c91e2").get_json()
@@ -251,6 +379,11 @@ class T(unittest.TestCase):
             self.assertEqual(secret_row["mask"], "••••••••")
             self.assertTrue(secret_row["set"])
             loaded = client.get("/api/boards/talking_head").get_json()
+            self.assertEqual(loaded["graph"]["funnel"]["name"], "Northline VSL")
+            self.assertEqual(loaded["graph"]["nodes"][-1]["config"]["url"], "https://example.test/ad")
+            route = client.get("/api/intel/ads/rec_4c91e2/funnel")
+            self.assertEqual(route.status_code, 200)
+            self.assertEqual(route.get_json()["steps"][2]["kind"], "landing")
             self.assertEqual(loaded["preview"]["origin"], "fixture")
             self.assertIn("Fixture", loaded["preview"]["label"])
             self.assertTrue(loaded["preview"]["timeline"]["evidence"]["fields"]["points"])
@@ -382,7 +515,10 @@ class T(unittest.TestCase):
         art = feed_artefact({"advertiser": "Northline Markets", "status": "live"})
         rows = art["evidence"]["fields"]["waterfall"]
         self.assertGreaterEqual(len(rows), 2)
-        self.assertTrue(all(row["steps"] and row["headline"] for row in rows))
+        self.assertTrue(all(row["headline"] for row in rows))
+        self.assertTrue(all("steps" not in row for row in rows))
+        with patch("studio.board.funnel_for", side_effect=AssertionError("feed must not read each route")):
+            self.assertEqual(len(feed_artefact({"advertiser": "Northline Markets"})["evidence"]["fields"]["waterfall"]), 3)
         self.assertNotIn("waterfall", art["inference"])
         preview = preview_pack({"advertiser": "Northline Markets", "status": "live", "ad_id": "rec_4c91e2",
                                 "event_id": "ev_launch_northline"})

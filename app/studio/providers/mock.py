@@ -1,8 +1,10 @@
 """DRY_RUN provider: placeholder media made locally with ffmpeg. $0, no network."""
 import os
+import subprocess
+from functools import lru_cache
 from pathlib import Path
 from .base import Provider, ProviderError
-from ..assets import font_file
+from ..assets import font_file, ffmpeg_bin
 from ..media import ff, esc, duration
 
 # STUDIO_MOCK_FAST=1: render placeholders small/low-fps (tests); outputs are throwaway either way
@@ -12,8 +14,19 @@ W, H, FPS = (270, 480, 10) if FAST else (1080, 1920, 30)
 BG = {"marco": "0x1d2b3a", "maksim": "0x2f3a24", "callum": "0x3a2430"}
 
 
+@lru_cache(maxsize=1)
+def _has_drawtext():
+    result = subprocess.run([ffmpeg_bin("ffmpeg"), "-hide_banner", "-filters"],
+                            capture_output=True, text=True, timeout=10)
+    return result.returncode == 0 and " drawtext " in result.stdout
+
+
 def _label(lines, size=46, y0=120):
     """drawtext with an explicit font file. The Vercel runtime has no fontconfig."""
+    if not _has_drawtext():
+        # Some local ffmpeg builds omit freetype. Keep dry media visibly tinted
+        # and runnable, while the job metadata still identifies it as mock.
+        return "drawbox=x=0:y=0:w=iw:h=ih:color=0x7c6cff@0.55:t=fill"
     font = esc(font_file())
     parts = []
     for i, line in enumerate(lines):

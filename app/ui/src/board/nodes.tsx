@@ -1,6 +1,8 @@
 import { createContext, useContext, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
+import { useQuery } from "@tanstack/react-query";
+import { api } from "../lib/api";
 import { CATALOG, LONGEVITY_NOTE, PORT_COLOR, REFERENCE_LABEL, type NodeSpec } from "./catalog";
 
 export type Artefact = {
@@ -27,8 +29,8 @@ type Panel = { id: string; text: string };
 type WaterAd = {
   id?: string; headline?: string; advertiser?: string; status?: string; longevity_days?: number;
   first_seen?: string; last_seen?: string; primary_text?: string; cta?: string;
-  media?: { type?: string }[];
-  steps?: { n?: number; kind?: string; label?: string; url?: string }[];
+  media?: { type?: string }[]; format?: string; library_url?: string; landing_url?: string;
+  funnel?: string; assigned_funnel?: string; as_of?: string;
 };
 type PersonaOpt = { id: string; display: string; voice_name?: string };
 type AccountOpt = { advertiser: string; ads: number };
@@ -55,6 +57,7 @@ export const BoardCtx = createContext<{
   setConfig: (id: string, patch: Record<string, string>) => void;
   mapFunnel: (id: string) => void;
   replicate: (id: string) => void;
+  addAds: (ads: WaterAd[]) => void;
   wired: Set<string>;
   persona: string;
   personaId: string;
@@ -63,7 +66,7 @@ export const BoardCtx = createContext<{
   boardScript: string;
 }>({
   keys: {}, toggle: () => {}, follow: () => {}, pickEvent: () => {}, setConfig: () => {},
-  mapFunnel: () => {}, replicate: () => {}, wired: new Set(), persona: "", personaId: "",
+  mapFunnel: () => {}, replicate: () => {}, addAds: () => {}, wired: new Set(), persona: "", personaId: "",
   personas: [], accounts: [], boardScript: "",
 });
 
@@ -214,9 +217,13 @@ function Panels({ artefact }: { artefact?: Artefact | null }) {
   );
 }
 
-function FeedWaterfall({ nodeId, config, ads }: { nodeId: string; config: Record<string, string>; ads: WaterAd[] }) {
-  const { setConfig, accounts } = useContext(BoardCtx);
+function FeedWaterfall({ nodeId, config, ads, matched }: { nodeId: string; config: Record<string, string>; ads: WaterAd[]; matched?: number }) {
+  const { setConfig, accounts, addAds } = useContext(BoardCtx);
   const [open, setOpen] = useState<string | null>(null);
+  const [selected, setSelected] = useState<string[]>([]);
+  const route = useQuery({ queryKey: ["ad-funnel", open], queryFn: () => api<{ steps: { n: number; kind: string; label: string; url?: string; state?: string }[]; note?: string }>(`/api/intel/ads/${encodeURIComponent(open || "")}/funnel`), enabled: !!open });
+  const offset = Number(config.offset || 0) || 0;
+  const limit = Number(config.limit || 40) || 40;
   return (
     <div className="nodrag nopan">
       <label className="v3-lab">Ad account
@@ -226,13 +233,18 @@ function FeedWaterfall({ nodeId, config, ads }: { nodeId: string; config: Record
           {accounts.map((row) => <option key={row.advertiser} value={row.advertiser}>{row.advertiser} · {row.ads}</option>)}
         </select>
       </label>
+      <div className="v3-acts nodrag nopan">
+        <span className="v3-muted">{matched ?? ads.length} matched · {ads.length} on this page</span>
+        <button type="button" className="v3-mini" disabled={!selected.length} onClick={() => { addAds(ads.filter((ad) => ad.id && selected.includes(ad.id))); setSelected([]); }}>Add {selected.length} to canvas</button>
+      </div>
       <div className="v3-fall">
         {ads.map((ad) => {
           const id = ad.id || ad.headline || "";
-          const media = ad.media?.[0]?.type || "media";
+          const media = ad.format || ad.media?.[0]?.type || "ad";
           const on = config.ad_id === ad.id;
           return (
             <div key={id} className={`v3-ad ${on ? "is-sel" : ""}`}>
+              <label className="v3-muted"><input type="checkbox" checked={selected.includes(id)} onChange={(e) => setSelected((ids) => e.target.checked ? [...ids, id] : ids.filter((x) => x !== id))} /> Add to board</label>
               <button type="button" className="v3-ad-h" onClick={() => setConfig(nodeId, { ad_id: ad.id || "" })}>
                 <span className="v3-tile">{media}</span>
                 <span>
@@ -241,19 +253,26 @@ function FeedWaterfall({ nodeId, config, ads }: { nodeId: string; config: Record
                 </span>
               </button>
               {ad.primary_text && <p className="v3-copy v3-clamp">{ad.primary_text}</p>}
+              {ad.library_url && <a className="v3-mini nodrag nopan" href={ad.library_url} target="_blank" rel="noopener noreferrer">Open ad record</a>}
               <button type="button" className="v3-mini" onClick={() => setOpen(open === id ? null : id)}>
                 {open === id ? "Hide steps" : "Funnel steps"}
               </button>
               {open === id && (
                 <ol className="v3-steps">
-                  {(ad.steps || []).map((step) => <li key={`${id}-${step.n}`}>{step.n}. {step.label}{step.url ? ` · ${step.url}` : ""}</li>)}
-                  {!ad.steps?.length && <li>No steps in this read.</li>}
+                  {route.isLoading && <li>Loading route…</li>}
+                  {route.isError && <li>{(route.error as Error).message}</li>}
+                  {(route.data?.steps || []).map((step) => <li key={`${id}-${step.n}`}>{step.n}. {step.label} [{step.state || "unknown"}]{step.url ? ` · ${step.url}` : ""}</li>)}
+                  {route.data && !route.data.steps.length && <li>{route.data.note || "No route steps in this read."}</li>}
                 </ol>
               )}
             </div>
           );
         })}
         {!ads.length && <p className="v3-muted">No ads for this account in the read.</p>}
+      </div>
+      <div className="v3-acts nodrag nopan">
+        <button type="button" className="v3-mini" disabled={offset <= 0} onClick={() => { setSelected([]); setConfig(nodeId, { offset: String(Math.max(0, offset - limit)), ad_id: "" }); }}>Previous</button>
+        <button type="button" className="v3-mini" disabled={offset + ads.length >= (matched ?? ads.length)} onClick={() => { setSelected([]); setConfig(nodeId, { offset: String(offset + limit), ad_id: "" }); }}>Next</button>
       </div>
     </div>
   );
@@ -281,14 +300,15 @@ function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
     return (
       <div className="v3-bd">
         <p className="v3-copy">{config.n ? `${config.n}. ` : ""}{config.label || "Step"}</p>
-        <p className="v3-muted">{config.kind || "step"}{config.url ? ` · ${config.url}` : ""}</p>
+        <p className="v3-muted">{config.kind || "step"} · {config.state || "state unrecorded"}{config.url ? ` · ${config.url}` : ""}</p>
+        {safeLink(config.url) && <a className="v3-mini nodrag nopan" href={safeLink(config.url)} target="_blank" rel="noopener noreferrer">Open step</a>}
         <EvidenceBox evidence={evidence} />
       </div>
     );
   }
   return (
     <div className="v3-bd">
-      {nodeType === "ad_feed" && <FeedWaterfall nodeId={nodeId} config={config} ads={waterfall} />}
+      {nodeType === "ad_feed" && <FeedWaterfall nodeId={nodeId} config={config} ads={waterfall} matched={fields.matched as number | undefined} />}
       {nodeType === "funnel_route" && (
         <>
           <FunnelSteps steps={steps} />
@@ -379,6 +399,18 @@ function CreateBody({ id, nodeType, config, file }: { id: string; nodeType: stri
           <p className="v3-muted">Dry run plays a tone, not this voice. The chosen voice id still flows to the stage. $0.</p>
         </>
       )}
+      {nodeType === "still" && (
+        <>
+          <Field label="Image prompt"><textarea aria-label="Image prompt" className="v3-in v3-area" value={config.prompt || ""}
+            placeholder="Describe the owned image. Leave blank for the persona still prompt." onChange={(e) => setConfig(id, { prompt: e.target.value })} /></Field>
+          <Field label="Aspect"><select aria-label="Image aspect" className="v3-in" value={config.aspect_ratio || "9:16"}
+            onChange={(e) => setConfig(id, { aspect_ratio: e.target.value })}>
+            {["9:16", "1:1", "4:5", "16:9"].map((ratio) => <option key={ratio} value={ratio}>{ratio}</option>)}
+          </select></Field>
+          {file && <a className="nodrag nopan" href={file} target="_blank" rel="noreferrer">Open generated image</a>}
+          <p className="v3-muted">Dry run makes a mock image for $0. A paid run requires a configured provider and approval.</p>
+        </>
+      )}
       {nodeType === "video" && (
         <>
           <Field label="Format">
@@ -399,6 +431,42 @@ function CreateBody({ id, nodeType, config, file }: { id: string; nodeType: stri
       {nodeType === "landing" && <p className="v3-copy">Our outline: hook, mechanism, next step. Not the source page. Dry run, $0.</p>}
     </div>
   );
+}
+
+function safeLink(value?: string) {
+  try {
+    const url = new URL(value || "");
+    return url.protocol === "https:" || url.protocol === "http:" ? url.href : "";
+  } catch { return ""; }
+}
+
+function CanvasBody({ id, nodeType, config }: { id: string; nodeType: string; config: Record<string, string> }) {
+  const { setConfig } = useContext(BoardCtx);
+  const link = safeLink(config.url);
+  return <div className="v3-bd nodrag nopan">
+    <Field label={nodeType === "note" ? "Heading" : nodeType === "ad_reference" ? "Source ad" : nodeType === "quick_link" ? "Link name" : "Stage name"}>
+      <input className="v3-in" value={config.title || ""} placeholder="Name this item" onChange={(e) => setConfig(id, { title: e.target.value })} />
+    </Field>
+    {nodeType === "funnel_stage" && <Field label="State">
+      <select className="v3-in" value={config.status || "planned"} onChange={(e) => setConfig(id, { status: e.target.value })}>
+        {["planned", "building", "ready for review", "published", "verified"].map((s) =>
+          <option key={s} value={s} disabled={(s === "published" && !link) || (s === "verified" && (!link || !config.checked_on))}>{s}</option>)}
+      </select>
+    </Field>}
+    {nodeType !== "note" && <Field label={nodeType === "ad_reference" ? "Ad record URL" : "Quick link URL"}>
+      <input className="v3-in" type="url" value={config.url || ""} placeholder="https://" onChange={(e) => setConfig(id, {
+        url: e.target.value,
+        ...(!safeLink(e.target.value) && ["published", "verified"].includes(config.status) ? { status: "building" } : {}),
+      })} />
+    </Field>}
+    {link && <a className="v3-mini" href={link} target="_blank" rel="noopener noreferrer">Open {nodeType === "ad_reference" ? "ad" : "link"}</a>}
+    {nodeType === "funnel_stage" && <Field label="Checked on"><input className="v3-in" type="date" value={config.checked_on || ""} onChange={(e) => setConfig(id, {
+      checked_on: e.target.value, ...(config.status === "verified" && !e.target.value ? { status: "published" } : {}),
+    })} /></Field>}
+    {nodeType === "ad_reference" && <p className="v3-muted">{config.advertiser || ""} · {config.source_status || "unknown"} · {config.as_of || "date unknown"}</p>}
+    <Field label="Notes"><textarea className="v3-in v3-area" value={config.notes || ""} placeholder="Add the process, evidence or next action" onChange={(e) => setConfig(id, { notes: e.target.value })} /></Field>
+    {nodeType === "funnel_stage" && <p className="v3-muted">User marked state. Add the destination URL before Published; record the read back date before Verified.</p>}
+  </div>;
 }
 
 function Handles({ spec, id }: { spec: NodeSpec; id: string }) {
@@ -431,38 +499,41 @@ export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "boa
   const status = data.status || "idle";
   const cost = data.ran && data.actual != null ? money(data.actual) : money(data.est ?? 0);
   const live = data.preview?.evidence?.origin === "live";
+  const timelinePoints = data.preview?.evidence?.fields?.points;
+  const hasTimeline = Array.isArray(timelinePoints) && timelinePoints.length > 0;
   const count = data.preview?.inference?.match_count;
+  const canvas = ["note", "quick_link", "funnel_stage", "ad_reference"].includes(data.nodeType);
   return (
     <article data-node={data.nodeType} style={{ width: spec.width }}
       className={`v3-node ${selected ? "is-sel" : ""} ${data.enabled ? "" : "is-off"}`}>
       <div className="v3-node-clip">
         <header className="v3-h">
           <span className={`v3-ic ${intel ? "in" : "cr"}`}><Icon size={14} aria-hidden /></span>
-          <h3 className="v3-title">{spec.headline}</h3>
+          <h3 className="v3-title">{data.config.title || spec.headline}</h3>
           <span className="v3-hm">
-            {data.nodeType === "market_timeline" && <span className={live ? "v3-live" : "v3-fix"}>{live ? "LIVE" : "FIXTURE"}</span>}
+            {data.nodeType === "market_timeline" && <span className={live && hasTimeline ? "v3-live" : "v3-fix"}>{live ? hasTimeline ? "LIVE" : "NO SERIES" : "FIXTURE"}</span>}
             {data.nodeType === "ad_feed" && count != null && <span className="v3-mono">{count}</span>}
-            {data.nodeType !== "market_timeline" && <span className="v3-mono">$0</span>}
+            {!canvas && data.nodeType !== "market_timeline" && <span className="v3-mono">$0</span>}
             {data.nodeType === "market_timeline" && <span className="v3-mono">· $0</span>}
           </span>
-          <button type="button" role="switch" aria-checked={data.enabled} aria-label={`${data.enabled ? "Disable" : "Enable"} ${spec.headline}`}
+          {!canvas && <button type="button" role="switch" aria-checked={data.enabled} aria-label={`${data.enabled ? "Disable" : "Enable"} ${spec.headline}`}
             className={`nodrag nopan v3-tg ${data.enabled ? "" : "is-off"}`}
             onClick={(e) => { e.stopPropagation(); toggle(id); }}>
             <i />
-          </button>
+          </button>}
         </header>
         {spec.needsKey && !keys[spec.needsKey] && (
           <div className="v3-nk-row">
             <Link to="/settings#connections" className="nodrag nopan v3-nk">Needs key → Settings</Link>
           </div>
         )}
-        {intel
+        {canvas ? <CanvasBody id={id} nodeType={data.nodeType} config={data.config} /> : intel
           ? <IntelBody artefact={data.preview} nodeType={data.nodeType} nodeId={id} selectedEvent={data.config.event_id} config={data.config} />
           : <CreateBody id={id} nodeType={data.nodeType} config={data.config} file={data.file} />}
-        <footer className="v3-ft">
+        {!canvas && <footer className="v3-ft">
           <span className={`v3-st ${statusClass(status)}`}>{status}</span>
           <span className="v3-cost v3-mono" title={data.ran ? `actual ${cost}` : `estimate ${cost}`}>{data.ran ? cost : cost}</span>
-        </footer>
+        </footer>}
       </div>
       <Handles spec={spec} id={id} />
     </article>

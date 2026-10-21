@@ -1,5 +1,6 @@
 """Caption text must render without a system fontconfig."""
 import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -8,14 +9,17 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("STUDIO_FFMPEG_PRESET", "ultrafast")
 
-from studio.assets import FONT_FAMILY, font_dir, font_file
+from studio.assets import FONT_FAMILY, font_dir, font_file, ffmpeg_bin
 from studio.compose import caption_face, compose
 from studio.media import ff
-from studio.providers.mock import MockProvider, _label
+from studio.providers.mock import MockProvider, _has_drawtext, _label
 
 
 class T(unittest.TestCase):
     def test_mock_still_and_captions_without_fontconfig(self):
+        filters = subprocess.run([ffmpeg_bin("ffmpeg"), "-hide_banner", "-filters"], capture_output=True, text=True).stdout
+        if not _has_drawtext() or " subtitles " not in filters:
+            self.skipTest("Local ffmpeg lacks drawtext or subtitles; bundled fonts cannot be exercised")
         saved = {k: os.environ.get(k) for k in ("FONTCONFIG_FILE", "FONTCONFIG_PATH")}
 
         def restore():

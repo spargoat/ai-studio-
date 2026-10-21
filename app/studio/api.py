@@ -477,17 +477,42 @@ def register(app, cfg, runner, live, bg):
                 return err(str(e), 502)
             raise
 
+    @bp.get("/api/intel/funnels")
+    def intel_funnels_route():
+        from .adintel import AdIntelError, directory
+        try:
+            return jsonify(directory())
+        except AdIntelError as e:
+            return err(str(e), 502)
+
     @bp.get("/api/intel/preview")
     def intel_preview():
         a = request.args
         config = {"advertiser": a.get("advertiser") or "", "status": a.get("status") or "",
                   "date_from": a.get("date_from") or "", "date_to": a.get("date_to") or "",
                   "longevity_min": a.get("longevity_min") or "", "ad_id": a.get("ad_id") or "",
-                  "event_id": a.get("event_id") or ""}
+                  "event_id": a.get("event_id") or "", "limit": a.get("limit") or "40",
+                  "offset": a.get("offset") or "0"}
         try:
             return jsonify(preview_pack(config))
         except Exception as e:
             return err(e, 502)
+
+    @bp.get("/api/intel/ads/<ad_id>/funnel")
+    def intel_ad_funnel(ad_id):
+        from .adintel import AdIntelError, funnel_for
+        try:
+            return jsonify(funnel_for(ad_id))
+        except AdIntelError as e:
+            return err(str(e), 502)
+
+    @bp.get("/api/intel/funnels/<path:funnel_id>/route")
+    def intel_funnel_route(funnel_id):
+        from .adintel import AdIntelError, route_for_funnel
+        try:
+            return jsonify(route_for_funnel(funnel_id))
+        except AdIntelError as e:
+            return err(str(e), 502)
 
     # ---------- SPA. /assets is registered on the app so it stays available
     # when the database gate returns before the blueprint.

@@ -1,21 +1,24 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  ReactFlow, ReactFlowProvider, Background, Controls, applyNodeChanges, applyEdgeChanges,
+  ReactFlow, ReactFlowProvider, Background, Controls, MiniMap, applyNodeChanges, applyEdgeChanges,
   useReactFlow, type Connection, type Edge, type Node, type NodeChange, type EdgeChange, type OnConnect, type FinalConnectionState,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Hash, Play, Copy, Save } from "lucide-react";
+import { Hash, Play, Copy, Save, Plus } from "lucide-react";
 import { api, fileUrl } from "../lib/api";
 import { toast } from "../components/Toast";
 import { CATALOG, PALETTE, PORT_COLOR, portType, type Side } from "../board/catalog";
 import { applyConnection, placeNode, type Box } from "../board/graph";
+import { buildKit, kitById, KITS } from "../board/kits";
 import { BoardCtx, nodeTypes, type Artefact, type BoardData } from "../board/nodes";
 
 type Lens = Side | "both";
 type FlowNode = Node<BoardData, "board">;
 type GraphNode = { id: string; type: string; position: { x: number; y: number }; enabled?: boolean; config?: Record<string, string> };
-type GraphEdge = { id: string; source: string; target: string; sourceHandle?: string; targetHandle?: string };
+type GraphEdge = { id: string; source: string; target: string; sourceHandle?: string; targetHandle?: string; label?: string };
+type FunnelMeta = { name: string; stage: string; owner: string; channel: string; sourceAdIds: string[] };
+const EMPTY_FUNNEL: FunnelMeta = { name: "", stage: "mapping", owner: "", channel: "", sourceAdIds: [] };
 
 function toFlow(nodes: GraphNode[]): FlowNode[] {
   let selectTimeline = true;
@@ -30,11 +33,11 @@ function toFlow(nodes: GraphNode[]): FlowNode[] {
   return flow;
 }
 
-function serialize(nodes: FlowNode[], edges: Edge[], variables: Record<string, string>) {
+function serialize(nodes: FlowNode[], edges: Edge[], variables: Record<string, string>, funnel: FunnelMeta) {
   return {
-    variables,
+    variables, funnel,
     nodes: nodes.map((n) => ({ id: n.id, type: n.data.nodeType, position: n.position, enabled: n.data.enabled, config: n.data.config || {} })),
-    edges: edges.map((e) => ({ id: e.id, source: e.source, target: e.target, sourceHandle: e.sourceHandle, targetHandle: e.targetHandle })),
+    edges: edges.map((e) => ({ id: e.id, source: e.source, target: e.target, sourceHandle: e.sourceHandle, targetHandle: e.targetHandle, label: e.label })),
   };
 }
 
@@ -76,12 +79,13 @@ function Canvas() {
   const { screenToFlowPosition, fitView } = useReactFlow();
   const { data: meta } = useQuery({ queryKey: ["meta"], queryFn: () => api("/api/meta") });
   const { data: list } = useQuery({ queryKey: ["boards"], queryFn: () => api<any[]>("/api/boards") });
-  const [boardId, setBoardId] = useState("talking_head");
+  const [boardId, setBoardId] = useState(() => window.localStorage.getItem("studio:board-id") || "talking_head");
   const { data: board } = useQuery({ queryKey: ["board", boardId], queryFn: () => api<any>(`/api/boards/${boardId}`), enabled: !!boardId });
   const [nodes, setNodes] = useState<FlowNode[]>([]);
   const [edges, setEdges] = useState<Edge[]>([]);
   const [name, setName] = useState("Talking head");
   const [variables, setVariables] = useState<Record<string, string>>({});
+  const [funnel, setFunnel] = useState<FunnelMeta>(EMPTY_FUNNEL);
   const [tab, setTab] = useState<Lens>("both");
   const [estimates, setEstimates] = useState<Record<string, number>>({});
   const [jobId, setJobId] = useState<string | null>(null);
@@ -89,6 +93,11 @@ function Canvas() {
   const [query, setQuery] = useState("");
   const [pane, setPane] = useState<"config" | "output" | "runs">("config");
   const searchRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => { window.localStorage.setItem("studio:board-id", boardId); }, [boardId]);
+  useEffect(() => {
+    if (list?.length && !list.some((row: { id: string }) => row.id === boardId)) setBoardId("talking_head");
+  }, [list, boardId]);
 
   useEffect(() => {
     if (!board) return;
@@ -99,6 +108,7 @@ function Canvas() {
     setEdges((board.graph?.edges || []).map((e: GraphEdge) => ({ ...e })));
     setName(board.name || "Board");
     setVariables(board.graph?.variables || {});
+    setFunnel({ ...EMPTY_FUNNEL, ...(board.graph?.funnel || {}) });
     setEstimates(board.estimates || {});
     if (board.last_job_id) setJobId(board.last_job_id);
   }, [board, boardId, loaded]);
@@ -111,6 +121,8 @@ function Canvas() {
     date_from: feed?.data.config.date_from || "",
     date_to: feed?.data.config.date_to || "",
     longevity_min: feed?.data.config.longevity_min || "",
+    limit: feed?.data.config.limit || "40",
+    offset: feed?.data.config.offset || "0",
     ad_id: feed?.data.config.ad_id || "",
     event_id: timeline?.data.config.event_id || "",
   }).toString();
@@ -122,6 +134,7 @@ function Canvas() {
   });
   const preview = previewQuery.data || board?.preview || null;
   const accountsQuery = useQuery({ queryKey: ["intel-accounts"], queryFn: () => api<any>("/api/intel/accounts") });
+  const directoryQuery = useQuery({ queryKey: ["intel-funnels"], queryFn: () => api<any>("/api/intel/funnels") });
   const { data: job } = useQuery({
     queryKey: ["job", jobId],
     queryFn: () => api<any>(`/api/jobs/${jobId}`),
@@ -172,6 +185,38 @@ function Canvas() {
   const setConfig = useCallback((id: string, patch: Record<string, string>) => {
     setNodes((ns) => ns.map((n) => n.id === id ? { ...n, data: { ...n.data, config: { ...n.data.config, ...patch } } } : n));
   }, []);
+  const addAds = useCallback((ads: { id?: string; headline?: string; advertiser?: string; status?: string; library_url?: string; landing_url?: string; as_of?: string }[]) => {
+    const usable = ads.filter((ad) => ad.id);
+    setNodes((ns) => {
+      const next = [...ns];
+      usable.forEach((ad, i) => {
+        const id = `source-ad-${ad.id}`;
+        if (next.some((n) => n.id === id)) return;
+        next.push({ id, type: "board", position: placeNode(next.map(nodeBox), { x: 1600 + (i % 4) * 300, y: 100 + Math.floor(i / 4) * 310 }, { width: 260, height: 260 }),
+          data: { nodeType: "ad_reference", enabled: true, config: { title: ad.headline || ad.id || "Source ad", url: ad.library_url || ad.landing_url || "", advertiser: ad.advertiser || "", source_status: ad.status || "unknown", as_of: ad.as_of || "", ad_id: ad.id || "", notes: "Observed source record. Add your own breakdown separately." } } });
+      });
+      return next;
+    });
+    setFunnel((prev) => ({ ...prev, sourceAdIds: [...new Set([...prev.sourceAdIds, ...usable.map((ad) => ad.id || "")])] }));
+    setTab("both");
+    toast.success(`${usable.length} source ads added to canvas`);
+  }, []);
+  const addKit = useCallback((kitId: string, desired?: { x: number; y: number }) => {
+    const definition = kitById(kitId);
+    if (!definition) return;
+    const start = desired || { x: Math.max(0, ...nodes.map((n) => n.position.x + (CATALOG[n.data.nodeType]?.width || 260))) + 160, y: 0 };
+    const at = placeNode(nodes.map(nodeBox), start, { width: kitId === "vsl" ? 1780 : 1240,
+      height: kitId === "vsl" ? 2400 : 330 + Math.ceil((definition.stages?.length || 0) / 4) * 300 + (["production", "creative-sprint", "profile-dm", "paid-lead"].includes(kitId) ? 630 : 0) });
+    const prefix = `${kitId}-${Date.now().toString(36)}`;
+    const kit = buildKit(kitId, prefix, at.x, at.y);
+    setNodes((ns) => [...ns, ...kit.nodes.map((n) => ({ id: n.id, type: "board" as const, position: n.position, data: { nodeType: n.type, enabled: n.enabled, config: n.config } }))]);
+    setEdges((es) => [...es, ...kit.edges]);
+    setFunnel((prev) => ({ ...prev, name: prev.name || definition.name, stage: "mapping" }));
+    setName((prev) => prev === "Untitled board" ? definition.name : prev);
+    setTab("both");
+    setTimeout(() => fitView({ nodes: [{ id: `${prefix}-overview` }], padding: 0.5, maxZoom: 1, duration: 250 }), 40);
+    toast.success(`${definition.name} added. Save the board to keep it.`);
+  }, [nodes, fitView]);
   const funnelSteps = useCallback(() => {
     const fields = (preview?.funnel?.evidence?.fields || {}) as { steps?: { n?: number; kind?: string; label?: string; url?: string }[]; ad_id?: string };
     return { steps: fields.steps || [], adId: fields.ad_id || "", asOf: preview?.funnel?.evidence?.data_as_of || "" };
@@ -198,7 +243,7 @@ function Canvas() {
       });
       return next;
     });
-    setEdges((es) => {
+    if (preview?.funnel?.evidence?.origin !== "live") setEdges((es) => {
       const add = [...es];
       steps.forEach((step, i) => {
         if (i === 0) return;
@@ -209,8 +254,27 @@ function Canvas() {
       });
       return add;
     });
-    toast.success("Public funnel mapped on the canvas");
-  }, [funnelSteps]);
+    toast.success(preview?.funnel?.evidence?.origin === "live" ? "Tracker route cards mapped. Order and links need verification." : "Public funnel mapped on the canvas");
+  }, [funnelSteps, preview]);
+  const mapDirectoryFunnel = useCallback(async (funnelName: string, advertiser: string) => {
+    try {
+      const route = await api<{ steps: { n: number; kind?: string; label?: string; url?: string; state?: string; source?: string }[]; note?: string; data_as_of?: string }>(`/api/intel/funnels/${encodeURIComponent(funnelName)}/route`);
+      if (!route.steps.length) { toast.error(route.note || "No steps in this route read."); return; }
+      const prefix = `route-${Date.now().toString(36)}`;
+      const x = Math.max(0, ...nodes.map((n) => n.position.x + (CATALOG[n.data.nodeType]?.width || 260))) + 160;
+      const noteId = `${prefix}-head`;
+      setNodes((ns) => [
+        ...ns,
+        { id: noteId, type: "board", position: { x, y: 0 }, data: { nodeType: "note", enabled: true, config: { title: `${advertiser}: ${funnelName}`, notes: "Tracker route read. Cards are grouped by evidence state. Confirm sequence and links before using this as a process map." } } },
+        ...route.steps.map((step, i) => ({ id: `${prefix}-${i}`, type: "board" as const,
+          position: { x: x + (i % 4) * 250, y: 290 + Math.floor(i / 4) * 250 },
+          data: { nodeType: "funnel_step", enabled: true, config: { n: String(step.n), kind: step.kind || "", label: step.label || "", url: step.url || "", state: step.state || "unknown", source: step.source || "", data_as_of: route.data_as_of || "" } } }))
+      ]);
+      setTab("both");
+      setTimeout(() => fitView({ nodes: [{ id: noteId }], padding: 0.4, duration: 250 }), 40);
+      toast.success(`${route.steps.length} route cards added`);
+    } catch (e) { toast.error((e as Error).message); }
+  }, [nodes, fitView]);
   const replicate = useCallback((funnelId: string) => {
     const { steps, adId, asOf } = funnelSteps();
     if (!steps.length) { toast.error("No public steps in this read."); return; }
@@ -258,7 +322,7 @@ function Canvas() {
           add.push({ id, source, target, sourceHandle, targetHandle });
         }
       };
-      steps.forEach((step, i) => {
+      if (preview?.funnel?.evidence?.origin !== "live") steps.forEach((step, i) => {
         if (i === 0) return;
         link(`step-${funnelId}-${steps[i - 1].n || i}`, "step", `step-${funnelId}-${step.n || i + 1}`, "step");
       });
@@ -272,7 +336,7 @@ function Canvas() {
       return add;
     });
     toast.success("Our funnel is scaffolded under the public steps");
-  }, [funnelSteps, variables]);
+  }, [funnelSteps, variables, preview]);
 
   const previewByType: Record<string, Artefact | null> = {
     ad_feed: preview?.feed, ad_breakdown: preview?.breakdown, funnel_route: preview?.funnel,
@@ -324,7 +388,11 @@ function Canvas() {
 
   useEffect(() => {
     if (!nodes.length) return;
-    const t = setTimeout(() => fitView({ padding: 0.18, maxZoom: 1, duration: 200 }), 80);
+    const overview = nodes.find((n) => n.id.endsWith("-overview"));
+    const focus = overview ? nodes.filter((n) => n.id.startsWith(overview.id.slice(0, -"overview".length)) &&
+      (n.id.endsWith("-overview") || n.id.endsWith("-source") || /-(?:section|stage)-[1-4]$/.test(n.id))) : [];
+    const t = setTimeout(() => fitView(focus.length ? { nodes: focus.map((n) => ({ id: n.id })), padding: 0.13, maxZoom: 0.9, duration: 200 }
+      : { padding: 0.18, maxZoom: 1, duration: 200 }), 80);
     return () => clearTimeout(t);
   }, [tab, loaded, fitView]);
 
@@ -383,18 +451,28 @@ function Canvas() {
   };
 
   const save = useMutation({
-    mutationFn: async () => api(`/api/boards/${boardId}`, { method: "PUT", body: { name, graph: serialize(nodes, edges, variables) } }),
-    onSuccess: (row: any) => { setEstimates(row.estimates || {}); setLoaded(boardId + (row.updated_at || "")); qc.invalidateQueries({ queryKey: ["boards"] }); toast.success("Board saved"); },
+    mutationFn: async () => api(`/api/boards/${boardId}`, { method: "PUT", body: { name, graph: serialize(nodes, edges, variables, funnel) } }),
+    onSuccess: (row: any) => { qc.setQueryData(["board", boardId], row); setEstimates(row.estimates || {}); setLoaded(boardId + (row.updated_at || "")); qc.invalidateQueries({ queryKey: ["boards"] }); toast.success("Board saved"); },
     onError: (e: Error) => toast.error(e.message),
   });
   const create = useMutation({
-    mutationFn: async () => api("/api/boards", { method: "POST", body: { name: name || "Untitled board", graph: serialize(nodes, edges, variables) } }),
-    onSuccess: (row: any) => { setBoardId(row.id); qc.invalidateQueries({ queryKey: ["boards"] }); toast.success("Board copied"); },
+    mutationFn: async (blank: boolean) => api("/api/boards", { method: "POST", body: blank
+      ? { name: "Untitled board", graph: { nodes: [], edges: [], variables: {}, funnel: EMPTY_FUNNEL } }
+      : { name: name || "Untitled board", graph: serialize(nodes, edges, variables, funnel) } }),
+    onSuccess: (row: any, blank) => {
+      qc.setQueryData(["boards"], (previous: any[] | undefined) => [...(previous || []).filter((item) => item.id !== row.id), row]);
+      qc.setQueryData(["board", row.id], row);
+      setBoardId(row.id);
+      qc.invalidateQueries({ queryKey: ["boards"] });
+      toast.success(blank ? "Blank board created" : "Board copied");
+    },
     onError: (e: Error) => toast.error(e.message),
   });
   const run = useMutation({
     mutationFn: async () => {
-      await api(`/api/boards/${boardId}`, { method: "PUT", body: { name, graph: serialize(nodes, edges, variables) } });
+      const saved = await api<any>(`/api/boards/${boardId}`, { method: "PUT", body: { name, graph: serialize(nodes, edges, variables, funnel) } });
+      qc.setQueryData(["board", boardId], saved);
+      setLoaded(boardId + (saved.updated_at || ""));
       const row = await api<{ id: string; mode: string; pump?: boolean }>(`/api/boards/${boardId}/run`, { body: { mode: "dry" } });
       setJobId(row.id);
       let status = "started";
@@ -434,6 +512,7 @@ function Canvas() {
   const cap = meta?.caps?.per_job;
   const needle = query.trim().toLowerCase();
   const lensIndex = tab === "intel" ? 0 : tab === "both" ? 1 : 2;
+  const hasRunnableNodes = nodes.some((node) => !["note", "quick_link", "funnel_stage", "ad_reference"].includes(node.data.nodeType));
 
   const setFeed = (key: string, value: string) => {
     if (!selected) return;
@@ -442,7 +521,7 @@ function Canvas() {
 
   return (
     <BoardCtx.Provider value={{
-      keys, toggle, follow, pickEvent, setConfig, mapFunnel, replicate, wired, persona,
+      keys, toggle, follow, pickEvent, setConfig, mapFunnel, replicate, addAds, wired, persona,
       personaId: variables.persona || meta?.personas?.[0]?.id || "",
       personas: meta?.personas || [],
       accounts: accountsQuery.data?.accounts || [],
@@ -461,15 +540,31 @@ function Canvas() {
             {(meta?.personas || []).map((p: any) => <option key={p.id} value={p.id}>{p.display}</option>)}
           </select>
           {board?.updated_at && <span className="v3-saved">{savedLabel(board.updated_at)}</span>}
-          <button type="button" className="v3-btn" onClick={() => create.mutate()} disabled={create.isPending}><Copy size={13} />Copy</button>
+          <button type="button" className="v3-btn" onClick={() => create.mutate(true)} disabled={create.isPending}><Plus size={13} />New</button>
+          <button type="button" className="v3-btn" onClick={() => create.mutate(false)} disabled={create.isPending}><Copy size={13} />Copy</button>
           <button type="button" className="v3-btn" onClick={() => save.mutate()} disabled={save.isPending}><Save size={13} />Save</button>
-          <button type="button" className="v3-btn pri" onClick={() => run.mutate()} disabled={run.isPending}><Play size={13} />Run (dry)</button>
+          <button type="button" className="v3-btn pri" onClick={() => run.mutate()} disabled={run.isPending || !hasRunnableNodes}
+            title={hasRunnableNodes ? "Run executable nodes without provider spend" : "Add an executable node such as Brief, Script or Video to run"}><Play size={13} />Run (dry)</button>
         </header>
+        <div className="v3-funnel-bar">
+          <label>Funnel <input aria-label="Funnel name" value={funnel.name} placeholder="Name this funnel" onChange={(e) => setFunnel((f) => ({ ...f, name: e.target.value }))} /></label>
+          <label>Stage <select aria-label="Funnel stage" value={funnel.stage} onChange={(e) => setFunnel((f) => ({ ...f, stage: e.target.value }))}>
+            {["mapping", "building", "review", "ready to publish"].map((stage) => <option key={stage} value={stage}>{stage}</option>)}
+          </select></label>
+          <label>Channel <input aria-label="Distribution channel" value={funnel.channel} placeholder="Meta, email, organic…" onChange={(e) => setFunnel((f) => ({ ...f, channel: e.target.value }))} /></label>
+          <label>Owner <input aria-label="Funnel owner" value={funnel.owner} placeholder="Owner" onChange={(e) => setFunnel((f) => ({ ...f, owner: e.target.value }))} /></label>
+          <span>{funnel.sourceAdIds.length} source ads</span>
+        </div>
         <div className="v3-board-body">
           <div className="v3-canvas board-shell v3-shell"
             onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
             onDrop={(e) => {
               e.preventDefault();
+              const kitId = e.dataTransfer.getData("application/board-kit");
+              if (kitById(kitId)) {
+                addKit(kitId, screenToFlowPosition({ x: e.clientX, y: e.clientY }));
+                return;
+              }
               const type = e.dataTransfer.getData("application/board-node");
               if (!CATALOG[type]) return;
               const spec = CATALOG[type];
@@ -488,12 +583,25 @@ function Canvas() {
                 <input ref={searchRef} className="v3-search" placeholder="Add…" aria-label="Add node" value={query} onChange={(e) => setQuery(e.target.value)} />
                 <span className="v3-kbd">/</span>
               </div>
+              {(["Operating maps", "Funnel strategies", "Asset workflows"] as const).map((group) => {
+                const kits = KITS.filter((kit) => kit.group === group && (!needle || `${kit.name} ${kit.description}`.toLowerCase().includes(needle)));
+                if (!kits.length) return null;
+                return <div key={group}>
+                  <h6>{group}</h6>
+                  <div className="v3-grid">
+                    {kits.map((kit) => <button key={kit.id} type="button" draggable className="palette-tile palette-tile-create" data-palette={`${kit.id}-kit`}
+                      title={`${kit.description} Source: ${kit.source}`}
+                      onDragStart={(e) => { e.dataTransfer.setData("application/board-kit", kit.id); e.dataTransfer.effectAllowed = "move"; }}
+                      onClick={() => addKit(kit.id)}><span className="palette-label">{kit.name}</span></button>)}
+                  </div>
+                </div>;
+              })}
               {PALETTE.map((group) => {
                 const types = group.types.filter((type) => !needle || CATALOG[type].headline.toLowerCase().includes(needle));
-                const soon = group.side === "create" && (!needle || "hook lab".includes(needle));
+                const soon = group.label === "Create · pipeline" && (!needle || "hook lab".includes(needle));
                 if (!types.length && !soon) return null;
                 return (
-                  <div key={group.side}>
+                  <div key={group.label}>
                     <h6>{group.label}</h6>
                     <div className="v3-grid">
                       {types.map((type) => {
@@ -521,15 +629,26 @@ function Canvas() {
                   </div>
                 );
               })}
+              {directoryQuery.data?.origin === "live" && <div>
+                <h6>Competitor funnels</h6>
+                <p className="v3-muted">{directoryQuery.data.coverage}</p>
+                {(directoryQuery.data.funnels || []).filter((f: { name: string; advertisers?: string[] }) => !needle || `${f.name} ${(f.advertisers || []).join(" ")}`.toLowerCase().includes(needle)).map((f: { id: string; name: string; advertisers?: string[]; ads?: number | null }) => (
+                  <button key={f.id} type="button" className="v3-dir-item"
+                    onClick={() => mapDirectoryFunnel(f.id, (f.advertisers || []).join(", ") || f.name)} title="Map tracker route cards on this board">
+                    <b>{f.name}</b><small>{(f.advertisers || []).join(", ") || "Advertiser not linked"}{f.ads != null ? ` · ${f.ads} assigned ads` : ""}</small>
+                  </button>
+                ))}
+              </div>}
             </aside>
             <div className="v3-flow">
               <ReactFlow nodes={view.nodes} edges={view.edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
                 onConnect={onConnect} onConnectEnd={onConnectEnd} isValidConnection={isValid} edgesReconnectable={false}
-                connectionRadius={40} colorMode="dark" fitView minZoom={0.3}
+                connectionRadius={40} colorMode="dark" fitView minZoom={0.15}
                 connectionLineStyle={{ stroke: "#7c6cff", strokeWidth: 2 }}
                 proOptions={{ hideAttribution: false }}>
                 <Background gap={24} size={1.1} color="#2c2c33" />
                 <Controls showInteractive={false} />
+                <MiniMap pannable zoomable nodeColor={(n) => n.data?.nodeType === "ad_reference" ? "#5ab0ff" : "#7c6cff"} />
               </ReactFlow>
               <div className="v3-pill" role="tablist" aria-label="Board lens" data-lens={tab}>
                 <i className="v3-pill-ind" style={{ left: 4 + lensIndex * 96 }} />
@@ -566,9 +685,11 @@ function Canvas() {
                 <div className="v3-ib">
                   {pane === "config" && selected.data.nodeType === "ad_feed" && (
                     <div className="v3-flds">
-                      {(["advertiser", "status", "date_from", "date_to", "longevity_min", "ad_id"] as const).map((key) => (
+                      {(["advertiser", "status", "date_from", "date_to", "longevity_min", "limit", "offset", "ad_id"] as const).map((key) => (
                         <label key={key} className="v3-fld">{key.replace(/_/g, " ")}
-                          <input className="v3-inp" value={selected.data.config[key] || ""} aria-label={key} onChange={(e) => setFeed(key, e.target.value)} />
+                          {key === "status" ? <select className="v3-inp" value={selected.data.config.status || ""} aria-label="status" onChange={(e) => setFeed("status", e.target.value)}>
+                            <option value="">All statuses</option>{["live", "stopped", "missing", "removed"].map((s) => <option key={s} value={s}>{s}</option>)}
+                          </select> : <input className="v3-inp" value={selected.data.config[key] || ""} aria-label={key} onChange={(e) => setFeed(key, e.target.value)} />}
                         </label>
                       ))}
                     </div>

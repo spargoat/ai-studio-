@@ -1,6 +1,6 @@
 // Node catalogue for the board. Port ids and types mirror studio/board.py.
 import type { LucideIcon } from "lucide-react";
-import { AudioLines, ChartNoAxesCombined, Clapperboard, FileText, Microscope, PanelTop, Route, Rss, ScanSearch, ScrollText, Waypoints } from "lucide-react";
+import { AudioLines, ChartNoAxesCombined, Clapperboard, FileText, Image as ImageIcon, Link2, Microscope, PanelTop, Route, Rss, ScanSearch, ScrollText, StickyNote, Waypoints, Workflow } from "lucide-react";
 
 export type Side = "intel" | "create";
 export type Port = { id: string; type: string };
@@ -37,13 +37,20 @@ export const CATALOG: Record<string, NodeSpec> = {
     inputs: [{ id: "brief", type: "brief" }, { id: "source", type: "step" }], outputs: [{ id: "script", type: "script" }, { id: "hooks", type: "hooks" }] },
   voice: { type: "voice", side: "create", headline: "Voiceover", icon: AudioLines, width: 240, needsKey: "elevenlabs",
     inputs: [{ id: "script", type: "script" }], outputs: [{ id: "audio", type: "audio" }] },
+  still: { type: "still", side: "create", headline: "Image", icon: ImageIcon, width: 260, needsKey: "fal",
+    inputs: [{ id: "brief", type: "brief" }], outputs: [{ id: "still", type: "still" }] },
   video: { type: "video", side: "create", headline: "Video", icon: Clapperboard, width: 240, needsKey: "fal",
     inputs: [{ id: "audio", type: "audio" }, { id: "still", type: "still" }], outputs: [{ id: "video", type: "video" }] },
+  note: { type: "note", side: "create", headline: "Note", icon: StickyNote, width: 260, inputs: [], outputs: [] },
+  quick_link: { type: "quick_link", side: "create", headline: "Quick link", icon: Link2, width: 260, inputs: [], outputs: [] },
+  funnel_stage: { type: "funnel_stage", side: "create", headline: "Funnel stage", icon: Workflow, width: 260, inputs: [{ id: "flow", type: "flow" }], outputs: [{ id: "flow", type: "flow" }] },
+  ad_reference: { type: "ad_reference", side: "intel", headline: "Source ad", icon: Rss, width: 260, inputs: [], outputs: [] },
 };
 
 export const PALETTE: { side: Side; label: string; types: string[] }[] = [
   { side: "intel", label: "Intel · charts", types: ["market_timeline", "funnel_route", "ad_feed", "ad_breakdown", "teardown"] },
-  { side: "create", label: "Create · pipeline", types: ["brief", "landing", "script", "voice", "video"] },
+  { side: "create", label: "Create · pipeline", types: ["brief", "landing", "script", "voice", "still", "video"] },
+  { side: "create", label: "Canvas · map and access", types: ["funnel_stage", "note", "quick_link"] },
 ];
 
 export const REFERENCE_LABEL = "pattern reference for ideation only, NOT copy-blueprint";
@@ -58,5 +65,5 @@ export function portType(nodeType: string, direction: "in" | "out", handle?: str
 
 export const PORT_COLOR: Record<string, string> = {
   ad: "#5ab0ff", brief: "#7c6cff", script: "#c9a0ff", hooks: "#c9a0ff",
-  audio: "#3ecf8e", video: "#ff7a8a", still: "#e5a54b", page: "#5ab0ff", step: "#e2a65a",
+  audio: "#3ecf8e", video: "#ff7a8a", still: "#e5a54b", page: "#5ab0ff", step: "#e2a65a", flow: "#a98cff",
 };
