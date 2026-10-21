@@ -22,7 +22,9 @@ background:#27272a;color:#fff;font-size:15px}button{width:100%;height:40px;margi
 
 def config():
     pw, secret = os.environ.get("STUDIO_APP_PASSWORD", ""), os.environ.get("STUDIO_SESSION_SECRET", "")
-    required = os.environ.get("STUDIO_REQUIRE_AUTH") == "1" or bool(pw)
+    # STUDIO_AUTH_DISABLED=1 skips the password gate. Any other value leaves today's rules.
+    disabled = os.environ.get("STUDIO_AUTH_DISABLED") == "1"
+    required = (not disabled) and (os.environ.get("STUDIO_REQUIRE_AUTH") == "1" or bool(pw))
     return {"pw": pw, "secret": secret, "required": required, "configured": bool(pw and secret)}
 
 

@@ -389,5 +389,39 @@ class T(unittest.TestCase):
             for k, v in old.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
 
+    def test_auth_disabled_switch_skips_the_gate(self):
+        from studio.web import create_app
+        keys = ("STUDIO_REQUIRE_AUTH", "STUDIO_APP_PASSWORD", "STUDIO_SESSION_SECRET", "STUDIO_AUTH_DISABLED")
+        old = {k: os.environ.get(k) for k in keys}
+        try:
+            os.environ["STUDIO_REQUIRE_AUTH"] = "1"
+            os.environ["STUDIO_APP_PASSWORD"] = "t-pass-123"
+            os.environ["STUDIO_SESSION_SECRET"] = "t-secret-abc"
+            os.environ.pop("STUDIO_AUTH_DISABLED", None)
+            closed = create_app(cfg()).test_client()
+            page = closed.get("/board")
+            self.assertEqual(page.status_code, 302)
+            self.assertIn("/login", page.headers["Location"])
+            self.assertEqual(closed.get("/api/meta").status_code, 401)
+            self.assertEqual(closed.get("/api/boards").status_code, 401)
+            os.environ["STUDIO_AUTH_DISABLED"] = "0"
+            still = create_app(cfg()).test_client()
+            self.assertEqual(still.get("/api/spend").status_code, 401)
+            os.environ["STUDIO_AUTH_DISABLED"] = "1"
+            open_ = create_app(cfg()).test_client()
+            board = open_.get("/board")
+            self.assertNotIn("/login", board.headers.get("Location", ""))
+            self.assertIn(board.status_code, (200, 503))
+            self.assertEqual(open_.get("/library").status_code, board.status_code)
+            self.assertEqual(open_.get("/api/meta").status_code, 200)
+            self.assertEqual(open_.get("/api/boards").status_code, 200)
+            self.assertEqual(open_.get("/api/spend").status_code, 200)
+            login = open_.get("/login")
+            self.assertEqual(login.status_code, 302)
+            self.assertNotIn("password", login.get_data(as_text=True).lower())
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
