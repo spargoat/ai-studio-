@@ -58,6 +58,9 @@ export const BoardCtx = createContext<{
   mapFunnel: (id: string) => void;
   replicate: (id: string) => void;
   addAds: (ads: WaterAd[]) => void;
+  buildKitPath: (id: string) => void;
+  expandKitMap: (id: string) => void;
+  sources: { id: string; title: string; url: string; status: string }[];
   wired: Set<string>;
   persona: string;
   personaId: string;
@@ -66,7 +69,8 @@ export const BoardCtx = createContext<{
   boardScript: string;
 }>({
   keys: {}, toggle: () => {}, follow: () => {}, pickEvent: () => {}, setConfig: () => {},
-  mapFunnel: () => {}, replicate: () => {}, addAds: () => {}, wired: new Set(), persona: "", personaId: "",
+  mapFunnel: () => {}, replicate: () => {}, addAds: () => {}, buildKitPath: () => {}, expandKitMap: () => {},
+  sources: [], wired: new Set(), persona: "", personaId: "",
   personas: [], accounts: [], boardScript: "",
 });
 
@@ -469,6 +473,46 @@ function CanvasBody({ id, nodeType, config }: { id: string; nodeType: string; co
   </div>;
 }
 
+function KitBody({ id, config }: { id: string; config: Record<string, string> }) {
+  const { setConfig, sources, buildKitPath, expandKitMap } = useContext(BoardCtx);
+  const stages = (() => { try { return JSON.parse(config.stages || "[]") as [string, string][]; } catch { return []; } })();
+  const completed = (() => { try { return JSON.parse(config.completed || "[]") as number[]; } catch { return []; } })();
+  const source = sources.find((row) => row.id === config.source_ad_id);
+  const sourceUrl = safeLink(source?.url || config.source_url);
+  const canBuild = ["vsl", "production", "creative-sprint", "profile-dm", "paid-lead"].includes(config.kit_id);
+  return <div className="v3-bd nodrag nopan v3-kit">
+    <p className="v3-copy">{config.description}</p>
+    <div className="v3-kit-summary"><b>{completed.length}/{stages.length}</b> steps checked · {canBuild
+      ? config.production_built === "true" ? "production path on canvas" : "production path ready to open"
+      : config.map_expanded === "true" ? "stage map on canvas" : "stage map kept inside kit"}</div>
+    <Field label="Source on this board">
+      <select className="v3-in" aria-label="Kit source" value={config.source_ad_id || ""} onChange={(e) => {
+        const picked = sources.find((row) => row.id === e.target.value);
+        setConfig(id, { source_ad_id: e.target.value, source_url: picked?.url || "", source_status: picked?.status || "unknown" });
+      }}>
+        <option value="">Choose a source ad</option>
+        {config.source_ad_id && !source && <option value={config.source_ad_id}>{config.source_ad_id} · saved source</option>}
+        {sources.map((row) => <option key={row.id} value={row.id}>{row.title}</option>)}
+      </select>
+    </Field>
+    {!source && <Field label="Or source URL"><input className="v3-in" type="url" aria-label="Kit source URL" value={config.source_url || ""} placeholder="https://" onChange={(e) => setConfig(id, { source_url: e.target.value })} /></Field>}
+    {(source || config.source_ad_id) && <p className="v3-muted">{source?.status || config.source_status || "Source state unknown"}. Research reference only.</p>}
+    {sourceUrl && <a className="v3-mini" href={sourceUrl} target="_blank" rel="noopener noreferrer">Open source</a>}
+    {canBuild && <Field label="Owned offer"><input className="v3-in" aria-label="Kit owned offer" value={config.offer || ""} placeholder="Add once for the production brief" onChange={(e) => setConfig(id, { offer: e.target.value })} /></Field>}
+    <div className="v3-acts">
+      {canBuild && <button type="button" className="v3-mini" disabled={config.production_built === "true"} onClick={() => buildKitPath(id)}>{config.production_built === "true" ? "Path built" : "Build production path"}</button>}
+      <button type="button" className="v3-mini" disabled={config.map_expanded === "true"} onClick={() => expandKitMap(id)}>{config.map_expanded === "true" ? "Map opened" : "Open map on canvas"}</button>
+    </div>
+    <details className="v3-kit-details"><summary>Open {stages.length} step outline</summary>
+      <ol>{stages.map(([title, guidance], i) => <li key={`${title}-${i}`}>
+        <label><input type="checkbox" checked={completed.includes(i)} onChange={() => setConfig(id, { completed: JSON.stringify(completed.includes(i) ? completed.filter((n) => n !== i) : [...completed, i]) })} /> <b>{title}</b></label>
+        <small>{guidance}</small>
+      </li>)}</ol>
+    </details>
+    <p className="v3-muted">Method: {config.method_source}. Checked steps are operator notes, not proof of deployment.</p>
+  </div>;
+}
+
 function Handles({ spec, id }: { spec: NodeSpec; id: string }) {
   const { wired } = useContext(BoardCtx);
   const spot = (i: number, n: number) => `${((i + 1) / (n + 1)) * 100}%`;
@@ -502,7 +546,7 @@ export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "boa
   const timelinePoints = data.preview?.evidence?.fields?.points;
   const hasTimeline = Array.isArray(timelinePoints) && timelinePoints.length > 0;
   const count = data.preview?.inference?.match_count;
-  const canvas = ["note", "quick_link", "funnel_stage", "ad_reference"].includes(data.nodeType);
+  const canvas = ["note", "quick_link", "funnel_stage", "ad_reference", "kit_master"].includes(data.nodeType);
   return (
     <article data-node={data.nodeType} style={{ width: spec.width }}
       className={`v3-node ${selected ? "is-sel" : ""} ${data.enabled ? "" : "is-off"}`}>
@@ -527,7 +571,7 @@ export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "boa
             <Link to="/settings#connections" className="nodrag nopan v3-nk">Needs key → Settings</Link>
           </div>
         )}
-        {canvas ? <CanvasBody id={id} nodeType={data.nodeType} config={data.config} /> : intel
+        {data.nodeType === "kit_master" ? <KitBody id={id} config={data.config} /> : canvas ? <CanvasBody id={id} nodeType={data.nodeType} config={data.config} /> : intel
           ? <IntelBody artefact={data.preview} nodeType={data.nodeType} nodeId={id} selectedEvent={data.config.event_id} config={data.config} />
           : <CreateBody id={id} nodeType={data.nodeType} config={data.config} file={data.file} />}
         {!canvas && <footer className="v3-ft">

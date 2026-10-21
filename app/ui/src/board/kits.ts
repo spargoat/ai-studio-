@@ -22,34 +22,7 @@ export type KitNode = { id: string; type: string; position: { x: number; y: numb
 export type KitEdge = { id: string; source: string; sourceHandle: string; target: string; targetHandle: string; label?: string };
 
 export function vslKit(prefix: string, x = 0, y = 0): { nodes: KitNode[]; edges: KitEdge[] } {
-  const nodes: KitNode[] = [];
-  const add = (key: string, type: string, px: number, py: number, config: Record<string, string> = {}) => {
-    nodes.push({ id: `${prefix}-${key}`, type, position: { x: x + px, y: y + py }, enabled: true, config });
-  };
-  add("overview", "note", 0, 0, { title: "VSL funnel", notes: "Map source evidence, write the VSL, produce the media, build the page and connect distribution. Each item is saved on this board." });
-  add("source", "quick_link", 300, 0, { title: "Competitor or research source", notes: "Paste a source URL. Record what is observed and what is inferred." });
-  VSL_SECTIONS.forEach(([title, guidance], i) => add(`section-${i + 1}`, "note", (i % 4) * 300, 270 + Math.floor(i / 4) * 310, {
-    title: `${i + 1}. ${title}`, notes: guidance,
-  }));
-  const py = 1610;
-  add("brief", "brief", 0, py, {});
-  add("script", "script", 300, py, {});
-  add("voice", "voice", 600, py, {});
-  add("lip-sync", "funnel_stage", 900, py, { title: "Lip sync", status: "planned", notes: "Choose model, source video and approved voice. Connect a provider before claiming generation." });
-  add("video", "video", 1200, py, { format: "talking_head", aspect: "9:16" });
-  add("still", "still", 1500, py, {});
-  add("landing", "landing", 0, py + 360, {});
-  add("opt-in", "funnel_stage", 300, py + 360, { title: "Opt-in and lead capture", status: "planned", notes: "Capture consent, destination and form test." });
-  add("application", "funnel_stage", 600, py + 360, { title: "Application and booking", status: "planned", notes: "Record qualification, reachable endings and booking URL." });
-  add("follow-up", "funnel_stage", 900, py + 360, { title: "Follow-up", status: "planned", notes: "Define message timing and verify the workflow after publication." });
-  add("distribution", "funnel_stage", 1200, py + 360, { title: "Distribution channel", status: "planned", notes: "Record account, creative, destination, UTM and live check." });
-  add("live-link", "quick_link", 1500, py + 360, { title: "Published funnel URL", notes: "Add the live URL after a read back." });
-  const edge = (from: string, out: string, to: string, inn: string): KitEdge => ({
-    id: `${prefix}-${from}-${to}`, source: `${prefix}-${from}`, sourceHandle: out, target: `${prefix}-${to}`, targetHandle: inn,
-  });
-  return { nodes, edges: [edge("brief", "brief", "script", "brief"), edge("script", "script", "voice", "script"),
-    edge("voice", "audio", "video", "audio"), edge("brief", "brief", "still", "brief"),
-    edge("still", "still", "video", "still"), edge("brief", "brief", "landing", "brief")] };
+  return buildKit("vsl", prefix, x, y);
 }
 
 export type KitDefinition = {
@@ -178,54 +151,49 @@ export const KITS: readonly KitDefinition[] = [
       ["Readout", "Delivery, replies, conversions, receipts and follow-up learning."],
     ] },
   { id: "vsl", name: "VSL funnel", group: "Funnel strategies", source: "Video sales letter",
-    description: "Sixteen script sections plus media, page, lead capture and distribution stages." },
+    description: "One VSL workbench with the script structure, production path and distribution checks inside it." },
 ];
 
 export function kitById(id: string): KitDefinition | undefined { return KITS.find((kit) => kit.id === id); }
 
 export function buildKit(id: string, prefix: string, x = 0, y = 0): { nodes: KitNode[]; edges: KitEdge[] } {
-  if (id === "vsl") return vslKit(prefix, x, y);
   const kit = kitById(id);
-  if (!kit?.stages) throw new Error(`Unknown board kit: ${id}`);
-  const nodes: KitNode[] = [
-    { id: `${prefix}-overview`, type: "note", position: { x, y }, enabled: true, config: { title: kit.name, notes: `${kit.description}\nSource: ${kit.source}. Add owners, links, evidence and decisions to each stage.` } },
-    { id: `${prefix}-source`, type: "quick_link", position: { x: x + 310, y }, enabled: true, config: { title: "Source and working links", notes: "Add research, reference board, live destinations and operating documents." } },
-  ];
-  kit.stages.forEach(([title, notes], index) => nodes.push({
-    id: `${prefix}-stage-${index + 1}`, type: "funnel_stage",
-    position: { x: x + (Math.floor(index / 4) % 2 ? 3 - index % 4 : index % 4) * 310, y: y + 290 + Math.floor(index / 4) * 300 },
-    enabled: true, config: { title: `${index + 1}. ${title}`, status: "planned",
-      notes: id === "fxfarm" ? `${notes}\n\nInput:\nTrigger:\nAction:\nOwner:\nSystem:\nMetric:\nControl:\nRun evidence:` : notes },
-  }));
-  const edges: KitEdge[] = kit.stages.slice(1).map(([title], index) => ({
-    id: `${prefix}-handoff-${index + 1}`, source: `${prefix}-stage-${index + 1}`, sourceHandle: "flow",
-    target: `${prefix}-stage-${index + 2}`, targetHandle: "flow", label: `→ ${title}`,
-  }));
-  if (["production", "creative-sprint", "profile-dm", "paid-lead"].includes(id)) {
-    const py = y + 310 + Math.ceil(kit.stages.length / 4) * 300;
-    const add = (key: string, type: string, column: number, row = 0) => nodes.push({
-      id: `${prefix}-${key}`, type, position: { x: x + column * 310, y: py + row * 310 }, enabled: true, config: {},
-    });
-    const link = (from: string, out: string, to: string, input: string) => edges.push({
-      id: `${prefix}-${from}-${to}`, source: `${prefix}-${from}`, sourceHandle: out,
-      target: `${prefix}-${to}`, targetHandle: input,
-    });
-    add("brief", "brief", 0);
-    if (id === "paid-lead") {
-      add("script", "script", 1);
-      add("landing", "landing", 2);
-      link("brief", "brief", "script", "brief");
+  if (!kit) throw new Error(`Unknown board kit: ${id}`);
+  const stages = id === "vsl"
+    ? VSL_SECTIONS.map(([title, guidance]) => [title, guidance])
+    : (kit.stages || []).map(([title, guidance]) => [title, guidance]);
+  return { nodes: [{ id: `${prefix}-overview`, type: "kit_master", position: { x, y }, enabled: true,
+    config: { title: kit.name, kit_id: id, description: kit.description, method_source: kit.source,
+      stages: JSON.stringify(stages), completed: "[]", production_built: "false" } }], edges: [] };
+}
+
+// A production path is materialised only on request. Strategy and source stay in the master node.
+export function buildKitPipeline(id: string, prefix: string, x: number, y: number, offer = "", sourceAdId = "", sourceUrl = ""): { nodes: KitNode[]; edges: KitEdge[] } {
+  const nodes: KitNode[] = [];
+  const edges: KitEdge[] = [];
+  const add = (key: string, type: string, column: number, row = 0, config: Record<string, string> = {}) =>
+    nodes.push({ id: `${prefix}-${key}`, type, position: { x: x + column * 310, y: y + row * 330 }, enabled: true, config });
+  const link = (from: string, out: string, to: string, input: string) => edges.push({
+    id: `${prefix}-${from}-${to}`, source: `${prefix}-${from}`, sourceHandle: out,
+    target: `${prefix}-${to}`, targetHandle: input,
+  });
+  add("brief", "brief", 0, 0, { offer, source_ad_id: sourceAdId, source_url: sourceUrl });
+  add("script", "script", 1);
+  link("brief", "brief", "script", "brief");
+  if (id === "paid-lead") {
+    add("landing", "landing", 2);
+    link("brief", "brief", "landing", "brief");
+  } else {
+    add("voice", "voice", 2);
+    add("still", "still", 2, 1);
+    add("video", "video", 3, 0, { format: "talking_head", aspect: "9:16" });
+    link("script", "script", "voice", "script");
+    link("brief", "brief", "still", "brief");
+    link("voice", "audio", "video", "audio");
+    link("still", "still", "video", "still");
+    if (id === "vsl") {
+      add("landing", "landing", 3, 1);
       link("brief", "brief", "landing", "brief");
-    } else {
-      add("script", "script", 1);
-      add("voice", "voice", 2);
-      add("video", "video", 3);
-      add("still", "still", 2, 1);
-      link("brief", "brief", "script", "brief");
-      link("script", "script", "voice", "script");
-      link("brief", "brief", "still", "brief");
-      link("voice", "audio", "video", "audio");
-      link("still", "still", "video", "still");
     }
   }
   return { nodes, edges };

@@ -10,7 +10,7 @@ import { api, fileUrl } from "../lib/api";
 import { toast } from "../components/Toast";
 import { CATALOG, PALETTE, PORT_COLOR, portType, type Side } from "../board/catalog";
 import { applyConnection, placeNode, type Box } from "../board/graph";
-import { buildKit, kitById, KITS } from "../board/kits";
+import { buildKit, buildKitPipeline, kitById, KITS } from "../board/kits";
 import { BoardCtx, nodeTypes, type Artefact, type BoardData } from "../board/nodes";
 
 type Lens = Side | "both";
@@ -133,6 +133,20 @@ function Canvas() {
     enabled: nodes.length > 0,
   });
   const preview = previewQuery.data || board?.preview || null;
+  const sources = useMemo(() => {
+    const attached = nodes.filter((node) => node.data.nodeType === "ad_reference" && node.data.config.ad_id).map((node) => ({
+      id: node.data.config.ad_id, title: node.data.config.title || node.data.config.ad_id,
+      url: node.data.config.url || "", status: node.data.config.source_status || "unknown",
+    }));
+    const pickedId = feed?.data.config.ad_id;
+    const waterfall = (preview?.feed?.evidence?.fields?.waterfall || []) as { id?: string; headline?: string; library_url?: string; landing_url?: string; status?: string }[];
+    const picked = waterfall.find((ad) => ad.id === pickedId);
+    if (pickedId && picked && !attached.some((source) => source.id === pickedId)) attached.unshift({
+      id: pickedId, title: picked.headline || pickedId, url: picked.library_url || picked.landing_url || "",
+      status: preview?.feed?.evidence?.origin === "live" ? picked.status || "unknown" : "fixture",
+    });
+    return attached;
+  }, [nodes, feed?.data.config.ad_id, preview]);
   const accountsQuery = useQuery({ queryKey: ["intel-accounts"], queryFn: () => api<any>("/api/intel/accounts") });
   const directoryQuery = useQuery({ queryKey: ["intel-funnels"], queryFn: () => api<any>("/api/intel/funnels") });
   const { data: job } = useQuery({
@@ -183,7 +197,14 @@ function Canvas() {
     setPane("config");
   }, []);
   const setConfig = useCallback((id: string, patch: Record<string, string>) => {
-    setNodes((ns) => ns.map((n) => n.id === id ? { ...n, data: { ...n.data, config: { ...n.data.config, ...patch } } } : n));
+    setNodes((ns) => ns.map((n) => {
+      if (n.id === id) return { ...n, data: { ...n.data, config: { ...n.data.config, ...patch } } };
+      if (n.id === `${id}-brief` && ["offer", "source_ad_id", "source_url"].some((key) => key in patch)) {
+        return { ...n, data: { ...n.data, config: { ...n.data.config,
+          ...Object.fromEntries(["offer", "source_ad_id", "source_url"].filter((key) => key in patch).map((key) => [key, patch[key]])) } } };
+      }
+      return n;
+    }));
   }, []);
   const addAds = useCallback((ads: { id?: string; headline?: string; advertiser?: string; status?: string; library_url?: string; landing_url?: string; as_of?: string }[]) => {
     const usable = ads.filter((ad) => ad.id);
@@ -205,10 +226,13 @@ function Canvas() {
     const definition = kitById(kitId);
     if (!definition) return;
     const start = desired || { x: Math.max(0, ...nodes.map((n) => n.position.x + (CATALOG[n.data.nodeType]?.width || 260))) + 160, y: 0 };
-    const at = placeNode(nodes.map(nodeBox), start, { width: kitId === "vsl" ? 1780 : 1240,
-      height: kitId === "vsl" ? 2400 : 330 + Math.ceil((definition.stages?.length || 0) / 4) * 300 + (["production", "creative-sprint", "profile-dm", "paid-lead"].includes(kitId) ? 630 : 0) });
+    const at = placeNode(nodes.map(nodeBox), start, { width: 370, height: 620 });
     const prefix = `${kitId}-${Date.now().toString(36)}`;
     const kit = buildKit(kitId, prefix, at.x, at.y);
+    const source = sources.find((row) => funnel.sourceAdIds.includes(row.id)) || sources[0];
+    if (source) kit.nodes[0].config = { ...kit.nodes[0].config, source_ad_id: source.id,
+      source_url: source.url, source_status: source.status };
+    if (variables.offer) kit.nodes[0].config.offer = variables.offer;
     setNodes((ns) => [...ns, ...kit.nodes.map((n) => ({ id: n.id, type: "board" as const, position: n.position, data: { nodeType: n.type, enabled: n.enabled, config: n.config } }))]);
     setEdges((es) => [...es, ...kit.edges]);
     setFunnel((prev) => ({ ...prev, name: prev.name || definition.name, stage: "mapping" }));
@@ -216,7 +240,32 @@ function Canvas() {
     setTab("both");
     setTimeout(() => fitView({ nodes: [{ id: `${prefix}-overview` }], padding: 0.5, maxZoom: 1, duration: 250 }), 40);
     toast.success(`${definition.name} added. Save the board to keep it.`);
-  }, [nodes, fitView]);
+  }, [nodes, fitView, funnel.sourceAdIds, variables.offer, sources]);
+  const buildKitPath = useCallback((masterId: string) => {
+    const master = nodes.find((n) => n.id === masterId && n.data.nodeType === "kit_master");
+    if (!master || master.data.config.production_built === "true") return;
+    const cfg = master.data.config;
+    const path = buildKitPipeline(cfg.kit_id, masterId, master.position.x + 470, master.position.y, cfg.offer, cfg.source_ad_id, cfg.source_url);
+    if (path.nodes.some((n) => nodes.some((existing) => existing.id === n.id))) return;
+    setNodes((ns) => [...ns.map((n) => n.id === masterId ? { ...n, data: { ...n.data, config: { ...n.data.config, production_built: "true" } } } : n),
+      ...path.nodes.map((n) => ({ id: n.id, type: "board" as const, position: n.position, data: { nodeType: n.type, enabled: n.enabled, config: n.config } }))]);
+    setEdges((es) => [...es, ...path.edges]);
+    toast.success("Production path built. Save the board to keep it. Dry run is $0.");
+  }, [nodes]);
+  const expandKitMap = useCallback((masterId: string) => {
+    const master = nodes.find((n) => n.id === masterId && n.data.nodeType === "kit_master");
+    if (!master || master.data.config.map_expanded === "true") return;
+    let stages: [string, string][] = [];
+    try { stages = JSON.parse(master.data.config.stages || "[]"); } catch { return; }
+    const cards = stages.map(([title, guidance], i) => ({ id: `${masterId}-map-${i + 1}`, type: "board" as const,
+      position: { x: master.position.x + (i % 3) * 310, y: master.position.y + 720 + Math.floor(i / 3) * 310 },
+      data: { nodeType: "funnel_stage", enabled: true, config: { title: `${i + 1}. ${title}`, status: "planned", notes: guidance } } }));
+    if (cards.some((card) => nodes.some((n) => n.id === card.id))) return;
+    setNodes((ns) => [...ns.map((n) => n.id === masterId ? { ...n, data: { ...n.data, config: { ...n.data.config, map_expanded: "true" } } } : n), ...cards]);
+    setEdges((es) => [...es, ...cards.slice(1).map((card, i) => ({ id: `${masterId}-map-edge-${i + 1}`,
+      source: cards[i].id, sourceHandle: "flow", target: card.id, targetHandle: "flow" }))]);
+    toast.success("Stage map opened. Save the board to keep it.");
+  }, [nodes]);
   const funnelSteps = useCallback(() => {
     const fields = (preview?.funnel?.evidence?.fields || {}) as { steps?: { n?: number; kind?: string; label?: string; url?: string }[]; ad_id?: string };
     return { steps: fields.steps || [], adId: fields.ad_id || "", asOf: preview?.funnel?.evidence?.data_as_of || "" };
@@ -512,7 +561,7 @@ function Canvas() {
   const cap = meta?.caps?.per_job;
   const needle = query.trim().toLowerCase();
   const lensIndex = tab === "intel" ? 0 : tab === "both" ? 1 : 2;
-  const hasRunnableNodes = nodes.some((node) => !["note", "quick_link", "funnel_stage", "ad_reference"].includes(node.data.nodeType));
+  const hasRunnableNodes = nodes.some((node) => !["note", "quick_link", "funnel_stage", "ad_reference", "kit_master"].includes(node.data.nodeType));
 
   const setFeed = (key: string, value: string) => {
     if (!selected) return;
@@ -521,7 +570,7 @@ function Canvas() {
 
   return (
     <BoardCtx.Provider value={{
-      keys, toggle, follow, pickEvent, setConfig, mapFunnel, replicate, addAds, wired, persona,
+      keys, toggle, follow, pickEvent, setConfig, mapFunnel, replicate, addAds, buildKitPath, expandKitMap, sources, wired, persona,
       personaId: variables.persona || meta?.personas?.[0]?.id || "",
       personas: meta?.personas || [],
       accounts: accountsQuery.data?.accounts || [],
@@ -674,7 +723,7 @@ function Canvas() {
                   <div className="v3-sub">
                     {selected.data.nodeType === "market_timeline" && "Chart node · reach and live ads. A marker emits that ad."}
                     {selected.data.nodeType === "ad_feed" && "Query the tracker. Filters stay on this node."}
-                    {selected.data.nodeType !== "market_timeline" && selected.data.nodeType !== "ad_feed" && "Keys stay in Settings. This board does not ask for them."}
+                    {selected.data.nodeType === "kit_master" ? "Source, offer, outline and progress are saved in this kit." : selected.data.nodeType !== "market_timeline" && selected.data.nodeType !== "ad_feed" && "Keys stay in Settings. This board does not ask for them."}
                   </div>
                 </div>
                 <div className="v3-tabs">
@@ -697,7 +746,10 @@ function Canvas() {
                   {pane === "config" && selected.data.nodeType === "market_timeline" && (
                     <TimelineConfig config={selected.data.config} preview={previewByType.market_timeline} />
                   )}
-                  {pane === "config" && selected.data.nodeType !== "ad_feed" && selected.data.nodeType !== "market_timeline" && (
+                  {pane === "config" && selected.data.nodeType === "kit_master" && (
+                    <p className="v3-copy">Use the kit card to attach a source, review the outline and open an editable production path when needed. Save the board to keep these choices.</p>
+                  )}
+                  {pane === "config" && selected.data.nodeType !== "kit_master" && selected.data.nodeType !== "ad_feed" && selected.data.nodeType !== "market_timeline" && (
                     <p className="v3-copy">This node takes its stage settings from the template. Connect a matching port to feed it.</p>
                   )}
                   {pane === "output" && (

@@ -84,13 +84,18 @@ class T(unittest.TestCase):
         graph["funnel"] = {"name": "VSL", "stage": "mapping", "sourceAdIds": ["rec_4c91e2"]}
         graph["nodes"].append({"id": "research", "type": "quick_link", "position": {"x": 1800, "y": 0},
                                "config": {"title": "Ad record", "url": "https://example.test/ad"}})
+        graph["nodes"].append({"id": "vsl-kit", "type": "kit_master", "position": {"x": 2100, "y": 0},
+                               "config": {"kit_id": "vsl", "source_ad_id": "rec_4c91e2",
+                                          "stages": json.dumps([["Hook", "Evidence needed"]]), "completed": "[]"}})
         self.assertNotIn("research", {s["id"] for s in compile_board(graph)})
+        self.assertNotIn("vsl-kit", {s["id"] for s in compile_board(graph)})
         from studio.db import DB
         db = DB(cfg()["_db_file"])
         db.save_board("test-funnel", "VSL", graph, preset=False)
         saved = db.board("test-funnel")["graph"]
         self.assertEqual(saved["funnel"]["sourceAdIds"], ["rec_4c91e2"])
-        self.assertEqual(saved["nodes"][-1]["config"]["url"], "https://example.test/ad")
+        self.assertEqual(saved["nodes"][-2]["config"]["url"], "https://example.test/ad")
+        self.assertEqual(saved["nodes"][-1]["config"]["source_ad_id"], "rec_4c91e2")
 
     def test_planning_handoff_wires_persist_without_becoming_run_dependencies(self):
         graph = talking_head_preset()

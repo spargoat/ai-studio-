@@ -41,6 +41,7 @@ NODES = {
     "quick_link": {"tab": "create", "kind": "canvas", "inputs": [], "outputs": []},
     "funnel_stage": {"tab": "create", "kind": "canvas", "inputs": [("flow", "flow")], "outputs": [("flow", "flow")]},
     "ad_reference": {"tab": "intel", "kind": "canvas", "inputs": [], "outputs": []},
+    "kit_master": {"tab": "create", "kind": "canvas", "inputs": [], "outputs": []},
 }
 
 # Mechanism only. No wardrobe, palette, or scene. The decode stays under these.

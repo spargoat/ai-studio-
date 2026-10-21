@@ -45,6 +45,7 @@ export const CATALOG: Record<string, NodeSpec> = {
   quick_link: { type: "quick_link", side: "create", headline: "Quick link", icon: Link2, width: 260, inputs: [], outputs: [] },
   funnel_stage: { type: "funnel_stage", side: "create", headline: "Funnel stage", icon: Workflow, width: 260, inputs: [{ id: "flow", type: "flow" }], outputs: [{ id: "flow", type: "flow" }] },
   ad_reference: { type: "ad_reference", side: "intel", headline: "Source ad", icon: Rss, width: 260, inputs: [], outputs: [] },
+  kit_master: { type: "kit_master", side: "create", headline: "Strategy kit", icon: Workflow, width: 370, inputs: [], outputs: [] },
 };
 
 export const PALETTE: { side: Side; label: string; types: string[] }[] = [
