@@ -1,4 +1,4 @@
-import { createContext, useContext, type ReactNode } from "react";
+import { createContext, useContext, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
 import { CATALOG, LONGEVITY_NOTE, PORT_COLOR, REFERENCE_LABEL, type NodeSpec } from "./catalog";
@@ -20,8 +20,18 @@ export type Artefact = {
     label?: string;
     fields?: Record<string, unknown>;
   };
-  inference?: { note?: string; longevity_note?: string; match_count?: number };
+  inference?: { note?: string; longevity_note?: string; match_count?: number; panels?: { id: string; text: string }[] };
 };
+
+type Panel = { id: string; text: string };
+type WaterAd = {
+  id?: string; headline?: string; advertiser?: string; status?: string; longevity_days?: number;
+  first_seen?: string; last_seen?: string; primary_text?: string; cta?: string;
+  media?: { type?: string }[];
+  steps?: { n?: number; kind?: string; label?: string; url?: string }[];
+};
+type PersonaOpt = { id: string; display: string; voice_name?: string };
+type AccountOpt = { advertiser: string; ads: number };
 
 export type BoardData = {
   nodeType: string;
@@ -32,6 +42,7 @@ export type BoardData = {
   est?: number | null;
   actual?: number | null;
   ran?: boolean;
+  file?: string;
 };
 
 export type StubData = { nodeType: string; followId: string; side: "source" | "target" };
@@ -41,9 +52,20 @@ export const BoardCtx = createContext<{
   toggle: (id: string) => void;
   follow: (id: string) => void;
   pickEvent: (id: string, event: { id: string; ad_id?: string }) => void;
+  setConfig: (id: string, patch: Record<string, string>) => void;
+  mapFunnel: (id: string) => void;
+  replicate: (id: string) => void;
   wired: Set<string>;
   persona: string;
-}>({ keys: {}, toggle: () => {}, follow: () => {}, pickEvent: () => {}, wired: new Set(), persona: "" });
+  personaId: string;
+  personas: PersonaOpt[];
+  accounts: AccountOpt[];
+  boardScript: string;
+}>({
+  keys: {}, toggle: () => {}, follow: () => {}, pickEvent: () => {}, setConfig: () => {},
+  mapFunnel: () => {}, replicate: () => {}, wired: new Set(), persona: "", personaId: "",
+  personas: [], accounts: [], boardScript: "",
+});
 
 function money(n: number) {
   return `$${n.toFixed(2)}`;
@@ -172,14 +194,80 @@ function FunnelSteps({ steps }: { steps: { label?: string }[] }) {
   );
 }
 
+function Panels({ artefact }: { artefact?: Artefact | null }) {
+  const evidence = (artefact?.evidence?.fields?.panels as Panel[] | undefined) || [];
+  const inference = artefact?.inference?.panels || [];
+  if (!evidence.length) return null;
+  return (
+    <div className="v3-panels">
+      {evidence.map((panel) => {
+        const guess = inference.find((row) => row.id === panel.id);
+        return (
+          <div key={panel.id} className="v3-panel">
+            <b>{panel.id}</b>
+            <div className="v3-ev"><span className="v3-ev-l">Evidence</span><p>{panel.text}</p></div>
+            <div className="v3-inf"><span className="v3-inf-l">Inference</span><p>{guess?.text || "—"}</p></div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function FeedWaterfall({ nodeId, config, ads }: { nodeId: string; config: Record<string, string>; ads: WaterAd[] }) {
+  const { setConfig, accounts } = useContext(BoardCtx);
+  const [open, setOpen] = useState<string | null>(null);
+  return (
+    <div className="nodrag nopan">
+      <label className="v3-lab">Ad account
+        <select aria-label="Ad account" className="v3-in" value={config.advertiser || ""}
+          onChange={(e) => setConfig(nodeId, { advertiser: e.target.value, ad_id: "" })}>
+          <option value="">All accounts in this read</option>
+          {accounts.map((row) => <option key={row.advertiser} value={row.advertiser}>{row.advertiser} · {row.ads}</option>)}
+        </select>
+      </label>
+      <div className="v3-fall">
+        {ads.map((ad) => {
+          const id = ad.id || ad.headline || "";
+          const media = ad.media?.[0]?.type || "media";
+          const on = config.ad_id === ad.id;
+          return (
+            <div key={id} className={`v3-ad ${on ? "is-sel" : ""}`}>
+              <button type="button" className="v3-ad-h" onClick={() => setConfig(nodeId, { ad_id: ad.id || "" })}>
+                <span className="v3-tile">{media}</span>
+                <span>
+                  <b>{ad.headline || ad.id}</b>
+                  <small>{ad.first_seen || "—"} – {ad.last_seen || "—"} · {ad.status || "—"} · {ad.longevity_days != null ? `${ad.longevity_days}d signal` : "no run length"}</small>
+                </span>
+              </button>
+              {ad.primary_text && <p className="v3-copy v3-clamp">{ad.primary_text}</p>}
+              <button type="button" className="v3-mini" onClick={() => setOpen(open === id ? null : id)}>
+                {open === id ? "Hide steps" : "Funnel steps"}
+              </button>
+              {open === id && (
+                <ol className="v3-steps">
+                  {(ad.steps || []).map((step) => <li key={`${id}-${step.n}`}>{step.n}. {step.label}{step.url ? ` · ${step.url}` : ""}</li>)}
+                  {!ad.steps?.length && <li>No steps in this read.</li>}
+                </ol>
+              )}
+            </div>
+          );
+        })}
+        {!ads.length && <p className="v3-muted">No ads for this account in the read.</p>}
+      </div>
+    </div>
+  );
+}
+
 function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
   artefact?: Artefact | null; nodeType: string; nodeId: string; selectedEvent?: string; config: Record<string, string>;
 }) {
+  const { mapFunnel, replicate } = useContext(BoardCtx);
   const evidence = artefact?.evidence;
   const fields = evidence?.fields || {};
-  const picked = (fields.picked as { headline?: string; advertiser?: string; longevity_days?: number } | undefined) || artefact?.ad;
+  const picked = (fields.picked as { headline?: string; advertiser?: string } | undefined) || artefact?.ad;
   const steps = (fields.steps as { label?: string }[] | undefined) || [];
-  const ads = (fields.ads as { headline?: string; longevity_days?: number; id?: string }[] | undefined) || [];
+  const waterfall = (fields.waterfall as WaterAd[] | undefined) || [];
   if (nodeType === "market_timeline") {
     return (
       <div className="v3-bd">
@@ -189,31 +277,32 @@ function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
       </div>
     );
   }
+  if (nodeType === "funnel_step") {
+    return (
+      <div className="v3-bd">
+        <p className="v3-copy">{config.n ? `${config.n}. ` : ""}{config.label || "Step"}</p>
+        <p className="v3-muted">{config.kind || "step"}{config.url ? ` · ${config.url}` : ""}</p>
+        <EvidenceBox evidence={evidence} />
+      </div>
+    );
+  }
   return (
     <div className="v3-bd">
-      {nodeType === "ad_feed" && (
+      {nodeType === "ad_feed" && <FeedWaterfall nodeId={nodeId} config={config} ads={waterfall} />}
+      {nodeType === "funnel_route" && (
         <>
-          <div className="v3-chips">
-            {config.status && <span className="v3-chip">{config.status}</span>}
-            {config.longevity_min && <span className="v3-chip">≥ {config.longevity_min}d</span>}
-            {config.advertiser && <span className="v3-chip">{config.advertiser}</span>}
+          <FunnelSteps steps={steps} />
+          <div className="v3-acts nodrag nopan">
+            <button type="button" className="v3-mini" onClick={() => mapFunnel(nodeId)}>Map on canvas</button>
+            <button type="button" className="v3-mini" onClick={() => replicate(nodeId)}>Replicate</button>
           </div>
-          {ads.length > 0 && (
-            <div className="v3-thumbs">
-              {ads.slice(0, 4).map((ad) => (
-                <div key={ad.id || ad.headline} className={`v3-thumb ${ad.id && ad.id === config.ad_id ? "is-sel" : ""}`}>
-                  <span>{ad.longevity_days != null ? `${ad.longevity_days}d` : "ad"}</span>
-                </div>
-              ))}
-            </div>
-          )}
         </>
       )}
-      {nodeType === "funnel_route" && <FunnelSteps steps={steps} />}
+      {(nodeType === "ad_breakdown" || nodeType === "teardown") && <Panels artefact={artefact} />}
       {nodeType === "teardown" && <p className="v3-warn">{REFERENCE_LABEL}</p>}
       {nodeType === "teardown" && artefact?.pattern_summary && <p className="v3-copy v3-clamp">{artefact.pattern_summary}</p>}
       <EvidenceBox evidence={evidence}>
-        {picked?.headline && <p className="v3-copy">{picked.advertiser ? `${picked.advertiser}: ` : ""}{picked.headline}</p>}
+        {picked?.headline && nodeType !== "ad_feed" && <p className="v3-copy">{picked.advertiser ? `${picked.advertiser}: ` : ""}{picked.headline}</p>}
       </EvidenceBox>
       <InferenceBox note={artefact?.inference?.note} />
       {nodeType === "ad_breakdown" && <p className="v3-warn">{artefact?.inference?.longevity_note || LONGEVITY_NOTE}</p>}
@@ -222,18 +311,92 @@ function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
   );
 }
 
-function CreateBody({ nodeType, persona }: { nodeType: string; persona: string }) {
+function Field({ label, children }: { label: string; children: ReactNode }) {
+  return <label className="v3-lab nodrag nopan">{label}{children}</label>;
+}
+
+function CreateBody({ id, nodeType, config, file }: { id: string; nodeType: string; config: Record<string, string>; file?: string }) {
+  const { setConfig, personas, persona, personaId, boardScript } = useContext(BoardCtx);
+  const versions = (() => { try { return JSON.parse(config.versions || "[]") as { at: string; text: string }[]; } catch { return []; } })();
+  const script = config.script ?? "";
+  const voices = personas.filter((p) => p.voice_name);
   return (
     <div className="v3-bd">
       {nodeType === "brief" && (
         <>
-          <span className="v3-pchip"><span className="v3-av" />{persona || "Persona"}</span>
-          <p className="v3-copy">Wraps the brief stage. Pattern summary stays above the decode.</p>
+          <Field label="Persona">
+            <select aria-label="Brief persona" className="v3-in" value={config.persona || personaId} onChange={(e) => setConfig(id, { persona: e.target.value })}>
+              {personas.map((p) => <option key={p.id} value={p.id}>{p.display}</option>)}
+            </select>
+          </Field>
+          <Field label="Offer"><input aria-label="Offer" className="v3-in" value={config.offer || ""} placeholder="What we are offering" onChange={(e) => setConfig(id, { offer: e.target.value })} /></Field>
+          <Field label="Angle"><input aria-label="Angle" className="v3-in" value={config.angle || ""} placeholder="Our angle, not the source line" onChange={(e) => setConfig(id, { angle: e.target.value })} /></Field>
+          <div className="v3-pair">
+            <Field label="Length">
+              <select aria-label="Length" className="v3-in" value={config.length || "30"} onChange={(e) => setConfig(id, { length: e.target.value })}>
+                {["15", "30", "45", "60"].map((n) => <option key={n} value={n}>{n}s</option>)}
+              </select>
+            </Field>
+            <Field label="Platform">
+              <select aria-label="Platform" className="v3-in" value={config.platform || "instagram"} onChange={(e) => setConfig(id, { platform: e.target.value })}>
+                {["instagram", "tiktok", "youtube"].map((n) => <option key={n} value={n}>{n}</option>)}
+              </select>
+            </Field>
+          </div>
+          <p className="v3-muted">Flows to script. Intended length. Dry run follows the script and stays $0. {persona ? `Board persona ${persona}.` : ""}</p>
         </>
       )}
-      {nodeType === "script" && <p className="v3-copy">Wraps the script stage. Dry run writes [MOCK] copy.</p>}
-      {nodeType === "voice" && <p className="v3-copy">Wraps the voice stage. Dry run is silent audio, $0.</p>}
-      {nodeType === "video" && <p className="v3-copy">Wraps the video stage. Dry run is a placeholder, $0.</p>}
+      {nodeType === "script" && (
+        <>
+          <Field label="Script">
+            <textarea aria-label="Script" className="v3-in v3-area" value={script || boardScript} onChange={(e) => setConfig(id, { script: e.target.value })} />
+          </Field>
+          <button type="button" className="nodrag nopan v3-mini" onClick={() => {
+            const text = (config.script || boardScript || "").trim();
+            if (!text) return;
+            const next = [{ at: new Date().toISOString().slice(0, 16), text }, ...versions].slice(0, 8);
+            setConfig(id, { script: text, versions: JSON.stringify(next) });
+          }}>Save version</button>
+          {versions.length > 0 && (
+            <ul className="v3-vers">
+              {versions.map((row, i) => (
+                <li key={`${row.at}-${i}`}><button type="button" onClick={() => setConfig(id, { script: row.text })}>{row.at} · {row.text.slice(0, 42)}</button></li>
+              ))}
+            </ul>
+          )}
+          <p className="v3-muted">The saved line is what voice reads. Dry run keeps it and marks mock beats. $0.</p>
+        </>
+      )}
+      {nodeType === "voice" && (
+        <>
+          <Field label="Voice">
+            <select aria-label="Voice" className="v3-in" value={config.voice || ""} onChange={(e) => setConfig(id, { voice: e.target.value })}>
+              <option value="">Persona voice</option>
+              {voices.map((p) => <option key={p.id} value={p.voice_name}>{p.voice_name} · {p.display}</option>)}
+            </select>
+          </Field>
+          {file && <audio className="nodrag nopan v3-audio" controls src={file} />}
+          <p className="v3-muted">Dry run plays a tone, not this voice. The chosen voice id still flows to the stage. $0.</p>
+        </>
+      )}
+      {nodeType === "video" && (
+        <>
+          <Field label="Format">
+            <select aria-label="Format" className="v3-in" value={config.format || "talking_head"} onChange={(e) => setConfig(id, { format: e.target.value })}>
+              <option value="talking_head">Talking head</option>
+            </select>
+          </Field>
+          <Field label="Aspect">
+            <select aria-label="Aspect" className="v3-in" value={config.aspect || "9:16"} onChange={(e) => setConfig(id, { aspect: e.target.value })}>
+              <option value="9:16">9:16</option>
+              <option value="1:1">1:1</option>
+              <option value="16:9">16:9</option>
+            </select>
+          </Field>
+          <p className="v3-muted">Aspect flows to the video stage. Dry run is a placeholder frame. $0.</p>
+        </>
+      )}
+      {nodeType === "landing" && <p className="v3-copy">Our outline: hook, mechanism, next step. Not the source page. Dry run, $0.</p>}
     </div>
   );
 }
@@ -260,7 +423,7 @@ function Handles({ spec, id }: { spec: NodeSpec; id: string }) {
 }
 
 export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "board">>) {
-  const { keys, toggle, persona } = useContext(BoardCtx);
+  const { keys, toggle } = useContext(BoardCtx);
   const spec = CATALOG[data.nodeType];
   if (!spec) return null;
   const Icon = spec.icon;
@@ -295,7 +458,7 @@ export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "boa
         )}
         {intel
           ? <IntelBody artefact={data.preview} nodeType={data.nodeType} nodeId={id} selectedEvent={data.config.event_id} config={data.config} />
-          : <CreateBody nodeType={data.nodeType} persona={persona} />}
+          : <CreateBody id={id} nodeType={data.nodeType} config={data.config} file={data.file} />}
         <footer className="v3-ft">
           <span className={`v3-st ${statusClass(status)}`}>{status}</span>
           <span className="v3-cost v3-mono" title={data.ran ? `actual ${cost}` : `estimate ${cost}`}>{data.ran ? cost : cost}</span>

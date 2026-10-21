@@ -1,6 +1,6 @@
 import { useLocation, useNavigate } from "react-router-dom";
 import {
-  ClipboardList, Library, Users, Settings, DollarSign, Workflow, LucideIcon,
+  ClipboardList, Library, Settings, DollarSign, Workflow, LucideIcon,
 } from "lucide-react";
 
 interface NavItem { path: string; icon: LucideIcon; label: string }
@@ -10,7 +10,6 @@ const NAV: NavItem[] = [
   { path: "/library", icon: Library, label: "Library" },
   { path: "/jobs", icon: ClipboardList, label: "Runs" },
   { path: "/spend", icon: DollarSign, label: "Spend" },
-  { path: "/personas", icon: Users, label: "Personas" },
 ];
 
 export default function Sidebar({ onNavigate }: { onNavigate?: () => void }) {

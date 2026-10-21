@@ -17,7 +17,7 @@ function overlaps(x: number, y: number, size: { width: number; height: number },
     y < n.y + n.height + GAP && y + size.height + GAP > n.y);
 }
 
-/** Drop point when it is free; otherwise the nearest open cell on the same tab. */
+/** Drop point when it is free anywhere on the canvas; otherwise the nearest open cell. No zone fence. */
 export function placeNode(occupied: Box[], desired: { x: number; y: number }, size: { width: number; height: number }) {
   const x0 = Math.round(desired.x);
   const y0 = Math.round(desired.y);
@@ -48,7 +48,7 @@ export function applyConnection(
     return { edges, ok: false, message: "Drop the wire on a coloured port." };
   }
   if (!ctx.hasNode(c.source) || !ctx.hasNode(c.target)) {
-    return { edges, ok: false, message: "That node is on the other tab. Open it and connect the port there." };
+    return { edges, ok: false, message: "That block is hidden by the category filter. Switch to Both to connect it." };
   }
   const outType = ctx.port(c.source, "out", c.sourceHandle);
   const inType = ctx.port(c.target, "in", c.targetHandle);

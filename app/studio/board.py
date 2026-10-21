@@ -21,10 +21,15 @@ NODES = {
                  "inputs": [("ad", "ad"), ("page", "page")], "outputs": [("brief", "brief")]},
     "market_timeline": {"tab": "intel", "kind": "intel", "task": "timeline",
                         "inputs": [], "outputs": [("ad", "ad")]},
+    "funnel_step": {"tab": "intel", "kind": "intel", "task": "step",
+                    "inputs": [("step", "step")], "outputs": [("step", "step"), ("page", "page")]},
     "brief": {"tab": "create", "kind": "stage", "template": "talking_head", "stage_id": "brief",
-              "inputs": [("brief", "brief")], "outputs": [("brief", "brief")]},
+              "inputs": [("brief", "brief"), ("source", "step")], "outputs": [("brief", "brief")]},
+    "landing": {"tab": "create", "kind": "intel", "task": "landing",
+                "inputs": [("brief", "brief"), ("source", "step")], "outputs": [("page", "page")]},
     "script": {"tab": "create", "kind": "stage", "template": "talking_head_scripted", "stage_id": "script",
-               "needs_key": "llm", "inputs": [("brief", "brief")], "outputs": [("script", "script"), ("hooks", "hooks")]},
+               "needs_key": "llm", "inputs": [("brief", "brief"), ("source", "step")],
+               "outputs": [("script", "script"), ("hooks", "hooks")]},
     "voice": {"tab": "create", "kind": "stage", "template": "talking_head", "stage_id": "voice",
               "needs_key": "elevenlabs", "inputs": [("script", "script")], "outputs": [("audio", "audio")]},
     "video": {"tab": "create", "kind": "stage", "template": "talking_head", "stage_id": "video",
@@ -187,28 +192,63 @@ def compile_board(graph):
                     if edge.get("targetHandle") == "still":
                         stage.setdefault("input_alias", {})["still"] = edge["source"]
             params = stage.get("params") or {}
-            if node.get("config", {}).get("framework"):
-                params["framework"] = node["config"]["framework"]
+            cfg = node.get("config") or {}
+            if cfg.get("framework"):
+                params["framework"] = cfg["framework"]
+            if node["type"] == "video":
+                if cfg.get("aspect"):
+                    params["aspect"] = cfg["aspect"]
+                if cfg.get("format"):
+                    params["format"] = cfg["format"]
             stage["params"] = params
         stages.append(stage)
     return stages
 
 
+def _enabled(graph, node_type):
+    return next((n for n in (graph.get("nodes") or []) if n.get("type") == node_type and n.get("enabled", True)), None)
+
+
 def job_brief(graph, stages, job_id=None):
+    """Create-block fields win over the board variables when the block has a value."""
     variables = graph.get("variables") or {}
+    brief_cfg = (_enabled(graph, "brief") or {}).get("config") or {}
+    script_cfg = (_enabled(graph, "script") or {}).get("config") or {}
+    voice_cfg = (_enabled(graph, "voice") or {}).get("config") or {}
+    video_cfg = (_enabled(graph, "video") or {}).get("config") or {}
+    script = (script_cfg.get("script") or "").strip() or variables.get("script") or ""
+    offer = brief_cfg.get("offer") or variables.get("offer") or ""
+    angle = brief_cfg.get("angle") or ""
     return {
         "id": job_id,
-        "persona": variables.get("persona") or "marco",
+        "persona": brief_cfg.get("persona") or variables.get("persona") or "marco",
         "template": "talking_head",
-        "script": variables.get("script") or "",
+        "script": script,
         "setting": variables.get("setting") or "a bright, lived-in room",
-        "topic": variables.get("topic") or variables.get("offer") or "the offer",
+        "topic": angle or variables.get("topic") or offer or "the offer",
         "headline": variables.get("headline") or "",
         "cta": variables.get("cta") or "",
+        "offer": offer,
+        "angle": angle,
+        "length": brief_cfg.get("length") or "30",
+        "platform": brief_cfg.get("platform") or "instagram",
+        "voice_name": voice_cfg.get("voice") or "",
+        "aspect": video_cfg.get("aspect") or "9:16",
+        "format": video_cfg.get("format") or "talking_head",
         "board_id": graph.get("id"),
         "board_stages": stages,
         "variables": variables,
     }
+
+
+def resolve_voice_id(personas, persona, voice_name):
+    """A voiceover block's voice name picks that voice. Otherwise the persona's own voice."""
+    wanted = (voice_name or "").strip().lower()
+    if wanted:
+        for row in (personas or {}).values():
+            if (row.get("voice_name") or "").strip().lower() == wanted and row.get("voice_id"):
+                return row["voice_id"]
+    return ((personas or {}).get(persona) or {}).get("voice_id")
 
 
 def _evidence(pack, fields):
@@ -234,13 +274,50 @@ def _observed_ad(ad):
                                    "primary_text", "headline", "cta", "media", "landing_url", "creative_family", "platforms")}
 
 
+def _panels(ad):
+    """Six cards. Evidence is what the record states. Inference is our reading, kept in its own list."""
+    ad = ad or {}
+    media = ad.get("media") if isinstance(ad.get("media"), list) and ad.get("media") else [{}]
+    kind = (media[0] or {}).get("type") or "unknown"
+    family = ad.get("creative_family") or ""
+    pattern = PATTERNS.get(family) or DEFAULT_PATTERN
+    days = ad.get("longevity_days")
+    platforms = ", ".join(ad.get("platforms") or []) or "platform not recorded"
+    evidence = [
+        {"id": "hook", "text": ad.get("headline") or "Not stated in the record."},
+        {"id": "angle", "text": family or "No creative family on the record."},
+        {"id": "offer", "text": "No offer, price, or promise is in the public record."},
+        {"id": "proof", "text": f"{days} days on the record. {LONGEVITY_NOTE}" if days is not None else "No run length on the record."},
+        {"id": "cta", "text": ad.get("cta") or "No call to action on the record."},
+        {"id": "format", "text": f"{kind} · {platforms}"},
+    ]
+    inference = [
+        {"id": "hook", "text": pattern["decode"]},
+        {"id": "angle", "text": pattern["pattern_summary"]},
+        {"id": "offer", "text": "Do not invent an offer from the mechanism."},
+        {"id": "proof", "text": "Run length is not proof the ad worked."},
+        {"id": "cta", "text": "The button text is the only observed next step."},
+        {"id": "format", "text": "Format is the media type on the record, not a production spec."},
+    ]
+    return evidence, inference
+
+
+def _waterfall(ads):
+    rows = []
+    for ad in (ads or [])[:8]:
+        route = funnel_for(ad["id"])
+        rows.append({**_observed_ad(ad), "steps": route.get("steps") or [], "landing_page": route.get("landing_page") or {}})
+    return rows
+
+
 def feed_artefact(config):
     pack = query_ads(config or {})
     chosen = _pick_ad(pack, (config or {}).get("ad_id"))
     return {
         "type": "ad",
         "ad": chosen,
-        "evidence": _evidence(pack, {"ads": [_observed_ad(a) for a in pack["ads"]], "picked": _observed_ad(chosen)}),
+        "evidence": _evidence(pack, {"ads": [_observed_ad(a) for a in pack["ads"]], "picked": _observed_ad(chosen),
+                                     "waterfall": _waterfall(pack["ads"])}),
         "inference": {"note": "Picking one ad out of the query is our choice, not a tracker field.",
                       "match_count": len(pack["ads"]), "picked_id": (chosen or {}).get("id")},
     }
@@ -274,12 +351,14 @@ def breakdown_artefact(ad_blob):
     # A fresh read so this node's source and data-as-of are its own, not copied off the wire.
     probe = query_ads({"advertiser": (ad or {}).get("advertiser")}) if ad else query_ads({})
     fields = _observed_ad(ad)
+    evidence_panels, inference_panels = _panels(ad)
+    fields["panels"] = evidence_panels
     return {
         "type": "ad",
         "ad": ad,
         "evidence": _evidence(probe, fields),
         "inference": {"note": "Family is the tracker's own grouping, copied into evidence. What we make of the run length is not.",
-                      "longevity_note": LONGEVITY_NOTE},
+                      "longevity_note": LONGEVITY_NOTE, "panels": inference_panels},
     }
 
 
@@ -304,6 +383,7 @@ def teardown_artefact(ad_blob, page_blob):
     page = None
     if isinstance(page_blob, dict):
         page = (page_blob.get("evidence") or {}).get("fields") or page_blob.get("page")
+    evidence_panels, inference_panels = _panels(ad)
     return {
         "type": "brief",
         "pattern_summary": pattern["pattern_summary"],
@@ -311,9 +391,10 @@ def teardown_artefact(ad_blob, page_blob):
         "decode": pattern["decode"],
         "label": REFERENCE_LABEL,
         "ad": _observed_ad(ad) if ad else None,
-        "evidence": _evidence(probe, {"ad": _observed_ad(ad) if ad else None, "funnel": page}),
+        "evidence": _evidence(probe, {"ad": _observed_ad(ad) if ad else None, "funnel": page, "panels": evidence_panels}),
         "inference": {"note": "Pattern summary and interpretation are ours. The decode is the source, kept below them as reference.",
-                      "pattern_summary": pattern["pattern_summary"], "interpretation": pattern["interpretation"]},
+                      "pattern_summary": pattern["pattern_summary"], "interpretation": pattern["interpretation"],
+                      "panels": inference_panels},
     }
 
 
@@ -335,6 +416,37 @@ def timeline_artefact(config):
     }
 
 
+def step_artefact(config):
+    config = config or {}
+    return {
+        "type": "step",
+        "page": {"url": config.get("url") or "", "title": config.get("label") or ""},
+        "evidence": {"source": "board", "origin": "copy", "live": False,
+                     "label": "Copied from the funnel read onto the canvas",
+                     "data_as_of": config.get("data_as_of") or "",
+                     "fields": {k: config.get(k) for k in ("n", "kind", "label", "url", "ad_id")}},
+        "inference": {"note": "Placing the step on the canvas does not add a reading."},
+    }
+
+
+def landing_artefact(config, inputs):
+    brief = {}
+    for blob in (inputs or {}).values():
+        if isinstance(blob, dict) and isinstance(blob.get("brief"), dict):
+            brief = blob["brief"]
+            break
+    offer = (config or {}).get("offer") or brief.get("offer") or ""
+    angle = (config or {}).get("angle") or brief.get("angle") or ""
+    return {
+        "type": "page",
+        "page": {"title": "Landing outline", "url": ""},
+        "evidence": {"source": "board", "origin": "local", "live": False,
+                     "label": "Our outline, not a tracker page", "data_as_of": "",
+                     "fields": {"offer": offer, "angle": angle, "sections": ["hook", "mechanism", "next step"]}},
+        "inference": {"note": "The section list is our scaffold. It is not the source landing page."},
+    }
+
+
 def intel_artefact(sdef, inputs):
     task = sdef.get("task")
     try:
@@ -348,6 +460,10 @@ def intel_artefact(sdef, inputs):
             return teardown_artefact(_blob_for(inputs, sdef, "ad"), _blob_for(inputs, sdef, "page"))
         if task == "timeline":
             return timeline_artefact(sdef.get("params") or {})
+        if task == "step":
+            return step_artefact(sdef.get("params") or {})
+        if task == "landing":
+            return landing_artefact(sdef.get("params") or {}, inputs)
     except AdIntelError:
         raise
     raise BoardError(f"unknown intel task {task}")
@@ -417,11 +533,18 @@ _V3_DRAFT_POSITIONS = {
     "ad_breakdown": (36, 800), "teardown": (300, 800),
     "brief": (760, 40), "script": (760, 300), "voice": (1020, 40), "video": (1020, 320),
 }
+# The first v3 column fit short cards. Deeper blocks need the rows further apart.
+_V3_TIGHT = {
+    "timeline": (24, 20), "ad_feed": (24, 420), "funnel": (24, 780),
+    "ad_breakdown": (24, 1050), "teardown": (292, 1050),
+    "brief": (620, 20), "script": (620, 220),
+    "voice": (880, 20), "video": (880, 230),
+}
 _V3_POSITIONS = {
-    "timeline": {"x": 24, "y": 20}, "ad_feed": {"x": 24, "y": 420}, "funnel": {"x": 24, "y": 780},
-    "ad_breakdown": {"x": 24, "y": 1050}, "teardown": {"x": 292, "y": 1050},
-    "brief": {"x": 620, "y": 20}, "script": {"x": 620, "y": 220},
-    "voice": {"x": 880, "y": 20}, "video": {"x": 880, "y": 230},
+    "timeline": {"x": 24, "y": 20}, "ad_feed": {"x": 24, "y": 460}, "funnel": {"x": 24, "y": 1020},
+    "ad_breakdown": {"x": 24, "y": 1400}, "teardown": {"x": 340, "y": 1400},
+    "brief": {"x": 720, "y": 20}, "script": {"x": 720, "y": 460},
+    "voice": {"x": 1020, "y": 20}, "video": {"x": 1020, "y": 460},
 }
 
 
@@ -447,7 +570,7 @@ def migrate_talking_head_layout(graph):
                 return False
         return True
 
-    if not any(matches(layout) for layout in (_SLICE1_POSITIONS, _V3_DRAFT_POSITIONS)):
+    if not any(matches(layout) for layout in (_SLICE1_POSITIONS, _V3_DRAFT_POSITIONS, _V3_TIGHT)):
         return None
     moved = copy.deepcopy(graph)
     for node in moved["nodes"]:

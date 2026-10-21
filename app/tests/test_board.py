@@ -371,6 +371,112 @@ class T(unittest.TestCase):
             self.assertEqual(calls, ["doctor"])
             self.assertIn("doctor", overview.get_json())
 
+    def test_account_waterfall_keeps_evidence_and_inference_apart(self):
+        from studio.adintel import accounts
+        from studio.board import feed_artefact
+        pack = accounts()
+        self.assertEqual(pack["origin"], "fixture")
+        self.assertFalse(pack["live"])
+        north = next(row for row in pack["accounts"] if row["advertiser"] == "Northline Markets")
+        self.assertGreaterEqual(north["ads"], 3)
+        art = feed_artefact({"advertiser": "Northline Markets", "status": "live"})
+        rows = art["evidence"]["fields"]["waterfall"]
+        self.assertGreaterEqual(len(rows), 2)
+        self.assertTrue(all(row["steps"] and row["headline"] for row in rows))
+        self.assertNotIn("waterfall", art["inference"])
+        preview = preview_pack({"advertiser": "Northline Markets", "status": "live", "ad_id": "rec_4c91e2",
+                                "event_id": "ev_launch_northline"})
+        evidence = preview["breakdown"]["evidence"]["fields"]["panels"]
+        inference = preview["breakdown"]["inference"]["panels"]
+        self.assertEqual([p["id"] for p in evidence], ["hook", "angle", "offer", "proof", "cta", "format"])
+        self.assertEqual([p["id"] for p in inference], [p["id"] for p in evidence])
+        self.assertIn("No offer", evidence[2]["text"])
+        self.assertNotEqual(evidence[0]["text"], inference[0]["text"])
+        self.assertEqual([p["id"] for p in preview["teardown"]["evidence"]["fields"]["panels"]], [p["id"] for p in evidence])
+
+    def test_create_fields_flow_into_the_brief(self):
+        from studio.board import job_brief, resolve_voice_id
+        graph = talking_head_preset()
+        for node in graph["nodes"]:
+            if node["type"] == "brief":
+                node["config"] = {"persona": "maksim", "offer": "a written stop", "angle": "name the invalidation",
+                                  "length": "15", "platform": "tiktok"}
+            elif node["type"] == "script":
+                node["config"] = {"script": "Stop first.", "framework": "PAS"}
+            elif node["type"] == "voice":
+                node["config"] = {"voice": "Brian"}
+            elif node["type"] == "video":
+                node["config"] = {"aspect": "1:1", "format": "talking_head"}
+        stages = compile_board(graph)
+        brief = job_brief(graph, stages, "job")
+        self.assertEqual(brief["persona"], "maksim")
+        self.assertEqual(brief["script"], "Stop first.")
+        self.assertEqual(brief["offer"], "a written stop")
+        self.assertEqual(brief["length"], "15")
+        self.assertEqual(brief["aspect"], "1:1")
+        video = next(stage for stage in stages if stage["id"] == "video")
+        self.assertEqual(video["params"].get("aspect"), "1:1")
+        personas = load_config()["_personas"]
+        self.assertEqual(resolve_voice_id(personas, "maksim", "Brian"), personas["marco"]["voice_id"])
+        self.assertEqual(resolve_voice_id(personas, "marco", ""), personas["marco"]["voice_id"])
+
+    def test_replicate_chain_compiles(self):
+        graph = {"nodes": [
+            {"id": "s1", "type": "funnel_step", "enabled": True, "config": {"n": "1", "kind": "ad", "label": "In-feed video"}},
+            {"id": "s2", "type": "funnel_step", "enabled": True, "config": {"n": "2", "kind": "landing", "label": "Page"}},
+            {"id": "brief", "type": "brief", "enabled": True, "config": {}},
+            {"id": "landing", "type": "landing", "enabled": True, "config": {}},
+        ], "edges": [
+            {"id": "a", "source": "s1", "sourceHandle": "step", "target": "s2", "targetHandle": "step"},
+            {"id": "b", "source": "s1", "sourceHandle": "step", "target": "brief", "targetHandle": "source"},
+            {"id": "c", "source": "brief", "sourceHandle": "brief", "target": "landing", "targetHandle": "brief"},
+            {"id": "d", "source": "s2", "sourceHandle": "step", "target": "landing", "targetHandle": "source"},
+        ]}
+        stages = {stage["id"]: stage for stage in compile_board(graph)}
+        self.assertEqual(stages["landing"]["task"], "landing")
+        self.assertIn("brief", stages["landing"]["needs"])
+        self.assertEqual(stages["s1"]["task"], "step")
+
+    def test_purpose_name_is_what_export_writes(self):
+        from studio.db import DB
+        from studio.export import export
+        from studio import library
+        from studio.names import purpose_name
+        self.assertEqual(purpose_name("Marco Sterling", "compose", 2), "Marco Sterling – VSL v2 – 9x16 HD")
+        root = TMP / "purpose"
+        src = root / "job" / "compose" / "v2" / "out.mp4"
+        src.parent.mkdir(parents=True)
+        src.write_bytes(b"dry")
+        db = DB(TMP / "purpose.db")
+        library.ensure(db)
+        db.x("""INSERT INTO library (stage_run_id, job_id, stage, version, persona, template, mode, path, reason, added_at)
+                VALUES (1, 'job', 'compose', 2, 'marco', 'talking_head', 'dry', ?, 'test', '2026-10-21')""", (str(src),))
+        man, zipped = export(db, root / "bundle", ids=[1], zip_it=False)
+        self.assertIsNone(zipped)
+        item = man["items"][0]
+        self.assertEqual(item["library_id"], 1)
+        self.assertEqual(item["purpose"], "Marco Sterling – VSL v2 – 9x16 HD")
+        folder = root / "bundle" / "Marco Sterling – VSL v2 – 9x16 HD"
+        self.assertTrue(folder.is_dir(), item)
+        self.assertTrue((folder / "Marco Sterling – VSL v2 – 9x16 HD.mp4").is_file())
+
+    def test_spend_and_accounts_do_not_invent_live_numbers(self):
+        app = create_app(cfg(), live=False)
+        client = app.test_client()
+        spend = client.get("/api/spend").get_json()
+        self.assertEqual(spend["forecast"]["month"], 0)
+        self.assertEqual(spend["higgsfield_fallback"], [])
+        self.assertEqual(spend["top_apis"], [])
+        self.assertIn("No live calls", spend["forecast"]["note"])
+        accounts = client.get("/api/intel/accounts").get_json()
+        self.assertEqual(accounts["origin"], "fixture")
+        self.assertTrue(accounts["accounts"])
+        pending = client.get("/api/library/pending")
+        self.assertEqual(pending.status_code, 200)
+        for row in pending.get_json():
+            self.assertIn("purpose", row)
+            self.assertEqual(row["library_id"], row["id"])
+
 
 def _stage_run(job, sid):
     for stage in job["stages"]:

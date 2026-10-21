@@ -1,5 +1,5 @@
 // Pattern from AMN Production OS router.tsx: MainLayout + lazy pages. Canvas/billing/admin/auth routes dropped.
-import { createBrowserRouter } from "react-router-dom";
+import { createBrowserRouter, Navigate } from "react-router-dom";
 import { lazy, Suspense } from "react";
 import MainLayout from "./layouts/MainLayout";
 
@@ -9,7 +9,6 @@ const Jobs = lazy(() => import("./pages/RunLogPage"));
 const JobDetail = lazy(() => import("./pages/JobDetailPage"));
 const LibraryPage = lazy(() => import("./pages/LibraryPage"));
 const ExportPage = lazy(() => import("./pages/ExportPage"));
-const Personas = lazy(() => import("./pages/PersonasPage"));
 const Settings = lazy(() => import("./pages/SettingsPage"));
 const Spend = lazy(() => import("./pages/SpendPage"));
 const Board = lazy(() => import("./pages/BoardPage"));
@@ -26,7 +25,7 @@ export const router = createBrowserRouter([{ element: <MainLayout />, children: 
   { path: "/jobs/:id", element: <Wrap><JobDetail /></Wrap> },
   { path: "/library", element: <Wrap><LibraryPage /></Wrap> },
   { path: "/export", element: <Wrap><ExportPage /></Wrap> },
-  { path: "/personas", element: <Wrap><Personas /></Wrap> },
+  { path: "/personas", element: <Navigate to="/library?tab=personas" replace /> },
   { path: "/settings", element: <Wrap><Settings /></Wrap> },
   { path: "/spend", element: <Wrap><Spend /></Wrap> },
 ] }]);

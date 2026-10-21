@@ -1,12 +1,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
-  ReactFlow, ReactFlowProvider, Background, Controls, ViewportPortal, applyNodeChanges, applyEdgeChanges,
+  ReactFlow, ReactFlowProvider, Background, Controls, applyNodeChanges, applyEdgeChanges,
   useReactFlow, type Connection, type Edge, type Node, type NodeChange, type EdgeChange, type OnConnect, type FinalConnectionState,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { Hash, Play, Copy, Save } from "lucide-react";
-import { api } from "../lib/api";
+import { api, fileUrl } from "../lib/api";
 import { toast } from "../components/Toast";
 import { CATALOG, PALETTE, PORT_COLOR, portType, type Side } from "../board/catalog";
 import { applyConnection, placeNode, type Box } from "../board/graph";
@@ -71,34 +71,6 @@ function nodeBox(n: FlowNode): Box {
   };
 }
 
-function ZoneBoxes({ nodes, lens, fixture }: { nodes: FlowNode[]; lens: Lens; fixture: boolean }) {
-  const sides: Side[] = lens === "both" ? ["intel", "create"] : [lens];
-  return (
-    <ViewportPortal>
-      {sides.map((side) => {
-        const list = nodes.filter((n) => CATALOG[n.data.nodeType]?.side === side);
-        if (!list.length) return null;
-        let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-        for (const n of list) {
-          const box = nodeBox(n);
-          minX = Math.min(minX, box.x); minY = Math.min(minY, box.y);
-          maxX = Math.max(maxX, box.x + box.width); maxY = Math.max(maxY, box.y + box.height);
-        }
-        const pad = 36;
-        return (
-          <div key={side} className="v3-zone" style={{ left: minX - pad, top: minY - 28, width: maxX - minX + pad * 2, height: maxY - minY + pad + 28 }}>
-            <div className="v3-zl">
-              <i style={{ background: side === "intel" ? "#5ab0ff" : "#7c6cff" }} />
-              {side === "intel" ? (fixture ? "INTEL · FIXTURE" : "INTEL · LIVE ANALYTICS") : "CREATE · PRODUCTION PIPELINE"}
-              <span>{side === "intel" ? (fixture ? "recorded sample · not a live read" : "read-only · ads-tracker") : "dry run"}</span>
-            </div>
-          </div>
-        );
-      })}
-    </ViewportPortal>
-  );
-}
-
 function Canvas() {
   const qc = useQueryClient();
   const { screenToFlowPosition, fitView } = useReactFlow();
@@ -149,6 +121,7 @@ function Canvas() {
     enabled: nodes.length > 0,
   });
   const preview = previewQuery.data || board?.preview || null;
+  const accountsQuery = useQuery({ queryKey: ["intel-accounts"], queryFn: () => api<any>("/api/intel/accounts") });
   const { data: job } = useQuery({
     queryKey: ["job", jobId],
     queryFn: () => api<any>(`/api/jobs/${jobId}`),
@@ -196,6 +169,110 @@ function Canvas() {
     }));
     setPane("config");
   }, []);
+  const setConfig = useCallback((id: string, patch: Record<string, string>) => {
+    setNodes((ns) => ns.map((n) => n.id === id ? { ...n, data: { ...n.data, config: { ...n.data.config, ...patch } } } : n));
+  }, []);
+  const funnelSteps = useCallback(() => {
+    const fields = (preview?.funnel?.evidence?.fields || {}) as { steps?: { n?: number; kind?: string; label?: string; url?: string }[]; ad_id?: string };
+    return { steps: fields.steps || [], adId: fields.ad_id || "", asOf: preview?.funnel?.evidence?.data_as_of || "" };
+  }, [preview]);
+  const mapFunnel = useCallback((funnelId: string) => {
+    const { steps, adId, asOf } = funnelSteps();
+    if (!steps.length) { toast.error("No public steps in this read."); return; }
+    setTab("both");
+    setNodes((ns) => {
+      const funnel = ns.find((n) => n.id === funnelId);
+      if (!funnel) return ns;
+      const next = [...ns];
+      steps.forEach((step, i) => {
+        const id = `step-${funnelId}-${step.n || i + 1}`;
+        if (next.some((n) => n.id === id)) return;
+        const spec = CATALOG.funnel_step;
+        next.push({
+          id, type: "board",
+          position: placeNode(next.map(nodeBox), { x: funnel.position.x + 480 + i * (spec.width + 36), y: funnel.position.y }, { width: spec.width, height: 180 }),
+          data: { nodeType: "funnel_step", enabled: true, config: {
+            n: String(step.n || i + 1), kind: step.kind || "", label: step.label || "", url: step.url || "", ad_id: adId, data_as_of: asOf,
+          } },
+        });
+      });
+      return next;
+    });
+    setEdges((es) => {
+      const add = [...es];
+      steps.forEach((step, i) => {
+        if (i === 0) return;
+        const source = `step-${funnelId}-${steps[i - 1].n || i}`;
+        const target = `step-${funnelId}-${step.n || i + 1}`;
+        const id = `e-${source}-step-${target}-step`;
+        if (!add.some((e) => e.id === id)) add.push({ id, source, target, sourceHandle: "step", targetHandle: "step" });
+      });
+      return add;
+    });
+    toast.success("Public funnel mapped on the canvas");
+  }, [funnelSteps]);
+  const replicate = useCallback((funnelId: string) => {
+    const { steps, adId, asOf } = funnelSteps();
+    if (!steps.length) { toast.error("No public steps in this read."); return; }
+    setTab("both");
+    const ad = steps.find((s) => s.kind === "ad") || steps[0];
+    const click = steps.find((s) => s.kind === "click");
+    const land = steps.find((s) => s.kind === "landing") || steps[steps.length - 1];
+    const briefId = `rep-${funnelId}-brief`;
+    const scriptId = `rep-${funnelId}-script`;
+    const voiceId = `rep-${funnelId}-voice`;
+    const videoId = `rep-${funnelId}-video`;
+    const landingId = `rep-${funnelId}-landing`;
+    setNodes((ns) => {
+      const funnel = ns.find((n) => n.id === funnelId);
+      if (!funnel) return ns;
+      const next = [...ns];
+      const ensure = (id: string, nodeType: string, at: { x: number; y: number }, config: Record<string, string>) => {
+        if (next.some((n) => n.id === id)) return;
+        const spec = CATALOG[nodeType];
+        next.push({
+          id, type: "board",
+          position: placeNode(next.map(nodeBox), at, { width: spec.width, height: 220 }),
+          data: { nodeType, enabled: true, config },
+        });
+      };
+      steps.forEach((step, i) => ensure(`step-${funnelId}-${step.n || i + 1}`, "funnel_step",
+        { x: funnel.position.x + 480 + i * 236, y: funnel.position.y },
+        { n: String(step.n || i + 1), kind: step.kind || "", label: step.label || "", url: step.url || "", ad_id: adId, data_as_of: asOf }));
+      const y = funnel.position.y + 320;
+      const x = funnel.position.x + 480;
+      ensure(briefId, "brief", { x, y }, {
+        persona: variables.persona || "", offer: variables.offer || "", angle: "", length: "30", platform: "instagram",
+      });
+      ensure(scriptId, "script", { x: x + 300, y }, { script: variables.script || "" });
+      ensure(voiceId, "voice", { x: x + 600, y }, {});
+      ensure(videoId, "video", { x: x + 900, y }, { format: "talking_head", aspect: "9:16" });
+      ensure(landingId, "landing", { x: x + 300, y: y + 300 }, {});
+      return next;
+    });
+    setEdges((es) => {
+      const add = [...es];
+      const link = (source: string, sourceHandle: string, target: string, targetHandle: string) => {
+        const id = `e-${source}-${sourceHandle}-${target}-${targetHandle}`;
+        if (!add.some((e) => e.target === target && e.targetHandle === targetHandle)) {
+          add.push({ id, source, target, sourceHandle, targetHandle });
+        }
+      };
+      steps.forEach((step, i) => {
+        if (i === 0) return;
+        link(`step-${funnelId}-${steps[i - 1].n || i}`, "step", `step-${funnelId}-${step.n || i + 1}`, "step");
+      });
+      link(`step-${funnelId}-${ad.n || 1}`, "step", briefId, "source");
+      link(briefId, "brief", scriptId, "brief");
+      if (click) link(`step-${funnelId}-${click.n}`, "step", scriptId, "source");
+      link(scriptId, "script", voiceId, "script");
+      link(voiceId, "audio", videoId, "audio");
+      link(briefId, "brief", landingId, "brief");
+      link(`step-${funnelId}-${land.n || steps.length}`, "step", landingId, "source");
+      return add;
+    });
+    toast.success("Our funnel is scaffolded under the public steps");
+  }, [funnelSteps, variables]);
 
   const previewByType: Record<string, Artefact | null> = {
     ad_feed: preview?.feed, ad_breakdown: preview?.breakdown, funnel_route: preview?.funnel,
@@ -212,7 +289,9 @@ function Canvas() {
     const selectedId = nodes.find((n) => n.selected)?.id;
     const paint = (n: FlowNode): FlowNode => {
       const sv = stageView(stages[n.id], job?.job?.status);
-      return { ...n, data: { ...n.data, preview: previewByType[n.data.nodeType] || null, status: sv.status, est: estimates[n.id] ?? 0, actual: sv.actual, ran: sv.ran } };
+      const runs = stages[n.id]?.runs || [];
+      const path = [...runs].reverse().find((r) => r.output_path)?.output_path;
+      return { ...n, data: { ...n.data, preview: previewByType[n.data.nodeType] || null, status: sv.status, est: estimates[n.id] ?? 0, actual: sv.actual, ran: sv.ran, file: path ? fileUrl(path) : "" } };
     };
     for (const edge of edges) {
       const srcIn = ids.has(edge.source);
@@ -277,7 +356,7 @@ function Canvas() {
     if (state.isValid !== false) return;
     const toId = state.toHandle?.nodeId;
     if (!toId || !nodes.some((n) => n.id === toId)) {
-      toast.error(toId ? "That node is on the other tab. Open it and connect the port there." : "Drop the wire on a coloured port.");
+      toast.error(toId ? "That block is hidden by the category filter. Switch to Both to connect it." : "Drop the wire on a coloured port.");
       return;
     }
     const fromId = state.fromHandle?.nodeId;
@@ -290,16 +369,15 @@ function Canvas() {
   }, [nodes]);
   const isValid = useCallback((c: Connection | Edge) => applyConnection(edges, c, wireCtx(nodes)).ok, [edges, nodes, wireCtx]);
 
-  const occupied = (list: FlowNode[], side: Side) => (tab === "both" ? list : list.filter((n) => CATALOG[n.data.nodeType]?.side === side));
   const addNode = (type: string) => {
     const spec = CATALOG[type];
     if (!spec) return;
-    if (tab !== "both" && spec.side !== tab) setTab(spec.side);
+    setTab((current) => (current === "both" || current === spec.side ? current : "both"));
     const id = `${type}-${Math.random().toString(36).slice(2, 6)}`;
-    const size = { width: spec.width, height: spec.side === "intel" ? 250 : 180 };
+    const size = { width: spec.width, height: spec.side === "intel" ? 250 : 220 };
     setNodes((ns) => [...ns, {
       id, type: "board",
-      position: placeNode(occupied(ns, spec.side).map(nodeBox), { x: 48, y: 48 }, size),
+      position: placeNode(ns.map(nodeBox), { x: 48, y: 48 }, size),
       data: { nodeType: type, enabled: true, config: {} },
     }]);
   };
@@ -363,7 +441,13 @@ function Canvas() {
   };
 
   return (
-    <BoardCtx.Provider value={{ keys, toggle, follow, pickEvent, wired, persona }}>
+    <BoardCtx.Provider value={{
+      keys, toggle, follow, pickEvent, setConfig, mapFunnel, replicate, wired, persona,
+      personaId: variables.persona || meta?.personas?.[0]?.id || "",
+      personas: meta?.personas || [],
+      accounts: accountsQuery.data?.accounts || [],
+      boardScript: variables.script || "",
+    }}>
       <div className="v3 v3-board">
         <header className="v3-top">
           <div className="v3-crumb">Boards / <input aria-label="Board name" value={name} onChange={(e) => setName(e.target.value)} /></div>
@@ -389,15 +473,15 @@ function Canvas() {
               const type = e.dataTransfer.getData("application/board-node");
               if (!CATALOG[type]) return;
               const spec = CATALOG[type];
-              const size = { width: spec.width, height: spec.side === "intel" ? 250 : 180 };
+              const size = { width: spec.width, height: spec.side === "intel" ? 250 : 220 };
               const dropped = screenToFlowPosition({ x: e.clientX, y: e.clientY });
               const id = `${type}-${Math.random().toString(36).slice(2, 6)}`;
               setNodes((ns) => [...ns, {
                 id, type: "board",
-                position: placeNode(occupied(ns, spec.side).map(nodeBox), dropped, size),
+                position: placeNode(ns.map(nodeBox), dropped, size),
                 data: { nodeType: type, enabled: true, config: {} },
               }]);
-              setTab((current) => (current === "both" ? current : spec.side));
+              setTab((current) => (current === "both" || current === spec.side ? current : "both"));
             }}>
             <aside className="v3-pal">
               <div className="v3-search-wrap">
@@ -446,7 +530,6 @@ function Canvas() {
                 proOptions={{ hideAttribution: false }}>
                 <Background gap={24} size={1.1} color="#2c2c33" />
                 <Controls showInteractive={false} />
-                <ZoneBoxes nodes={nodes} lens={tab} fixture={fixture} />
               </ReactFlow>
               <div className="v3-pill" role="tablist" aria-label="Board lens" data-lens={tab}>
                 <i className="v3-pill-ind" style={{ left: 4 + lensIndex * 96 }} />

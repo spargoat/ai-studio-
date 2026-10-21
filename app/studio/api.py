@@ -1,10 +1,12 @@
 """JSON API for the React UI. Thin layer over Runner / DB / library / export / persona. Dry runs only from the UI."""
-import contextlib, hmac, io, json, os, threading, time
+import contextlib, datetime as dt, hmac, io, json, os, threading, time
 from pathlib import Path
 from flask import Blueprint, abort, jsonify, request, send_file
 from . import library, persona as P
 from .adintel import configured
+from .adintel import accounts as intel_accounts
 from .board import BoardError, compile_board, ensure_presets, job_brief, preview_config, preview_pack
+from .names import purpose_name
 from .config import connection_status, key_status, load_template
 from .runner import BriefError, SpendGuardError
 
@@ -25,6 +27,14 @@ def register(app, cfg, runner, live, bg):
     app.json.sort_keys = False
     active, alock = set(), threading.Lock()
     data_dir = Path(cfg["_data_dir"]).resolve()
+    displays = {k: (v.get("display") or k) for k, v in (cfg.get("_personas") or {}).items()}
+
+    def present(row):
+        item = dict(row)
+        item["purpose"] = purpose_name(displays.get(item.get("persona")) or item.get("persona") or "Asset",
+                                       item.get("stage"), item.get("version"))
+        item["library_id"] = item.get("id")
+        return item
 
     def run_bg(jid, fn, *a):
         with alock:
@@ -128,7 +138,11 @@ def register(app, cfg, runner, live, bg):
             rows = [r for r in rows if r["stage"] == a["stage"]]
         if a.get("final") == "1":
             rows = [r for r in rows if r["stage"] in library.FINAL]
-        return jsonify([dict(r) for r in rows])
+        return jsonify([present(r) for r in rows])
+
+    @bp.get("/api/library/pending")
+    def lib_pending():
+        return jsonify([present(r) for r in library.pending(db)])
 
     @bp.get("/api/personas")
     def personas():
@@ -171,9 +185,33 @@ def register(app, cfg, runner, live, bg):
             pk, mk = r["provider"] or "unknown", r["model"] or "unknown"
             by_p[pk] = by_p.get(pk, 0) + r["c"]; by_m[mk] = by_m.get(mk, 0) + r["c"]
         n_live = db.one("SELECT COUNT(*) n FROM attempts WHERE mode='live'")["n"]
+        by_api = [{"provider": r["provider"] or "unknown", "api": r["model"] or "unknown",
+                   "cost": r["c"], "calls": r["n"]} for r in db.q(
+            "SELECT provider, model, COALESCE(SUM(actual_cost_usd),0) c, COUNT(*) n FROM attempts "
+            "WHERE mode='live' GROUP BY provider, model ORDER BY c DESC")]
+        fallback = [dict(r) for r in db.q(
+            "SELECT job_id, stage, model, status, actual_cost_usd, started_at FROM attempts "
+            "WHERE provider='higgsfield' ORDER BY id DESC LIMIT 20")]
+        span = db.one("SELECT MIN(started_at) a, MAX(started_at) b, COALESCE(SUM(actual_cost_usd),0) c "
+                      "FROM attempts WHERE mode='live'")
+        if not n_live:
+            forecast = {"month": 0.0, "note": "No live calls, so the month forecast stays $0."}
+        else:
+            forecast = {"month": round(float(span["c"] or 0), 4),
+                        "note": "Forecast is the live spend already logged. There is not a longer window to project from."}
+            try:
+                start = dt.datetime.fromisoformat(span["a"])
+                end = dt.datetime.fromisoformat(span["b"])
+                days = max((end - start).total_seconds() / 86400, 1)
+                if days >= 1 and start != end:
+                    forecast = {"month": round(float(span["c"] or 0) / days * 30, 4),
+                                "note": "Month forecast is logged live spend spread over the days those calls cover, times 30."}
+            except (TypeError, ValueError):
+                pass
         return jsonify({"logged": db.live_spend(), "counted": db.effective_spend(), "caps": caps(), "calls": n_live,
-                        "by_provider": by_p, "by_model": by_m, "recent": rows, "reconciled": db.spend_summary(),
-                        "live_recent": len(live)})
+                        "by_provider": by_p, "by_model": by_m, "by_api": by_api, "top_apis": by_api[:5],
+                        "forecast": forecast, "higgsfield_fallback": fallback,
+                        "recent": rows, "reconciled": db.spend_summary(), "live_recent": len(live)})
 
     # ---------- actions
     def brief_from(b):
@@ -428,6 +466,16 @@ def register(app, cfg, runner, live, bg):
             return err(e, 409)
         # One request runs one stage. The client keeps calling /advance until a gate.
         return jsonify({"id": jid, "mode": "dry", "pump": True}), 201
+
+    @bp.get("/api/intel/accounts")
+    def intel_accounts_route():
+        try:
+            return jsonify(intel_accounts())
+        except Exception as e:
+            from .adintel import AdIntelError
+            if isinstance(e, AdIntelError):
+                return err(str(e), 502)
+            raise
 
     @bp.get("/api/intel/preview")
     def intel_preview():

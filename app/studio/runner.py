@@ -570,9 +570,11 @@ class Runner:
             prompt = f"{prompt} {lt}"
         params = {k: v for k, v in sdef["params"].items() if k not in ("duration", "chars_per_second")} \
             if sdef["kind"] in ("video", "voice") else dict(sdef["params"])
+        from .board import resolve_voice_id
+        voice_id = resolve_voice_id(self.cfg.get("_personas") or {}, brief["persona"], brief.get("voice_name"))
         return {"stage": sdef["id"], "kind": sdef["kind"], "prompt": prompt, "params": params,
                 "inputs": inputs, "persona": brief["persona"], "persona_display": persona.get("display"),
-                "refs": persona.get("refs") or [], "voice_id": persona.get("voice_id"),
+                "refs": persona.get("refs") or [], "voice_id": voice_id,
                 "voice_settings": persona.get("voice_settings"), "script": script_txt, "brief": brief,
                 "audio_seconds": audio_s, "video_seconds": video_s, "fail_inject": self.fail_inject}
 

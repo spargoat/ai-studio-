@@ -37,6 +37,36 @@ FIXTURE_ADS = [
         "platforms": ["facebook", "instagram"],
     },
     {
+        "id": "rec_n2a81c",
+        "advertiser": "Northline Markets",
+        "status": "live",
+        "first_seen": "2026-09-12",
+        "last_seen": "2026-10-17",
+        "longevity_days": 35,
+        "primary_text": "Write the price that proves you wrong on the ticket before you write the size.",
+        "headline": "The price on the ticket",
+        "cta": "See the rule",
+        "media": [{"type": "video", "url": "https://example.test/ads/northline-ticket.mp4"}],
+        "landing_url": "https://northlinemarkets.example/ticket",
+        "creative_family": "loss-then-rule",
+        "platforms": ["facebook"],
+    },
+    {
+        "id": "rec_n39c0e",
+        "advertiser": "Northline Markets",
+        "status": "removed",
+        "first_seen": "2026-07-20",
+        "last_seen": "2026-08-18",
+        "longevity_days": 29,
+        "primary_text": "A bigger size does not fix a trade that had no stop.",
+        "headline": "Size is not a plan",
+        "cta": "Read the note",
+        "media": [{"type": "image", "url": "https://example.test/ads/northline-size.jpg"}],
+        "landing_url": "https://northlinemarkets.example/size",
+        "creative_family": "loss-then-rule",
+        "platforms": ["instagram"],
+    },
+    {
         "id": "rec_b17d04",
         "advertiser": "Harbor & Co",
         "status": "live",
@@ -76,6 +106,22 @@ FIXTURE_FUNNELS = {
             {"n": 3, "kind": "landing", "label": "Stop-first checklist", "url": "https://northlinemarkets.example/stop-first"},
         ],
         "landing_page": {"url": "https://northlinemarkets.example/stop-first", "title": "Stop-first checklist"},
+    },
+    "rec_n2a81c": {
+        "steps": [
+            {"n": 1, "kind": "ad", "label": "In-feed video"},
+            {"n": 2, "kind": "click", "label": "Link click"},
+            {"n": 3, "kind": "landing", "label": "Ticket rule", "url": "https://northlinemarkets.example/ticket"},
+        ],
+        "landing_page": {"url": "https://northlinemarkets.example/ticket", "title": "Ticket rule"},
+    },
+    "rec_n39c0e": {
+        "steps": [
+            {"n": 1, "kind": "ad", "label": "Static image"},
+            {"n": 2, "kind": "click", "label": "Link click"},
+            {"n": 3, "kind": "landing", "label": "Size note", "url": "https://northlinemarkets.example/size"},
+        ],
+        "landing_page": {"url": "https://northlinemarkets.example/size", "title": "Size note"},
     },
     "rec_b17d04": {
         "steps": [
@@ -253,6 +299,20 @@ def funnel_for(ad_id):
     steps = body.get("steps") or body.get("route") or []
     landing = body.get("landing_page") or {"url": ad.get("landing_url") or body.get("url") or "", "title": body.get("landing_title") or ""}
     return {"ad_id": ad_id, "steps": steps, "landing_page": landing}
+
+
+def accounts():
+    """Advertisers in the current read, with how many ads each one has. Same origin rules as query_ads."""
+    pack = query_ads({})
+    counts, order = {}, []
+    for ad in pack["ads"]:
+        name = ad.get("advertiser") or "Unknown"
+        if name not in counts:
+            order.append(name)
+            counts[name] = 0
+        counts[name] += 1
+    pack["accounts"] = [{"advertiser": name, "ads": counts[name]} for name in order]
+    return pack
 
 
 def market():
