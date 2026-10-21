@@ -502,7 +502,7 @@ def register(app, cfg, runner, live, bg):
     def intel_ad_funnel(ad_id):
         from .adintel import AdIntelError, funnel_for
         try:
-            return jsonify(funnel_for(ad_id))
+            return jsonify({**funnel_for(ad_id), "origin": "live" if configured() else "fixture"})
         except AdIntelError as e:
             return err(str(e), 502)
 

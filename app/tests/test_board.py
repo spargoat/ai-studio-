@@ -388,6 +388,7 @@ class T(unittest.TestCase):
             self.assertEqual(loaded["graph"]["nodes"][-1]["config"]["url"], "https://example.test/ad")
             route = client.get("/api/intel/ads/rec_4c91e2/funnel")
             self.assertEqual(route.status_code, 200)
+            self.assertEqual(route.get_json()["origin"], "fixture")
             self.assertEqual(route.get_json()["steps"][2]["kind"], "landing")
             self.assertEqual(loaded["preview"]["origin"], "fixture")
             self.assertIn("Fixture", loaded["preview"]["label"])

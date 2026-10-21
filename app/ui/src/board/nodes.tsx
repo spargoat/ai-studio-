@@ -475,6 +475,9 @@ function CanvasBody({ id, nodeType, config }: { id: string; nodeType: string; co
 
 function KitBody({ id, config }: { id: string; config: Record<string, string> }) {
   const { setConfig, sources, buildKitPath, expandKitMap } = useContext(BoardCtx);
+  const route = useQuery({ queryKey: ["kit-source-route", config.source_ad_id],
+    queryFn: () => api<{ origin: "live" | "fixture"; steps: { n: number; label: string; kind?: string; state?: string; url?: string }[]; note?: string }>(`/api/intel/ads/${encodeURIComponent(config.source_ad_id)}/funnel`),
+    enabled: !!config.source_ad_id });
   const stages = (() => { try { return JSON.parse(config.stages || "[]") as [string, string][]; } catch { return []; } })();
   const completed = (() => { try { return JSON.parse(config.completed || "[]") as number[]; } catch { return []; } })();
   const source = sources.find((row) => row.id === config.source_ad_id);
@@ -498,6 +501,14 @@ function KitBody({ id, config }: { id: string; config: Record<string, string> })
     {!source && <Field label="Or source URL"><input className="v3-in" type="url" aria-label="Kit source URL" value={config.source_url || ""} placeholder="https://" onChange={(e) => setConfig(id, { source_url: e.target.value })} /></Field>}
     {(source || config.source_ad_id) && <p className="v3-muted">{source?.status || config.source_status || "Source state unknown"}. Research reference only.</p>}
     {sourceUrl && <a className="v3-mini" href={sourceUrl} target="_blank" rel="noopener noreferrer">Open source</a>}
+    {config.source_ad_id && <details className="v3-kit-details"><summary>Source funnel steps</summary>
+      {route.isLoading && <p className="v3-muted">Reading source route…</p>}
+      {route.isError && <p className="v3-warn">Source route read failed: {(route.error as Error).message}</p>}
+      {route.data && <><p className="v3-muted">{route.data.origin === "live" ? "Live tracker read" : "Fixture example, not live"}. Steps retain their recorded state.</p>
+        {route.data.steps.length ? <ol>{route.data.steps.map((step, i) => <li key={`${step.n}-${i}`}><b>{step.n}. {step.label}</b>
+          <small>{step.state || "state unknown"} · {step.kind || "step"}{safeLink(step.url) && <> · <a href={safeLink(step.url)} target="_blank" rel="noopener noreferrer">Open step</a></>}</small>
+        </li>)}</ol> : <p className="v3-muted">{route.data.note || "No route steps in this read."}</p>}</>}
+    </details>}
     {canBuild && <Field label="Owned offer"><input className="v3-in" aria-label="Kit owned offer" value={config.offer || ""} placeholder="Add once for the production brief" onChange={(e) => setConfig(id, { offer: e.target.value })} /></Field>}
     <div className="v3-acts">
       {canBuild && <button type="button" className="v3-mini" disabled={config.production_built === "true"} onClick={() => buildKitPath(id)}>{config.production_built === "true" ? "Path built" : "Build production path"}</button>}
