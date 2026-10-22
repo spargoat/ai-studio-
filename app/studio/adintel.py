@@ -180,28 +180,47 @@ def _envelope(origin, data_as_of=None, source=None):
             "data_as_of": FIXTURE_AS_OF}
 
 
+_READ_TIMEOUT = 8
+_RETRY_STATUS = {502, 503, 504}
+
+
 def _get(path, params=None):
+    """One tracker read. A gateway 502 or a hung socket is retried once, then raised."""
     base = (os.environ.get("ADINTEL_API_URL") or "").rstrip("/")
     if not base.endswith("/api/board"):
         base += "/api/board"
     secret = os.environ.get("ADINTEL_API_SECRET") or ""
     query = {k: v for k, v in (params or {}).items() if v not in ("", None)}
-    try:
-        res = requests.get(base + path, params=query, timeout=20,
-                           headers={"x-adintel-secret": secret, "Accept": "application/json"})
-    except requests.RequestException as e:
-        raise AdIntelError(f"ads-tracker read failed: {type(e).__name__}") from None
-    if res.status_code == 404:
-        raise AdIntelNotFound("This record is not in the current tracker snapshot")
-    if res.status_code >= 400:
-        raise AdIntelError(f"ads-tracker read failed ({res.status_code})")
-    try:
-        body = res.json()
-    except ValueError:
-        raise AdIntelError("ads-tracker read failed: response was not JSON") from None
-    if not isinstance(body, dict) or body.get("ok") is not True:
-        raise AdIntelError("ads-tracker read failed: invalid board API response")
-    return body
+    headers = {"x-adintel-secret": secret, "Accept": "application/json"}
+    last = None
+    for attempt in range(2):
+        try:
+            res = requests.get(base + path, params=query, timeout=_READ_TIMEOUT, headers=headers)
+        except requests.Timeout:
+            last = AdIntelError("ads-tracker read timed out")
+        except requests.ConnectionError:
+            last = AdIntelError("ads-tracker read failed: connection error")
+        except requests.RequestException as e:
+            raise AdIntelError(f"ads-tracker read failed: {type(e).__name__}") from None
+        else:
+            if res.status_code == 404:
+                raise AdIntelNotFound("This record is not in the current tracker snapshot")
+            if res.status_code in _RETRY_STATUS:
+                last = AdIntelError(f"ads-tracker read failed ({res.status_code})")
+            elif res.status_code >= 400:
+                raise AdIntelError(f"ads-tracker read failed ({res.status_code})")
+            else:
+                try:
+                    body = res.json()
+                except ValueError:
+                    raise AdIntelError("ads-tracker read failed: response was not JSON") from None
+                if not isinstance(body, dict) or body.get("ok") is not True:
+                    raise AdIntelError("ads-tracker read failed: invalid board API response")
+                return body
+        if attempt == 0:
+            continue
+        raise last
+    raise last or AdIntelError("ads-tracker read failed")
 
 
 def _meta(body):

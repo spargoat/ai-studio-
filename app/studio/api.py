@@ -311,6 +311,8 @@ def register(app, cfg, runner, live, bg):
             return jsonify(runner.advance(jid))
         except BriefError as e:
             return err(e, 409)
+        except Exception as e:
+            return err(e, 502)
 
     @bp.route("/api/cron/advance", methods=["GET", "POST"])
     def cron_advance():
@@ -511,13 +513,42 @@ def register(app, cfg, runner, live, bg):
         if not one_stage():
             run_bg(jid, runner.run_job, jid)
             return jsonify({"id": jid, "mode": "dry", "pump": False}), 201
-        # Dry placeholders are a second or two. Run the whole board in this request
-        # so a 28-block replicate is not one full encode per HTTP call.
+        # One run_job held every node on idle until the request returned, and on
+        # Vercel that request downloaded ffmpeg. Run a short burst, then let the
+        # client pump and paint. A dry board does not fetch the ffmpeg archive.
+        previous = os.environ.get("STUDIO_NO_FFMPEG_FETCH")
+        os.environ["STUDIO_NO_FFMPEG_FETCH"] = "1"
         try:
-            status = runner.run_job(jid)
+            try:
+                budget = float(os.environ.get("STUDIO_DRY_BUDGET_S") or 12)
+            except ValueError:
+                budget = 12.0
+            deadline = time.monotonic() + max(0.0, budget)
+            status, error = "created", None
+            while time.monotonic() < deadline:
+                step = runner.advance(jid)
+                status = step.get("status") or status
+                if step.get("ok") is False:
+                    error = step.get("error") or "Dry run stopped"
+                    break
+                if step.get("action") in ("idle", "stopped"):
+                    break
+                if status not in ("created", "running", "partial"):
+                    break
         except BriefError as e:
             return err(e, 409)
-        return jsonify({"id": jid, "mode": "dry", "pump": False, "status": status}), 201
+        except Exception as e:
+            return jsonify({"error": str(e), "id": jid}), 502
+        finally:
+            if previous is None:
+                os.environ.pop("STUDIO_NO_FFMPEG_FETCH", None)
+            else:
+                os.environ["STUDIO_NO_FFMPEG_FETCH"] = previous
+        pump = status in ("created", "running", "partial") and not error
+        body = {"id": jid, "mode": "dry", "pump": pump, "status": status}
+        if error:
+            body["error"] = error
+        return jsonify(body), 201
 
     @bp.get("/api/intel/accounts")
     def intel_accounts_route():

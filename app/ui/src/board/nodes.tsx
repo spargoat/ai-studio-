@@ -2,7 +2,7 @@ import { createContext, useContext, useState, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import { Handle, Position, type Node, type NodeProps } from "@xyflow/react";
 import { useQuery } from "@tanstack/react-query";
-import { api } from "../lib/api";
+import { intel } from "../lib/api";
 import { CATALOG, LONGEVITY_NOTE, PORT_COLOR, REFERENCE_LABEL, type NodeSpec } from "./catalog";
 
 export type Artefact = {
@@ -270,12 +270,18 @@ function FeedWaterfall({ nodeId, config }: { nodeId: string; config: Record<stri
   }).toString();
   const own = useQuery({
     queryKey: ["intel-feed", qs],
-    queryFn: () => api<{ feed?: { evidence?: { fields?: { waterfall?: WaterAd[]; matched?: number } } } }>(`/api/intel/preview?${qs}`),
+    queryFn: () => intel<{ feed?: { evidence?: { fields?: { waterfall?: WaterAd[]; matched?: number } } } }>(`/api/intel/preview?${qs}`),
+    retry: 1,
   });
   const ads = own.data?.feed?.evidence?.fields?.waterfall || [];
   const matched = own.data?.feed?.evidence?.fields?.matched;
   const loading = own.isPending || (own.isFetching && !own.data);
-  const route = useQuery({ queryKey: ["ad-funnel", open], queryFn: () => api<{ steps: { n: number; kind: string; label: string; url?: string; state?: string }[]; note?: string }>(`/api/intel/ads/${encodeURIComponent(open || "")}/funnel`), enabled: !!open });
+  const route = useQuery({
+    queryKey: ["ad-funnel", open],
+    queryFn: () => intel<{ steps: { n: number; kind: string; label: string; url?: string; state?: string }[]; note?: string }>(`/api/intel/ads/${encodeURIComponent(open || "")}/funnel`),
+    enabled: !!open,
+    retry: 1,
+  });
   const offset = Number(config.offset || 0) || 0;
   const limit = Number(config.limit || 40) || 40;
   const named = accounts.filter((row) => row.advertiser === (config.advertiser || ""));
@@ -322,8 +328,9 @@ function FeedWaterfall({ nodeId, config }: { nodeId: string; config: Record<stri
               </button>
               {open === id && (
                 <ol className="v3-steps">
-                  {route.isLoading && <li>Loading route…</li>}
-                  {route.isError && <li>{(route.error as Error).message}</li>}
+                  {!route.isError && route.isLoading && route.failureCount === 0 && <li>Loading route…</li>}
+                  {!route.isError && route.isFetching && route.failureCount > 0 && <li className="v3-warn">Retrying route…</li>}
+                  {route.isError && <li className="v3-warn">Route read failed: {(route.error as Error).message}</li>}
                   {(route.data?.steps || []).map((step) => <li key={`${id}-${step.n}`}>{step.n}. {cleanStepLabel(step.label) || "Step"} [{step.state || "unknown"}]{step.url ? ` · ${step.url}` : ""}</li>)}
                   {route.data && !route.data.steps.length && <li>{route.data.note || "No route steps in this read."}</li>}
                 </ol>
@@ -331,7 +338,7 @@ function FeedWaterfall({ nodeId, config }: { nodeId: string; config: Record<stri
             </div>
           );
         })}
-        {!ads.length && <p className={own.isError ? "v3-warn" : "v3-muted"}>{own.isError ? (own.error as Error).message : loading ? "Loading ads…" : "No ads for this account in the read."}</p>}
+        {!ads.length && <p className={own.isError || (own.isFetching && own.failureCount > 0) ? "v3-warn" : "v3-muted"}>{own.isError ? `Ad read failed: ${(own.error as Error).message}` : own.isFetching && own.failureCount > 0 ? "Retrying ads…" : loading ? "Loading ads…" : "No ads for this account in the read."}</p>}
       </div>
       <div className="v3-acts nodrag nopan">
         <button type="button" className="v3-mini" disabled={offset <= 0} onClick={() => { setSelected([]); setConfig(nodeId, { offset: String(Math.max(0, offset - limit)), ad_id: "" }); }}>Previous</button>
@@ -347,8 +354,9 @@ function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
   const { mapFunnel, replicate, funnels, setConfig } = useContext(BoardCtx);
   const pickedRoute = useQuery({
     queryKey: ["funnel-route", config.funnel_id],
-    queryFn: () => api<{ steps: RouteStep[]; note?: string; funnel_name?: string }>(`/api/intel/funnels/${encodeURIComponent(config.funnel_id)}/route`),
+    queryFn: () => intel<{ steps: RouteStep[]; note?: string; funnel_name?: string }>(`/api/intel/funnels/${encodeURIComponent(config.funnel_id)}/route`),
     enabled: nodeType === "funnel_route" && !!config.funnel_id,
+    retry: 1,
   });
   const evidence = artefact?.evidence;
   const fields = evidence?.fields || {};
@@ -390,8 +398,9 @@ function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
             </select>
           </label>
           {config.funnel_name && <p className="v3-muted">{config.funnel_name}</p>}
-          {pickedRoute.isFetching && <p className="v3-muted">Loading funnel…</p>}
-          {pickedRoute.isError && <p className="v3-warn">{(pickedRoute.error as Error).message}</p>}
+          {!pickedRoute.isError && pickedRoute.isFetching && pickedRoute.failureCount === 0 && <p className="v3-muted">Loading funnel…</p>}
+          {!pickedRoute.isError && pickedRoute.isFetching && pickedRoute.failureCount > 0 && <p className="v3-warn">Retrying funnel…</p>}
+          {pickedRoute.isError && <p className="v3-warn">Funnel read failed: {(pickedRoute.error as Error).message}</p>}
           <FunnelSteps steps={routeSteps.slice(0, 8)} />
           {routeSteps.length > 8 && <p className="v3-muted">{routeSteps.length - 8} more steps collapsed</p>}
           <div className="v3-acts nodrag nopan">
@@ -554,8 +563,8 @@ function CanvasBody({ id, nodeType, config }: { id: string; nodeType: string; co
 function KitBody({ id, config }: { id: string; config: Record<string, string> }) {
   const { setConfig, sources, buildKitPath, expandKitMap } = useContext(BoardCtx);
   const route = useQuery({ queryKey: ["kit-source-route", config.source_ad_id],
-    queryFn: () => api<{ origin: "live" | "fixture"; steps: { n: number; label: string; kind?: string; state?: string; url?: string }[]; note?: string }>(`/api/intel/ads/${encodeURIComponent(config.source_ad_id)}/funnel`),
-    enabled: !!config.source_ad_id });
+    queryFn: () => intel<{ origin: "live" | "fixture"; steps: { n: number; label: string; kind?: string; state?: string; url?: string }[]; note?: string }>(`/api/intel/ads/${encodeURIComponent(config.source_ad_id)}/funnel`),
+    enabled: !!config.source_ad_id, retry: 1 });
   const stages = (() => { try { return JSON.parse(config.stages || "[]") as [string, string][]; } catch { return []; } })();
   const completed = (() => { try { return JSON.parse(config.completed || "[]") as number[]; } catch { return []; } })();
   const source = sources.find((row) => row.id === config.source_ad_id);
@@ -580,7 +589,8 @@ function KitBody({ id, config }: { id: string; config: Record<string, string> })
     {(source || config.source_ad_id) && <p className="v3-muted">{source?.status || config.source_status || "Source state unknown"}. Research reference only.</p>}
     {sourceUrl && <a className="v3-mini" href={sourceUrl} target="_blank" rel="noopener noreferrer">Open source</a>}
     {config.source_ad_id && <details className="v3-kit-details"><summary>Source funnel steps</summary>
-      {route.isLoading && <p className="v3-muted">Reading source route…</p>}
+      {!route.isError && route.isLoading && route.failureCount === 0 && <p className="v3-muted">Reading source route…</p>}
+      {!route.isError && route.isFetching && route.failureCount > 0 && <p className="v3-warn">Retrying route…</p>}
       {route.isError && <p className="v3-warn">Source route read failed: {(route.error as Error).message}</p>}
       {route.data && <><p className="v3-muted">{route.data.origin === "live" ? "Live tracker read" : "Fixture example, not live"}. Steps retain their recorded state.</p>
         {route.data.steps.length ? <ol>{route.data.steps.map((step, i) => <li key={`${step.n}-${i}`}><b>{step.n}. {cleanStepLabel(step.label) || "Step"}</b>

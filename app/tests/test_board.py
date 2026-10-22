@@ -13,7 +13,8 @@ for k in ("FAL_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS", "ADINTEL_API_URL", "ADI
           "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"):
     os.environ.pop(k, None)
 
-from studio.adintel import FIXTURE_ADS, FIXTURE_LABEL, LONGEVITY_NOTE, REFERENCE_LABEL, clean_step_label, query_ads
+import requests
+from studio.adintel import FIXTURE_ADS, FIXTURE_LABEL, LONGEVITY_NOTE, REFERENCE_LABEL, AdIntelError, _get, clean_step_label, query_ads
 from studio.board import (BoardError, compile_board, job_brief, migrate_talking_head_layout, preview_config, preview_pack,
                           talking_head_preset, timeline_artefact as board_timeline)
 from studio.config import connection_status, load_config
@@ -396,12 +397,27 @@ class T(unittest.TestCase):
             import time
             started_at = time.perf_counter()
             started = client.post("/api/boards/talking_head/run", json={})
-            elapsed = time.perf_counter() - started_at
+            first = time.perf_counter() - started_at
             self.assertEqual(started.status_code, 201, started.get_data(as_text=True))
             payload = started.get_json()
             self.assertEqual(payload["mode"], "dry")
-            self.assertIs(payload["pump"], False)
-            self.assertEqual(payload["status"], "done")
+            self.assertNotIn("error", payload)
+            # The first response has to come back while the canvas can still paint.
+            # A budget cut returns pump so the client keeps advancing.
+            self.assertLess(first, 20, payload)
+            status = payload.get("status")
+            guard = 0
+            while payload.get("pump") and guard < 40:
+                step = client.post(f"/api/jobs/{payload['id']}/advance", json={})
+                self.assertEqual(step.status_code, 200, step.get_data(as_text=True))
+                body = step.get_json()
+                self.assertIsNot(body.get("ok"), False, body)
+                status = body.get("status") or status
+                if body.get("action") in ("idle", "stopped") or status in ("done", "failed", "awaiting_review", "blocked"):
+                    break
+                guard += 1
+            elapsed = time.perf_counter() - started_at
+            self.assertEqual(status, "done")
             self.assertLess(elapsed, 45, "a dry board should finish in seconds, not one encode per stage")
             done = client.get(f"/api/jobs/{payload['id']}").get_json()
             self.assertEqual(done["job"]["mode"], "dry")
@@ -705,7 +721,7 @@ class T(unittest.TestCase):
         os.environ["STUDIO_ONE_STAGE"] = "1"
         self.addCleanup(os.environ.pop, "STUDIO_ONE_STAGE", None)
         app = create_app(c)
-        with patch("studio.runner.Runner.run_job", return_value="done") as run:
+        with patch("studio.runner.Runner.advance", return_value={"action": "idle", "status": "done", "ok": True}) as run:
             res = app.test_client().post("/api/boards/talking_head/run", json={"mode": "dry"})
         self.assertTrue(run.called)
         self.assertIs(res.get_json()["pump"], False)
@@ -716,6 +732,107 @@ class T(unittest.TestCase):
         stages = job["job"]["brief"]["board_stages"]
         self.assertTrue(stages)
         self.assertTrue(all(stage.get("review") is False for stage in stages))
+
+    def test_dry_run_error_is_json_and_a_zero_budget_returns_immediately(self):
+        c = cfg()
+        c["_db_file"] = TMP / "dryerr.db"
+        os.environ["STUDIO_ONE_STAGE"] = "1"
+        os.environ["STUDIO_DRY_BUDGET_S"] = "0"
+        self.addCleanup(os.environ.pop, "STUDIO_ONE_STAGE", None)
+        self.addCleanup(os.environ.pop, "STUDIO_DRY_BUDGET_S", None)
+        app = create_app(c)
+        client = app.test_client()
+        import time
+        started = time.perf_counter()
+        early = client.post("/api/boards/talking_head/run", json={"mode": "dry"})
+        self.assertLess(time.perf_counter() - started, 5)
+        self.assertEqual(early.status_code, 201, early.get_data(as_text=True))
+        self.assertIs(early.get_json()["pump"], True)
+        self.assertIn(early.get_json()["status"], ("created", "running", "partial"))
+        os.environ["STUDIO_DRY_BUDGET_S"] = "12"
+        with patch("studio.runner.Runner.advance", return_value={"action": "stage", "ok": False, "error": "voice blew up", "status": "failed"}):
+            failed = client.post("/api/boards/talking_head/run", json={"mode": "dry"})
+        self.assertEqual(failed.status_code, 201)
+        self.assertEqual(failed.get_json()["error"], "voice blew up")
+        self.assertIs(failed.get_json()["pump"], False)
+        with patch("studio.runner.Runner.advance", side_effect=RuntimeError("disk full")):
+            blown = client.post("/api/boards/talking_head/run", json={"mode": "dry"})
+        self.assertEqual(blown.status_code, 502)
+        self.assertEqual(blown.get_json()["error"], "disk full")
+        self.assertTrue(blown.get_json()["id"])
+
+    def test_vercel_dry_run_does_not_download_ffmpeg(self):
+        c = cfg()
+        c["_db_file"] = TMP / "nofetch.db"
+        os.environ["STUDIO_ONE_STAGE"] = "1"
+        os.environ["STUDIO_FETCH_FFMPEG"] = "1"
+        self.addCleanup(os.environ.pop, "STUDIO_ONE_STAGE", None)
+        self.addCleanup(os.environ.pop, "STUDIO_FETCH_FFMPEG", None)
+        app = create_app(c)
+        client = app.test_client()
+        with patch("studio.assets.ffmpeg_on_disk", return_value=None), \
+             patch("studio.assets.cached_download", side_effect=AssertionError("ffmpeg download")):
+            res = client.post("/api/boards/talking_head/run", json={"mode": "dry"})
+            self.assertEqual(res.status_code, 201, res.get_data(as_text=True))
+            body = res.get_json()
+            self.assertNotIn("error", body)
+            status = body.get("status")
+            guard = 0
+            while body.get("pump") and guard < 40:
+                step = client.post(f"/api/jobs/{body['id']}/advance", json={})
+                self.assertEqual(step.status_code, 200, step.get_data(as_text=True))
+                advanced = step.get_json()
+                self.assertIsNot(advanced.get("ok"), False, advanced)
+                status = advanced.get("status") or status
+                if advanced.get("action") in ("idle", "stopped") or status in ("done", "failed", "awaiting_review"):
+                    break
+                guard += 1
+        self.assertEqual(status, "done")
+        done = client.get(f"/api/jobs/{body['id']}").get_json()
+        for sid in ("voice", "video"):
+            self.assertEqual(_stage_status(done, sid), "succeeded", sid)
+            blob = Path(_stage_run(done, sid)["output_path"]).read_bytes()
+            self.assertGreater(len(blob), 100)
+            self.assertIn(b"ID3" if sid == "voice" else b"ftyp", blob[:64])
+
+    def test_tracker_read_retries_a_502_and_times_out_in_the_open(self):
+        os.environ["ADINTEL_API_URL"] = "https://tracker.example"
+        os.environ["ADINTEL_API_SECRET"] = "secret"
+        self.addCleanup(os.environ.pop, "ADINTEL_API_URL", None)
+        self.addCleanup(os.environ.pop, "ADINTEL_API_SECRET", None)
+
+        class Resp:
+            def __init__(self, code, body=None):
+                self.status_code = code
+                self._body = body or {"ok": True, "evidence": {}}
+
+            def json(self):
+                return self._body
+
+        with patch("studio.adintel.requests.get", side_effect=[Resp(502), Resp(200, {"ok": True, "evidence": {"asOf": "2026-10-22"}})]) as get:
+            body = _get("/ads")
+        self.assertEqual(get.call_count, 2)
+        self.assertLessEqual(get.call_args.kwargs["timeout"], 8)
+        self.assertTrue(body["ok"])
+        with patch("studio.adintel.requests.get", return_value=Resp(503)) as get:
+            with self.assertRaises(AdIntelError) as ctx:
+                _get("/ads")
+        self.assertEqual(get.call_count, 2)
+        self.assertIn("503", str(ctx.exception))
+        with patch("studio.adintel.requests.get", side_effect=requests.Timeout("slow")) as get:
+            with self.assertRaises(AdIntelError) as ctx:
+                _get("/ads")
+        self.assertEqual(get.call_count, 2)
+        self.assertIn("timed out", str(ctx.exception))
+        with patch("studio.adintel.requests.get", return_value=Resp(400)) as get:
+            with self.assertRaises(AdIntelError) as ctx:
+                _get("/ads")
+        self.assertEqual(get.call_count, 1)
+        self.assertIn("400", str(ctx.exception))
+        with patch("studio.adintel.requests.get", return_value=Resp(404)) as get:
+            with self.assertRaises(AdIntelError):
+                _get("/ads")
+        self.assertEqual(get.call_count, 1)
 
     def test_spend_read_fails_stuck_compose_jobs(self):
         import datetime as dt
@@ -888,6 +1005,23 @@ class T(unittest.TestCase):
         self.assertIn("preventDefault", main)
         self.assertNotIn("serviceWorker", main + router)
         self.assertIn("errorElement", router)
+        api_src = (root / "ui" / "src" / "lib" / "api.ts").read_text()
+        self.assertIn("Route read failed:", nodes)
+        self.assertIn("Retrying route…", nodes)
+        self.assertIn("Ad read failed:", nodes)
+        self.assertIn("Retrying ads…", nodes)
+        self.assertIn("Funnel read failed:", nodes)
+        self.assertIn("Retrying funnel…", nodes)
+        self.assertIn("Preview read failed:", page)
+        self.assertIn("Retrying preview…", page)
+        self.assertIn("Running…", page)
+        self.assertIn("v3-alert", page)
+        self.assertIn("setRunError", page)
+        self.assertIn("timeoutMs: 25000", page)
+        self.assertIn("pinnedBoards", page)
+        self.assertIn("INTEL_TIMEOUT_MS", api_src)
+        self.assertIn("Request timed out", api_src)
+        self.assertIn(".v3-alert", css)
 
     def test_marco_face_sheet_is_a_placeholder_when_the_file_is_missing(self):
         client = create_app(cfg()).test_client()

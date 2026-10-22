@@ -7,7 +7,10 @@ from .assets import ffmpeg_bin, font_file
 
 def ff(args, timeout=300):
     cmd = [ffmpeg_bin("ffmpeg"), "-v", "error", "-y", *args]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except OSError as e:
+        raise RuntimeError(f"ffmpeg failed: {e}") from None
     if r.returncode != 0:
         raise RuntimeError(f"ffmpeg failed: {r.stderr.strip()[-600:]}")
 
@@ -27,8 +30,15 @@ def duration(path):
 
 
 def _duration(path):
-    r = subprocess.run([ffmpeg_bin("ffprobe"), "-v", "error", "-show_entries", "format=duration",
-                        "-of", "json", str(path)], capture_output=True, text=True)
+    from .assets import ffmpeg_on_disk
+    probe = ffmpeg_on_disk("ffprobe")
+    if not probe:
+        return None
+    try:
+        r = subprocess.run([probe, "-v", "error", "-show_entries", "format=duration",
+                            "-of", "json", str(path)], capture_output=True, text=True)
+    except OSError:
+        return None
     try:
         return round(float(json.loads(r.stdout)["format"]["duration"]), 2)
     except Exception:
@@ -40,4 +50,7 @@ def esc(text):
 
 
 def poster(video, out_jpg, t=0.5):
+    from .assets import ffmpeg_on_disk
+    if ffmpeg_on_disk("ffmpeg") is None:
+        return
     ff(["-ss", str(t), "-i", str(video), "-frames:v", "1", "-vf", "scale=360:-2", str(out_jpg)])

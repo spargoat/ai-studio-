@@ -6,7 +6,7 @@ import {
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
 import { Hash, Play, Copy, Save, Plus, Loader2 } from "lucide-react";
-import { api, fileUrl } from "../lib/api";
+import { api, fileUrl, intel } from "../lib/api";
 import { toast } from "../components/Toast";
 import { CATALOG, PALETTE, PORT_COLOR, portType, type Side } from "../board/catalog";
 import { INSPECTOR_FIELDS, type InspectorField } from "../board/inputs";
@@ -128,12 +128,17 @@ function Canvas() {
   const [query, setQuery] = useState("");
   const [pane, setPane] = useState<"config" | "output" | "runs">("config");
   const [notice, setNotice] = useState("");
+  const [runError, setRunError] = useState("");
   const [busyId, setBusyId] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
+  const pinnedBoards = useRef(new Set<string>());
 
   useEffect(() => { window.localStorage.setItem("studio:board-id", boardId); }, [boardId]);
   useEffect(() => {
-    if (list?.length && !list.some((row: { id: string }) => row.id === boardId)) setBoardId("talking_head");
+    if (!list?.length || list.some((row: { id: string }) => row.id === boardId)) return;
+    // A board created in this session can lag the list read. Don't snap the canvas back to the preset.
+    if (pinnedBoards.current.has(boardId)) return;
+    setBoardId("talking_head");
   }, [list, boardId]);
 
   useEffect(() => {
@@ -166,8 +171,9 @@ function Canvas() {
   }).toString();
   const previewQuery = useQuery({
     queryKey: ["intel-preview", previewQs],
-    queryFn: () => api<any>(`/api/intel/preview?${previewQs}`),
+    queryFn: () => intel<any>(`/api/intel/preview?${previewQs}`),
     enabled: nodes.length > 0,
+    retry: 1,
   });
   const preview = previewQuery.data || board?.preview || null;
   const feedAds = (preview?.feed?.evidence?.fields?.waterfall || []) as unknown[];
@@ -188,8 +194,8 @@ function Canvas() {
     });
     return attached;
   }, [nodes, feed?.data.config.ad_id, preview]);
-  const accountsQuery = useQuery({ queryKey: ["intel-accounts"], queryFn: () => api<any>("/api/intel/accounts") });
-  const directoryQuery = useQuery({ queryKey: ["intel-funnels"], queryFn: () => api<any>("/api/intel/funnels") });
+  const accountsQuery = useQuery({ queryKey: ["intel-accounts"], queryFn: () => intel<any>("/api/intel/accounts"), retry: 1 });
+  const directoryQuery = useQuery({ queryKey: ["intel-funnels"], queryFn: () => intel<any>("/api/intel/funnels"), retry: 1 });
   const { data: job } = useQuery({
     queryKey: ["job", jobId],
     queryFn: () => api<any>(`/api/jobs/${jobId}`),
@@ -353,7 +359,7 @@ function Canvas() {
   const mapDirectoryFunnel = useCallback(async (funnelId: string, funnelName: string) => {
     setBusyId(`funnel:${funnelId}`);
     try {
-      const route = await api<{ steps: RouteStep[]; note?: string; data_as_of?: string; funnel_name?: string }>(`/api/intel/funnels/${encodeURIComponent(funnelId)}/route`);
+      const route = await intel<{ steps: RouteStep[]; note?: string; data_as_of?: string; funnel_name?: string }>(`/api/intel/funnels/${encodeURIComponent(funnelId)}/route`);
       const title = route.funnel_name || funnelName || "Funnel";
       const steps = presentSteps(route.steps || []);
       if (!steps.length) { toast.error(route.note || "No steps in this route read."); return; }
@@ -560,6 +566,7 @@ function Canvas() {
       ? { name: "Untitled board", graph: { nodes: [], edges: [], variables: {}, funnel: EMPTY_FUNNEL } }
       : { name: `${(name || "Untitled board").replace(/ copy$/, "")} copy`, graph: serialize(nodes, edges, variables, funnel) } }),
     onSuccess: (row: any, blank) => {
+      pinnedBoards.current.add(row.id);
       qc.setQueryData(["boards"], (previous: any[] | undefined) => [...(previous || []).filter((item) => item.id !== row.id), row]);
       qc.setQueryData(["board", row.id], row);
       setBoardId(row.id);
@@ -572,35 +579,44 @@ function Canvas() {
   });
   const run = useMutation({
     mutationFn: async () => {
+      setRunError("");
       const saved = await api<any>(`/api/boards/${boardId}`, { method: "PUT", body: { name, graph: serialize(nodes, edges, variables, funnel) } });
       qc.setQueryData(["board", boardId], saved);
       setLoaded(boardId + (saved.updated_at || ""));
-      const row = await api<{ id: string; mode: string; pump?: boolean }>(`/api/boards/${boardId}/run`, { body: { mode: "dry" } });
+      const row = await api<{ id: string; mode: string; pump?: boolean; status?: string; error?: string }>(`/api/boards/${boardId}/run`, { body: { mode: "dry" }, timeoutMs: 25000 });
       setJobId(row.id);
-      let status = "started";
+      let status = row.status || "started";
       const paint = async () => {
-        const fresh = await api<any>(`/api/jobs/${row.id}`);
+        const fresh = await api<any>(`/api/jobs/${row.id}`, { timeoutMs: 25000 });
         qc.setQueryData(["job", row.id], fresh);
         return fresh?.job?.status as string | undefined;
       };
+      const fail = async (message: string) => {
+        try { status = await paint() || status; } catch { /* the banner still reports the run error */ }
+        throw new Error(message);
+      };
+      if (row.error) await fail(row.error);
       for (let i = 0; i < 80; i++) {
         let action = "";
         if (row.pump) {
-          const step = await api<{ status?: string; action?: string; stage?: string; ok?: boolean; error?: string }>(`/api/jobs/${row.id}/advance`, { method: "POST", body: {} });
+          const step = await api<{ status?: string; action?: string; stage?: string; ok?: boolean; error?: string }>(`/api/jobs/${row.id}/advance`, { method: "POST", body: {}, timeoutMs: 25000 });
           status = step.status || status;
           action = step.action || "";
-          if (step.ok === false) throw new Error(step.error || "Dry run stopped");
+          await paint();
+          if (step.ok === false || step.error) throw new Error(step.error || "Dry run stopped");
+        } else {
+          status = await paint() || status;
         }
-        status = await paint() || status;
         if (action === "idle" || action === "stopped") break;
-        if (status === "done" || status === "failed" || status === "awaiting_review") break;
+        if (status === "failed") throw new Error("Dry run failed");
+        if (status === "done" || status === "awaiting_review") break;
         if (!row.pump && status !== "created" && status !== "running" && status !== "partial") break;
         await new Promise((resolve) => setTimeout(resolve, 280));
       }
       return { ...row, status };
     },
-    onSuccess: (row) => { setJobId(row.id); qc.invalidateQueries({ queryKey: ["board", boardId] }); toast.success(`Dry run ${row.id} · ${row.status}`); },
-    onError: (e: Error) => toast.error(e.message),
+    onSuccess: (row) => { setRunError(""); setJobId(row.id); qc.invalidateQueries({ queryKey: ["board", boardId] }); toast.success(`Dry run ${row.id} · ${row.status}`); },
+    onError: (e: Error) => { setRunError(e.message || "Dry run failed"); toast.error(e.message); },
   });
 
   useEffect(() => {
@@ -662,9 +678,12 @@ function Canvas() {
           <button type="button" className="v3-btn" onClick={() => create.mutate(false)} disabled={create.isPending}><Copy size={13} />{create.isPending ? "Copying…" : "Copy"}</button>
           <button type="button" className="v3-btn" onClick={() => save.mutate()} disabled={save.isPending}><Save size={13} />Save</button>
           <button type="button" className="v3-btn pri" onClick={() => run.mutate()} disabled={run.isPending || !hasRunnableNodes}
-            title={hasRunnableNodes ? "Run executable nodes without provider spend" : "Add an executable node such as Brief, Script or Video to run"}><Play size={13} />Run (dry)</button>
+            title={hasRunnableNodes ? "Run executable nodes without provider spend" : "Add an executable node such as Brief, Script or Video to run"}><Play size={13} />{run.isPending ? "Running…" : "Run (dry)"}</button>
         </header>
         {notice && <div className="v3-confirm" role="status">{notice}</div>}
+        {runError && <div className="v3-alert" role="alert">{runError}</div>}
+        {!previewQuery.isError && previewQuery.isFetching && previewQuery.failureCount > 0 && <div className="v3-alert" role="status">Retrying preview…</div>}
+        {previewQuery.isError && <div className="v3-alert" role="alert">Preview read failed: {(previewQuery.error as Error).message}</div>}
         <div className="v3-funnel-bar">
           <label>Funnel <input aria-label="Funnel name" value={funnel.name} placeholder="Name this funnel" onChange={(e) => setFunnel((f) => ({ ...f, name: e.target.value }))} /></label>
           <label>Stage <select aria-label="Funnel stage" value={funnel.stage} onChange={(e) => setFunnel((f) => ({ ...f, stage: e.target.value }))}>

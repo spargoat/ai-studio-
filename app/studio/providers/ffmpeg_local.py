@@ -25,6 +25,22 @@ class FfmpegProvider(Provider):
         return {"output_path": first, "meta": m, "units_actual": 1, "request_id": "local"}
 
     def do_finish(self, ctx):
+        if not ctx.get("live"):
+            from ..assets import ffmpeg_on_disk
+            if ffmpeg_on_disk("ffmpeg") is None:
+                from .mock import write_placeholder
+                out = Path(ctx["out_dir"]) / "final.mp4"
+                src = Path((ctx.get("inputs") or {}).get("lipsync") or "")
+                if src.is_file() and src.stat().st_size > 32:
+                    out.write_bytes(src.read_bytes())
+                else:
+                    write_placeholder("mp4", out)
+                send = Path(ctx["out_dir"]) / "final_send.mp4"
+                send.write_bytes(out.read_bytes())
+                return {"output_path": str(out),
+                        "meta": {"seconds": 1, "placeholder": True, "send_copy": str(send),
+                                 "send_mb": round(send.stat().st_size / 1e6, 3)},
+                        "units_actual": 1, "request_id": "local"}
         p = ctx["params"]
         w, h, fps = p.get("width", 1080), p.get("height", 1920), p.get("fps", 30)
         # Dry run + STUDIO_MOCK_FAST: inputs are tiny mock clips, so export at mock size. Never applies live.

@@ -10,6 +10,7 @@ already on PATH) always wins, so tests stay offline.
 """
 import mimetypes
 import os
+import shutil
 import stat
 import tarfile
 from pathlib import Path
@@ -122,21 +123,30 @@ def _unpack_ffmpeg(archive):
     return dest
 
 
-def ffmpeg_bin(name, session=None):
-    """Path to ffmpeg or ffprobe.
-
-    Override, a binary already on disk, or PATH. On Vercel (or when
-    STUDIO_FETCH_FFMPEG=1) the static archive is fetched into /tmp first.
-    """
+def ffmpeg_on_disk(name):
+    """ffmpeg or ffprobe that is already executable. Does not download."""
     override = os.environ.get("FFMPEG_BIN") if name == "ffmpeg" else os.environ.get("FFPROBE_BIN")
     candidates = [Path(override)] if override else []
     candidates += [APP_DIR / "bin" / name, Path("/tmp/studio-bin") / name]
     for path in candidates:
         if path.is_file() and os.access(path, os.X_OK):
             return str(path)
+    return shutil.which(name)
+
+
+def ffmpeg_bin(name, session=None):
+    """Path to ffmpeg or ffprobe.
+
+    Override, a binary already on disk, or PATH. On Vercel (or when
+    STUDIO_FETCH_FFMPEG=1) the static archive is fetched into /tmp first.
+    A dry board sets STUDIO_NO_FFMPEG_FETCH so that download never starts.
+    """
+    found = ffmpeg_on_disk(name)
+    if found:
+        return found
     archives = [APP_DIR / "bin" / FFMPEG_ARCHIVE, Path("/tmp/studio-bin") / FFMPEG_ARCHIVE]
     archive = next((p for p in archives if p.is_file() and p.stat().st_size >= 1_000_000), None)
-    if archive is None and _fetch_ffmpeg():
+    if archive is None and _fetch_ffmpeg() and os.environ.get("STUDIO_NO_FFMPEG_FETCH") != "1":
         archive = cached_download(
             Path("/tmp/studio-bin") / FFMPEG_ARCHIVE, FFMPEG_URL, f"runtime/{FFMPEG_ARCHIVE}", 1_000_000, session=session)
     if archive is not None and archive.is_file():

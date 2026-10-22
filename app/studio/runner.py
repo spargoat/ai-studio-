@@ -897,8 +897,13 @@ class Runner:
             meta["poster_error"] = str(e)
 
     def _placeholder_still(self, out_dir):
-        from .media import ff
         path = Path(out_dir) / "board_still.png"
+        from .assets import ffmpeg_on_disk
+        if ffmpeg_on_disk("ffmpeg") is None:
+            from .providers.mock import write_placeholder
+            write_placeholder("png", path)
+            return str(path)
+        from .media import ff
         ff(["-f", "lavfi", "-i", "color=c=0x1d2b3a:s=270x480", "-frames:v", "1", str(path)])
         return str(path)
 

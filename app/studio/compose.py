@@ -202,6 +202,17 @@ def overlay_filters(overlays, w, h, font):
 # ---------- main
 def compose(src, out_dir, params, script=None, fast=False):
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    from .assets import ffmpeg_on_disk
+    if fast and ffmpeg_on_disk("ffmpeg") is None:
+        # A dry board on Vercel must not download ffmpeg just to letterbox a placeholder.
+        from .providers.mock import write_placeholder
+        out = out_dir / "compose_9x16.mp4"
+        src_path = Path(src)
+        if src_path.is_file() and src_path.stat().st_size > 32 and src_path.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp"):
+            out.write_bytes(src_path.read_bytes())
+        else:
+            write_placeholder("mp4", out)
+        return {"exports": {"9:16": str(out)}, "words": 0, "face_center": None, "source": str(src), "placeholder": True}
     cap = dict(params.get("captions") or {})
     fonts, font_name, fontfile = caption_face(cap)
     cap["font_name"] = font_name
