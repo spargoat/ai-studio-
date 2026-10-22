@@ -15,6 +15,17 @@ assert.ok(nudged.x !== 40 || nudged.y !== 40);
 const stacked = placeNode([timeline], { x: 80, y: 80 }, size);
 assert.ok(stacked.y >= timeline.height || stacked.x >= timeline.width, JSON.stringify(stacked));
 
+// A packed centre used to walk right by whole card widths, past a 1280px view (x≈1731).
+const packed = [];
+for (let row = 0; row < 6; row++) {
+  for (let col = 0; col < 6; col++) packed.push({ x: col * 300, y: row * 280, width: 290, height: 260 });
+}
+const view = { x: 0, y: 0, width: 1100, height: 800 };
+const kept = placeNode(packed, { x: 499, y: 400 }, size, view);
+assert.ok(kept.x >= view.x && kept.y >= view.y, JSON.stringify(kept));
+assert.ok(kept.x + size.width <= view.x + view.width, JSON.stringify(kept));
+assert.ok(kept.y + size.height <= view.y + view.height, JSON.stringify(kept));
+
 const ctx = {
   hasNode: (id: string) => id === "timeline" || id === "breakdown" || id === "feed",
   port: (id: string, direction: "in" | "out", handle?: string | null) => {
@@ -44,6 +55,6 @@ assert.match(mismatch.message, /Cannot connect/);
 
 const otherTab = applyConnection([], { source: "timeline", target: "missing", sourceHandle: "ad", targetHandle: "ad" }, ctx);
 assert.equal(otherTab.ok, false);
-assert.match(otherTab.message, /other tab/);
+assert.match(otherTab.message, /Switch to Both/);
 
 console.log("graph tests ok");

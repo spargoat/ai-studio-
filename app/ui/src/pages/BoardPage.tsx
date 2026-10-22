@@ -124,6 +124,47 @@ function stageView(stage: { runs?: { status: string; review_status?: string; act
   return { status, actual: run.actual_cost_usd ?? 0, ran: true };
 }
 
+type StageSnap = { id: string; node?: string; runs?: { status?: string }[] };
+
+function runRank(status?: string) {
+  if (status === "succeeded" || status === "failed" || status === "blocked_budget") return 3;
+  if (status === "running") return 2;
+  if (status) return 1;
+  return 0;
+}
+
+function jobRank(status?: string) {
+  if (status === "done" || status === "awaiting_review" || status === "failed" || status === "blocked") return 3;
+  if (status === "running" || status === "partial") return 2;
+  if (status === "created") return 1;
+  return 0;
+}
+
+/** A slow job read must not wipe a stage that already finished. */
+export function mergeJobSnapshot<T extends { job?: { status?: string }; stages?: StageSnap[] }>(prev: T | undefined, fresh: T): T {
+  if (!prev?.stages?.length) return fresh;
+  const byId = new Map<string, StageSnap>();
+  for (const stage of fresh?.stages || []) byId.set(stage.id, { ...stage, runs: [...(stage.runs || [])] });
+  for (const stage of prev.stages) {
+    const next = byId.get(stage.id);
+    const oldRun = stage.runs?.length ? stage.runs[stage.runs.length - 1] : undefined;
+    const newRun = next?.runs?.length ? next.runs[next.runs.length - 1] : undefined;
+    if (runRank(oldRun?.status) > runRank(newRun?.status)) {
+      if (next) next.runs = stage.runs || [];
+      else byId.set(stage.id, stage);
+    }
+  }
+  const job = jobRank(fresh?.job?.status) >= jobRank(prev.job?.status) ? fresh.job : prev.job;
+  return { ...fresh, job: job || fresh.job, stages: [...byId.values()] };
+}
+
+function stageFor(stages: { id: string; node?: string }[], nodeId: string, nodeType: string) {
+  const byId = stages.find((stage) => stage.id === nodeId);
+  if (byId) return byId;
+  const sameType = stages.filter((stage) => stage.node === nodeType || stage.node === nodeId);
+  return sameType.length === 1 ? sameType[0] : undefined;
+}
+
 function nodeBox(n: FlowNode): Box {
   const spec = CATALOG[n.data.nodeType];
   return {
@@ -140,6 +181,11 @@ function Canvas() {
   const ignoreClickUntil = useRef(0);
   const droppedOnPane = useRef(false);
   const followJob = useRef(false);
+  const sessionJob = useRef<string | null>(null);
+  const adoptStamp = useRef("");
+  const adoptedStamp = useRef("");
+  const baseline = useRef("");
+  const attempted = useRef("");
   const { data: meta } = useQuery({ queryKey: ["meta"], queryFn: () => api("/api/meta", { timeoutMs: 12000 }) });
   const listQuery = useQuery({ queryKey: ["boards"], queryFn: () => api<any[]>("/api/boards", { timeoutMs: 12000 }) });
   const list = listQuery.data;
@@ -163,7 +209,7 @@ function Canvas() {
   const searchRef = useRef<HTMLInputElement>(null);
   const pinnedBoards = useRef(new Set<string>());
 
-  useEffect(() => { window.localStorage.setItem("studio:board-id", boardId); }, [boardId]);
+  useEffect(() => { window.localStorage.setItem("studio:board-id", boardId); sessionJob.current = null; }, [boardId]);
   useEffect(() => {
     if (!list?.length || list.some((row: { id: string }) => row.id === boardId)) return;
     // A board created in this session can lag the list read. Don't snap the canvas back to the preset.
@@ -175,6 +221,7 @@ function Canvas() {
     if (!board) return;
     const stamp = boardId + (board.updated_at || "");
     if (loaded === stamp) return;
+    adoptStamp.current = stamp;
     setLoaded(stamp);
     setNodes(toFlow(board.graph?.nodes || []));
     setEdges((board.graph?.edges || []).map((e: GraphEdge) => ({ ...e })));
@@ -182,6 +229,7 @@ function Canvas() {
     setVariables(board.graph?.variables || {});
     setFunnel({ ...EMPTY_FUNNEL, ...(board.graph?.funnel || {}) });
     setEstimates(board.estimates || {});
+    if (board.last_job_id && sessionJob.current && sessionJob.current !== board.last_job_id) return;
     if (board.last_job_id) setJobId(board.last_job_id);
   }, [board, boardId, loaded]);
 
@@ -228,7 +276,7 @@ function Canvas() {
   const directoryQuery = useQuery({ queryKey: ["intel-funnels"], queryFn: () => intel<any>("/api/intel/funnels"), retry: 1 });
   const { data: job } = useQuery({
     queryKey: ["job", jobId],
-    queryFn: () => api<any>(`/api/jobs/${jobId}`, { timeoutMs: 12000 }),
+    queryFn: ({ signal, client, queryKey }) => api<any>(`/api/jobs/${jobId}`, { timeoutMs: 12000, signal }).then((fresh) => mergeJobSnapshot(client.getQueryData(queryKey), fresh)),
     enabled: !!jobId,
     refetchInterval: (q) => {
       // Opening a board used to poll its last job every 2s. A stuck job then held
@@ -313,7 +361,7 @@ function Canvas() {
     if (source) kit.nodes[0].config = { ...kit.nodes[0].config, source_ad_id: source.id,
       source_url: source.url, source_status: source.status };
     if (variables.offer) kit.nodes[0].config.offer = variables.offer;
-    setNodes((ns) => [...ns, ...kit.nodes.map((n) => ({ id: n.id, type: "board" as const, position: n.position, data: { nodeType: n.type, enabled: n.enabled, config: n.config } }))]);
+    setNodes((ns) => [...ns.map((n) => (n.selected ? { ...n, selected: false } : n)), ...kit.nodes.map((n) => ({ id: n.id, type: "board" as const, position: n.position, selected: n.id.endsWith("-overview"), data: { nodeType: n.type, enabled: n.enabled, config: n.config } }))]);
     setEdges((es) => [...es, ...kit.edges]);
     setFunnel((prev) => ({ ...prev, name: prev.name || definition.name, stage: "mapping" }));
     setName((prev) => prev === "Untitled board" ? definition.name : prev);
@@ -458,8 +506,9 @@ function Canvas() {
     ad_feed: preview?.feed, ad_breakdown: preview?.breakdown, funnel_route: preview?.funnel,
     teardown: preview?.teardown, market_timeline: preview?.timeline,
   };
+  const stageList: any[] = job?.stages || [];
   const stages: Record<string, any> = {};
-  for (const stage of job?.stages || []) stages[stage.id] = stage;
+  for (const stage of stageList) stages[stage.id] = stage;
 
   const view = useMemo(() => {
     const visible = tab === "both" ? nodes : nodes.filter((n) => CATALOG[n.data.nodeType]?.side === tab);
@@ -468,8 +517,9 @@ function Canvas() {
     const viewEdges: Edge[] = [];
     const selectedId = nodes.find((n) => n.selected)?.id;
     const paint = (n: FlowNode): FlowNode => {
-      const sv = stageView(stages[n.id], job?.job?.status);
-      const runs = stages[n.id]?.runs || [];
+      const stage = stages[n.id] || stageFor(stageList, n.id, n.data.nodeType);
+      const sv = stageView(stage, job?.job?.status);
+      const runs = stage?.runs || [];
       const path = [...runs].reverse().find((r) => r.output_path)?.output_path;
       const inherited = n.data.nodeType === "funnel_route" && !n.data.config.funnel_id && n.id !== "funnel"
         ? null
@@ -561,6 +611,14 @@ function Canvas() {
     return !!rect && rect.width > 0 && rect.height > 0 && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
   };
 
+  const flowView = (): Box | undefined => {
+    const rect = flowPane.current?.getBoundingClientRect();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return undefined;
+    const origin = screenToFlowPosition({ x: rect.left, y: rect.top });
+    const end = screenToFlowPosition({ x: rect.right, y: rect.bottom });
+    return { x: Math.min(origin.x, end.x), y: Math.min(origin.y, end.y), width: Math.abs(end.x - origin.x), height: Math.abs(end.y - origin.y) };
+  };
+
   const addNode = (type: string, config: Record<string, string> = {}) => {
     const spec = CATALOG[type];
     if (!spec) return;
@@ -571,21 +629,65 @@ function Canvas() {
     const center = rect && rect.width > 0 && rect.height > 0
       ? screenToFlowPosition({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 })
       : { x: 48, y: 48 };
-    setNodes((ns) => [...ns, {
-      id, type: "board",
-      position: placeNode(ns.map(nodeBox), { x: center.x - size.width / 2, y: center.y - size.height / 2 }, size),
+    const view = flowView();
+    setNodes((ns) => [...ns.map((n) => (n.selected ? { ...n, selected: false } : n)), {
+      id, type: "board", selected: true,
+      position: placeNode(ns.map(nodeBox), { x: center.x - size.width / 2, y: center.y - size.height / 2 }, size, view),
       data: { nodeType: type, enabled: true, config },
     }]);
   };
 
   const save = useMutation({
-    mutationFn: async () => {
+    mutationFn: async (input?: { quiet?: boolean; boardId: string; name: string; graph: ReturnType<typeof serialize> }) => {
+      const target = input?.boardId || boardId;
+      const graph = input?.graph || serialize(nodes, edges, variables, funnel);
+      const boardName = input?.name ?? name;
       if (!loaded) throw new Error("This board has not finished loading.");
-      return api(`/api/boards/${boardId}`, { method: "PUT", body: { name, graph: serialize(nodes, edges, variables, funnel) }, timeoutMs: 12000 });
+      const row = await api(`/api/boards/${target}`, { method: "PUT", body: { name: boardName, graph }, timeoutMs: 12000 });
+      return { row, quiet: !!input?.quiet, snap: JSON.stringify(graph) + "\n" + boardName, boardId: target };
     },
-    onSuccess: (row: any) => { qc.setQueryData(["board", boardId], row); setEstimates(row.estimates || {}); setLoaded(boardId + (row.updated_at || "")); qc.invalidateQueries({ queryKey: ["boards"] }); toast.success("Board saved"); },
+    onSuccess: ({ row, quiet, snap, boardId: savedId }: { row: any; quiet: boolean; snap: string; boardId: string }) => {
+      if (savedId === boardId) {
+        baseline.current = snap;
+        qc.setQueryData(["board", boardId], row);
+        setEstimates(row.estimates || {});
+        setLoaded(boardId + (row.updated_at || ""));
+      }
+      qc.invalidateQueries({ queryKey: ["boards"] });
+      if (!quiet) toast.success("Board saved");
+    },
     onError: (e: Error) => toast.error(e.message),
   });
+  const saveRef = useRef(save);
+  saveRef.current = save;
+  const graphSnap = JSON.stringify(serialize(nodes, edges, variables, funnel)) + "\n" + name;
+  useEffect(() => {
+    if (!loaded) return;
+    if (adoptStamp.current && adoptStamp.current !== adoptedStamp.current) {
+      adoptedStamp.current = adoptStamp.current;
+      baseline.current = graphSnap;
+      attempted.current = "";
+      return;
+    }
+    if (!baseline.current || graphSnap === baseline.current || save.isPending || graphSnap === attempted.current) return;
+    const target = boardId;
+    const boardName = name;
+    const graph = serialize(nodes, edges, variables, funnel);
+    const timer = window.setTimeout(() => {
+      attempted.current = graphSnap;
+      saveRef.current.mutate({ quiet: true, boardId: target, name: boardName, graph });
+    }, 800);
+    return () => window.clearTimeout(timer);
+  }, [graphSnap, loaded, boardId, name, nodes, edges, variables, funnel, save.isPending]);
+  useEffect(() => {
+    const onLeave = (event: BeforeUnloadEvent) => {
+      if (!loaded || !baseline.current || (graphSnap === baseline.current && !save.isPending)) return;
+      event.preventDefault();
+      event.returnValue = "";
+    };
+    window.addEventListener("beforeunload", onLeave);
+    return () => window.removeEventListener("beforeunload", onLeave);
+  }, [graphSnap, loaded, save.isPending]);
   const create = useMutation({
     mutationFn: async (blank: boolean) => {
       if (!blank && !loaded) throw new Error("This board has not finished loading.");
@@ -614,12 +716,15 @@ function Canvas() {
       qc.setQueryData(["board", boardId], saved);
       setLoaded(boardId + (saved.updated_at || ""));
       const row = await api<{ id: string; mode: string; pump?: boolean; status?: string; error?: string; stages?: { id: string; status: string }[] }>(`/api/boards/${boardId}/run`, { body: { mode: "dry" }, timeoutMs: 25000 });
+      sessionJob.current = row.id;
       setJobId(row.id);
       let status = row.status || "started";
       const paint = async () => {
+        await qc.cancelQueries({ queryKey: ["job", row.id] });
         const fresh = await api<any>(`/api/jobs/${row.id}`, { timeoutMs: 25000 });
-        qc.setQueryData(["job", row.id], fresh);
-        return fresh?.job?.status as string | undefined;
+        let merged: any = fresh;
+        qc.setQueryData(["job", row.id], (prev: any) => { merged = mergeJobSnapshot(prev, fresh); return merged; });
+        return merged?.job?.status as string | undefined;
       };
       const applyStages = (stages?: { id: string; status: string }[], jobStatus?: string) => {
         if (!stages?.length && !jobStatus) return;
@@ -688,7 +793,7 @@ function Canvas() {
 
   const selected = nodes.find((n) => n.selected);
   const selectedSpec = selected ? CATALOG[selected.data.nodeType] : undefined;
-  const selectedView = selected ? stageView(stages[selected.id], job?.job?.status) : null;
+  const selectedView = selected ? stageView(stages[selected.id] || stageFor(stageList, selected.id, selected.data.nodeType), job?.job?.status) : null;
   const selectedPreview = selected ? previewByType[selected.data.nodeType] : null;
   const trackerOrigin = preview?.origin || board?.intel_origin || meta?.intel_origin;
   const fixture = trackerOrigin === "fixture";
@@ -720,7 +825,12 @@ function Canvas() {
       <div className="v3 v3-board">
         <header className="v3-top">
           <div className="v3-crumb">Boards / <input aria-label="Board name" value={name} onChange={(e) => setName(e.target.value)} /></div>
-          <select aria-label="Load board" className="v3-select" value={boardId} onChange={(e) => { setLoaded(""); setBoardId(e.target.value); }}>
+          <select aria-label="Load board" className="v3-select" value={boardId} onChange={(e) => {
+            if (baseline.current && graphSnap !== baseline.current) save.mutate({ quiet: true, boardId, name, graph: serialize(nodes, edges, variables, funnel) });
+            sessionJob.current = null;
+            setLoaded("");
+            setBoardId(e.target.value);
+          }}>
             {(list || [{ id: boardId, name: listQuery.isError ? "Board list did not load" : "Loading boards…" }]).map((b: any) => <option key={b.id} value={b.id}>{b.name}{b.preset ? " · preset" : ""}</option>)}
           </select>
           {trackerOrigin && <span className={`v3-badge ${fixture ? "ex" : "ok"}`}>{fixture ? "Fixture · not live" : "Live tracker"}</span>}
@@ -729,7 +839,7 @@ function Canvas() {
           <select aria-label="Persona" className="v3-select" value={variables.persona || ""} onChange={(e) => setVariables((v) => ({ ...v, persona: e.target.value }))}>
             {(meta?.personas || []).map((p: any) => <option key={p.id} value={p.id}>{p.display}</option>)}
           </select>
-          {board?.updated_at && <span className="v3-saved">{savedLabel(board.updated_at)}</span>}
+          {save.isPending ? <span className="v3-saved">Saving…</span> : board?.updated_at && <span className="v3-saved">{savedLabel(board.updated_at)}</span>}
           <button type="button" className="v3-btn" onClick={() => create.mutate(true)} disabled={create.isPending}><Plus size={13} />{create.isPending ? "Working…" : "New"}</button>
           <button type="button" className="v3-btn" onClick={() => create.mutate(false)} disabled={create.isPending || !loaded}><Copy size={13} />{create.isPending ? "Copying…" : "Copy"}</button>
           <button type="button" className="v3-btn" onClick={() => save.mutate()} disabled={save.isPending || !loaded}><Save size={13} />Save</button>
@@ -740,6 +850,7 @@ function Canvas() {
         {!loaded && !boardQuery.isError && <div className="v3-alert" role="status">Loading board…</div>}
         {boardQuery.isError && <div className="v3-alert" role="alert">Board did not load: {(boardQuery.error as Error).message}</div>}
         {listQuery.isError && <div className="v3-alert" role="alert">Board list did not load: {(listQuery.error as Error).message}</div>}
+        {save.isError && <div className="v3-alert" role="alert">Couldn't save this board. {(save.error as Error).message}</div>}
         {runError && <div className="v3-alert" role="alert">{runError}</div>}
         {!previewQuery.isError && previewQuery.isFetching && previewQuery.failureCount > 0 && <div className="v3-alert" role="status">Retrying preview…</div>}
         {previewQuery.isError && <div className="v3-alert" role="alert">Preview read failed: {(previewQuery.error as Error).message}</div>}
@@ -769,10 +880,15 @@ function Canvas() {
               const spec = CATALOG[type];
               const size = { width: spec.width, height: spec.side === "intel" ? 250 : 220 };
               const dropped = screenToFlowPosition({ x: e.clientX, y: e.clientY });
+              const view = flowView();
+              if (view && (dropped.x < view.x || dropped.y < view.y || dropped.x > view.x + view.width || dropped.y > view.y + view.height)) {
+                addNode(type);
+                return;
+              }
               const id = `${type}-${Math.random().toString(36).slice(2, 6)}`;
-              setNodes((ns) => [...ns, {
-                id, type: "board",
-                position: placeNode(ns.map(nodeBox), dropped, size),
+              setNodes((ns) => [...ns.map((n) => (n.selected ? { ...n, selected: false } : n)), {
+                id, type: "board", selected: true,
+                position: placeNode(ns.map(nodeBox), dropped, size, view),
                 data: { nodeType: type, enabled: true, config: {} },
               }]);
               setTab((current) => (current === "both" || current === spec.side ? current : "both"));
