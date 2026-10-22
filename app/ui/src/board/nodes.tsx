@@ -33,7 +33,9 @@ type WaterAd = {
   funnel?: string; assigned_funnel?: string; as_of?: string;
 };
 type PersonaOpt = { id: string; display: string; voice_name?: string };
-type AccountOpt = { advertiser: string; ads: number };
+type AccountOpt = { advertiser: string; ads: number; page_id?: string };
+type FunnelOpt = { id: string; name: string };
+export type RouteStep = { n?: number; kind?: string; label?: string; url?: string; state?: string; source?: string };
 
 export type BoardData = {
   nodeType: string;
@@ -55,8 +57,8 @@ export const BoardCtx = createContext<{
   follow: (id: string) => void;
   pickEvent: (id: string, event: { id: string; ad_id?: string }) => void;
   setConfig: (id: string, patch: Record<string, string>) => void;
-  mapFunnel: (id: string) => void;
-  replicate: (id: string) => void;
+  mapFunnel: (id: string, steps?: RouteStep[]) => void;
+  replicate: (id: string, steps?: RouteStep[]) => void;
   addAds: (ads: WaterAd[]) => void;
   buildKitPath: (id: string) => void;
   expandKitMap: (id: string) => void;
@@ -66,17 +68,15 @@ export const BoardCtx = createContext<{
   personaId: string;
   personas: PersonaOpt[];
   accounts: AccountOpt[];
+  funnels: FunnelOpt[];
+  dry: boolean;
   boardScript: string;
 }>({
   keys: {}, toggle: () => {}, follow: () => {}, pickEvent: () => {}, setConfig: () => {},
   mapFunnel: () => {}, replicate: () => {}, addAds: () => {}, buildKitPath: () => {}, expandKitMap: () => {},
   sources: [], wired: new Set(), persona: "", personaId: "",
-  personas: [], accounts: [], boardScript: "",
+  personas: [], accounts: [], funnels: [], dry: true, boardScript: "",
 });
-
-function money(n: number) {
-  return `$${n.toFixed(2)}`;
-}
 
 function statusClass(status: string) {
   if (status === "done") return "ok";
@@ -186,6 +186,19 @@ function TimelineChart({ nodeId, artefact, selectedId }: { nodeId: string; artef
   );
 }
 
+function collapseRoute(steps: RouteStep[]) {
+  const seen = new Set<string>();
+  const unique: RouteStep[] = [];
+  for (const step of steps) {
+    const label = /^\d{6,}$/.test(step.label || "") ? "Ad creative" : (step.label || "Step");
+    const key = `${step.kind || "step"}|${label}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push({ ...step, label });
+  }
+  return unique;
+}
+
 function FunnelSteps({ steps }: { steps: { label?: string }[] }) {
   const shown = steps.filter((s) => s.label).slice(0, 5);
   if (!shown.length) return null;
@@ -232,9 +245,13 @@ function FeedWaterfall({ nodeId, config, ads, matched }: { nodeId: string; confi
     <div className="nodrag nopan">
       <label className="v3-lab">Ad account
         <select aria-label="Ad account" className="v3-in" value={config.advertiser || ""}
-          onChange={(e) => setConfig(nodeId, { advertiser: e.target.value, ad_id: "" })}>
+          onChange={(e) => {
+            const advertiser = e.target.value;
+            const row = accounts.find((item) => item.advertiser === advertiser);
+            setConfig(nodeId, { advertiser, page_id: row?.page_id || "", ad_id: "", status: "", date_from: "", date_to: "", longevity_min: "", offset: "0" });
+          }}>
           <option value="">All accounts in this read</option>
-          {accounts.map((row) => <option key={row.advertiser} value={row.advertiser}>{row.advertiser} · {row.ads}</option>)}
+          {accounts.map((row) => <option key={row.page_id || row.advertiser} value={row.advertiser}>{row.advertiser} · {row.ads}</option>)}
         </select>
       </label>
       <div className="v3-acts nodrag nopan">
@@ -285,7 +302,12 @@ function FeedWaterfall({ nodeId, config, ads, matched }: { nodeId: string; confi
 function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
   artefact?: Artefact | null; nodeType: string; nodeId: string; selectedEvent?: string; config: Record<string, string>;
 }) {
-  const { mapFunnel, replicate } = useContext(BoardCtx);
+  const { mapFunnel, replicate, funnels, setConfig } = useContext(BoardCtx);
+  const pickedRoute = useQuery({
+    queryKey: ["funnel-route", config.funnel_id],
+    queryFn: () => api<{ steps: RouteStep[]; note?: string; funnel_name?: string }>(`/api/intel/funnels/${encodeURIComponent(config.funnel_id)}/route`),
+    enabled: nodeType === "funnel_route" && !!config.funnel_id,
+  });
   const evidence = artefact?.evidence;
   const fields = evidence?.fields || {};
   const picked = (fields.picked as { headline?: string; advertiser?: string } | undefined) || artefact?.ad;
@@ -310,15 +332,30 @@ function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
       </div>
     );
   }
+  const routeSteps = collapseRoute((pickedRoute.data?.steps?.length ? pickedRoute.data.steps : steps) as RouteStep[]);
   return (
     <div className="v3-bd">
       {nodeType === "ad_feed" && <FeedWaterfall nodeId={nodeId} config={config} ads={waterfall} matched={fields.matched as number | undefined} />}
       {nodeType === "funnel_route" && (
         <>
-          <FunnelSteps steps={steps} />
+          <label className="v3-lab">Funnel
+            <select aria-label="Funnel" className="v3-in" value={config.funnel_id || ""}
+              onChange={(e) => {
+                const row = funnels.find((item) => item.id === e.target.value);
+                setConfig(nodeId, { funnel_id: e.target.value, funnel_name: row?.name || "" });
+              }}>
+              <option value="">From the connected ad</option>
+              {funnels.map((row) => <option key={row.id} value={row.id}>{row.name}</option>)}
+            </select>
+          </label>
+          {config.funnel_name && <p className="v3-muted">{config.funnel_name}</p>}
+          {pickedRoute.isFetching && <p className="v3-muted">Loading funnel…</p>}
+          {pickedRoute.isError && <p className="v3-warn">{(pickedRoute.error as Error).message}</p>}
+          <FunnelSteps steps={routeSteps.slice(0, 8)} />
+          {routeSteps.length > 8 && <p className="v3-muted">{routeSteps.length - 8} more steps collapsed</p>}
           <div className="v3-acts nodrag nopan">
-            <button type="button" className="v3-mini" onClick={() => mapFunnel(nodeId)}>Map on canvas</button>
-            <button type="button" className="v3-mini" onClick={() => replicate(nodeId)}>Replicate</button>
+            <button type="button" className="v3-mini" onClick={() => mapFunnel(nodeId, routeSteps)}>Map on canvas</button>
+            <button type="button" className="v3-mini" onClick={() => replicate(nodeId, routeSteps)}>Replicate</button>
           </div>
         </>
       )}
@@ -546,13 +583,13 @@ function Handles({ spec, id }: { spec: NodeSpec; id: string }) {
 }
 
 export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "board">>) {
-  const { keys, toggle } = useContext(BoardCtx);
+  const { keys, toggle, dry } = useContext(BoardCtx);
   const spec = CATALOG[data.nodeType];
   if (!spec) return null;
   const Icon = spec.icon;
   const intel = spec.side === "intel";
   const status = data.status || "idle";
-  const cost = data.ran && data.actual != null ? money(data.actual) : money(data.est ?? 0);
+  const cost = "$0.00";
   const live = data.preview?.evidence?.origin === "live";
   const timelinePoints = data.preview?.evidence?.fields?.points;
   const hasTimeline = Array.isArray(timelinePoints) && timelinePoints.length > 0;
@@ -577,7 +614,7 @@ export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "boa
             <i />
           </button>}
         </header>
-        {spec.needsKey && !keys[spec.needsKey] && (
+        {spec.needsKey && !dry && !keys[spec.needsKey] && (
           <div className="v3-nk-row">
             <Link to="/settings#connections" className="nodrag nopan v3-nk">Needs key → Settings</Link>
           </div>

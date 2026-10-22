@@ -345,11 +345,11 @@ class Runner:
             if latest and latest["status"] == "running":
                 running = True
                 continue
-            deps_ok = all(self.is_ready(self.db.latest(job_id, d), self.def_of(defs, d)) for d in sdef["needs"])
-            if not deps_ok:
-                continue
             if latest and latest["status"] in ("failed", "blocked_budget"):
                 failed = True
+                continue
+            deps_ok = all(self.is_ready(self.db.latest(job_id, d), self.def_of(defs, d)) for d in sdef["needs"])
+            if not deps_ok:
                 continue
             if latest and latest["status"] == READY and latest["review_status"] == "rejected":
                 waiting = True
@@ -382,11 +382,70 @@ class Runner:
                     library.add(self.db, lr, "final output of a done job")
         return st
 
+    def _run_timeout_s(self):
+        """Past the function limit, so a stage that is still writing is not failed underneath itself."""
+        try:
+            return max(1, int(os.environ.get("STUDIO_RUN_TIMEOUT_S") or 360))
+        except ValueError:
+            return 360
+
+    def _run_age_s(self, started_at):
+        if not started_at:
+            return None
+        try:
+            started = dt.datetime.fromisoformat(started_at)
+        except ValueError:
+            return None
+        if started.tzinfo is None:
+            started = started.astimezone()
+        return (dt.datetime.now().astimezone() - started.astimezone()).total_seconds()
+
+    def _run_is_stale(self, run):
+        """A fal poll stays running between requests. Any other row still running past the timeout died with the instance."""
+        meta = json.loads(run.get("meta_json") or "{}")
+        if meta.get("fal"):
+            return False
+        age = self._run_age_s(run.get("started_at"))
+        if age is None:
+            return True
+        return age >= self._run_timeout_s()
+
+    def reconcile(self, job_id=None):
+        """Fail stage runs left running past the timeout.
+
+        A killed function cannot record its own failure, so the row stays `running`
+        until a later read or advance marks it failed. Re-run starts a new version.
+        """
+        sql = "SELECT * FROM stage_runs WHERE status='running'"
+        args = ()
+        if job_id:
+            sql += " AND job_id=?"
+            args = (job_id,)
+        failed = []
+        for run in self.db.q(sql, args):
+            if not self._run_is_stale(run):
+                continue
+            age = self._run_age_s(run.get("started_at"))
+            waited = f" after {int(age)}s" if age is not None else ""
+            reason = f"instance was killed or the run timed out{waited} (left running with no result)"
+            stamp = now()
+            self.db.update_run(run["id"], status="failed", error=reason, finished_at=stamp)
+            self.db.x("UPDATE attempts SET status='failed', error=?, finished_at=? WHERE stage_run_id=? AND status='running'",
+                      (reason, stamp, run["id"]))
+            if run["stage"] == "compose" and self.db.has_table("leases"):
+                self.db.x("DELETE FROM leases WHERE name='compose' AND job_id=?", (run["job_id"],))
+            self.log(run["job_id"], run["stage"], "error", reason)
+            self.settle(run["job_id"])
+            failed.append({"id": run["id"], "job_id": run["job_id"], "stage": run["stage"], "error": reason})
+        return {"failed": failed, "leases_released": self.db.release_expired_leases()}
+
     def advance(self, job_id, only=None):
         """Run one due stage, or poll one in-flight fal request. Safe to call again."""
         job = self.db.job(job_id)
         if not job:
             raise BriefError(f"no job {job_id}")
+        self.reconcile(job_id)
+        job = self.db.job(job_id)
         defs = self.stage_defs(job)
         running = [r for r in self.db.runs(job_id) if r["status"] == "running"]
         if running:

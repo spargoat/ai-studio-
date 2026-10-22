@@ -5,7 +5,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Loader2, Search } from "lucide-react";
 import { Media } from "../components/common";
 import { toast } from "../components/Toast";
-import { api, ts } from "../lib/api";
+import { api, fileUrl, ts } from "../lib/api";
 
 const TABS = [
   { id: "pending", label: "Pending approvals" },
@@ -93,9 +93,9 @@ export default function LibraryPage() {
           <div className="lib-grid">
             {(personas || []).map((p: any) => (
               <button key={p.id} type="button" className={`lib-card ${person?.id === p.id ? "is-sel" : ""}`} onClick={() => setPersonaId(p.id)}>
-                {p.refs?.[0]?.exists ? <img src={`/api/personas/${p.id}/ref/0`} alt="" /> : <div className="lib-ph">No reference</div>}
+                {p.refs?.[0]?.exists ? <img src={`/api/personas/${p.id}/ref/0`} alt="" /> : <div className="lib-ph" aria-hidden>{(p.display || "?").slice(0, 1)}</div>}
                 <b>{p.display}</b>
-                <small>{p.id}{p.voice_name ? ` · ${p.voice_name}` : ""}</small>
+                <small>{p.id}{p.voice_name ? ` · ${p.voice_name}` : ""}{p.refs?.[0]?.exists ? "" : " · No face sheet stored"}</small>
               </button>
             ))}
           </div>
@@ -106,8 +106,8 @@ export default function LibraryPage() {
               {person.look && <p>{person.look}</p>}
               <div className="lib-refs">
                 {person.refs.map((r: any) => r.exists
-                  ? <a key={r.i} href={`/api/personas/${person.id}/ref/${r.i}`}><img src={`/api/personas/${person.id}/ref/${r.i}`} alt={r.name} /><small>{r.name}</small></a>
-                  : <span key={r.i}>missing {r.name}</span>)}
+                  ? <a key={r.i} href={`/api/personas/${person.id}/ref/${r.i}`}><img src={`/api/personas/${person.id}/ref/${r.i}`} alt="" /><small>{r.name}</small></a>
+                  : <span key={r.i} className="lib-missing"><span className="lib-ph" aria-hidden>{(person.display || "?").slice(0, 1)}</span><small>No face sheet stored</small></span>)}
               </div>
               <h3>Lock</h3>
               <dl>{Object.entries(person.lock || {}).filter(([k]) => k !== "sources").map(([k, v]) => (
@@ -119,11 +119,15 @@ export default function LibraryPage() {
       ) : !shown.length ? <p className="v3-muted lib-empty">{tab === "pending" ? "Nothing is waiting on approval." : "Nothing in this section yet. Approved outputs land here with a purpose name."}</p> : (
         <div className="lib-grid">
           {shown.map((row: any) => (
-            <button key={`${row.job_id}-${row.id}`} type="button" className="lib-card" onClick={() => { setDetail(row); setNote(row.note || ""); }}>
-              <Media path={row.path} className="lib-media" />
-              <b>{row.purpose || row.stage}</b>
-              <small>id {row.library_id ?? row.id}</small>
-            </button>
+            <article key={`${row.job_id}-${row.id}`} className="lib-card">
+              {bucket(row.stage) === "voice"
+                ? (row.path ? <audio className="lib-audio" controls preload="none" src={fileUrl(row.path)} /> : <p className="v3-muted">No audio file stored for this note.</p>)
+                : <Media path={row.path} className="lib-media" />}
+              <button type="button" className="lib-open" onClick={() => { setDetail(row); setNote(row.note || ""); }}>
+                <b>{row.purpose || row.stage}</b>
+                <small>id {row.library_id ?? row.id}</small>
+              </button>
+            </article>
           ))}
         </div>
       )}

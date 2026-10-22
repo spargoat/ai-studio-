@@ -176,6 +176,19 @@ class DB:
         r = self.q(sql, args)
         return r[0] if r else None
 
+    def has_table(self, name):
+        return self.one("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)) is not None
+
+    def release_expired_leases(self):
+        """Drop compose leases past their expiry. Databases without the table have nothing to release."""
+        if not self.has_table("leases"):
+            return []
+        stamp = now()
+        rows = self.q("SELECT name, job_id FROM leases WHERE expires_at <= ?", (stamp,))
+        if rows:
+            self.x("DELETE FROM leases WHERE expires_at <= ?", (stamp,))
+        return [{"name": r["name"], "job_id": r["job_id"]} for r in rows]
+
     # --- jobs
     def create_job(self, job_id, template, persona, brief, mode, batch_id=None):
         t = now()

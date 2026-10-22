@@ -410,9 +410,9 @@ class T(unittest.TestCase):
                     break
                 if last.get("action") in ("idle", "stopped"):
                     break
-            self.assertEqual(last.get("status"), "awaiting_review", last)
+            self.assertEqual(last.get("status"), "done", last)
             done = client.get(f"/api/jobs/{payload['id']}").get_json()
-            for sid in ("timeline", "ad_feed", "ad_breakdown", "funnel", "teardown", "brief", "script"):
+            for sid in ("timeline", "ad_feed", "ad_breakdown", "funnel", "teardown", "brief", "script", "voice", "video"):
                 self.assertEqual(_stage_status(done, sid), "succeeded", sid)
                 run = _stage_run(done, sid)
                 self.assertEqual(run["actual_cost_usd"], 0, sid)
@@ -618,6 +618,155 @@ class T(unittest.TestCase):
         for row in pending.get_json():
             self.assertIn("purpose", row)
             self.assertEqual(row["library_id"], row["id"])
+
+    def test_preset_feed_does_not_keep_the_fixture_window(self):
+        feed = next(node for node in talking_head_preset()["nodes"] if node["id"] == "ad_feed")
+        self.assertEqual(feed["config"]["status"], "")
+        self.assertEqual(feed["config"]["date_from"], "")
+        self.assertEqual(feed["config"]["date_to"], "")
+        self.assertEqual(feed["config"]["longevity_min"], "")
+
+    def test_live_account_query_pins_page_id(self):
+        os.environ["ADINTEL_API_URL"] = "https://tracker.example"
+        os.environ["ADINTEL_API_SECRET"] = "secret"
+        class Resp:
+            status_code = 200
+            def json(self):
+                return {"ok": True, "evidence": {"source": "sqlite", "asOf": "2026-10-22"},
+                        "matched": 60, "limit": 40, "offset": 0,
+                        "observed": {"ads": [{"id": "elio-1", "advertiser": "Elio Info", "pageId": "126",
+                                              "status": "stopped", "headline": "A live ad"}]}}
+        try:
+            with patch("studio.adintel.requests.get", return_value=Resp()) as get:
+                pack = query_ads({"advertiser": "Elio Info", "page_id": "126"})
+            self.assertEqual(pack["matched"], 60)
+            self.assertEqual(pack["ads"][0]["page_id"], "126")
+            params = get.call_args.kwargs["params"]
+            self.assertEqual(params["advertiser"], "Elio Info")
+            self.assertEqual(params["pageId"], "126")
+            self.assertNotIn("status", params)
+            self.assertNotIn("min_days", params)
+        finally:
+            os.environ.pop("ADINTEL_API_URL", None)
+            os.environ.pop("ADINTEL_API_SECRET", None)
+
+    def test_live_account_query_retries_without_page_id_on_400(self):
+        os.environ["ADINTEL_API_URL"] = "https://tracker.example"
+        os.environ["ADINTEL_API_SECRET"] = "secret"
+        class Resp:
+            def __init__(self, code, body=None):
+                self.status_code = code
+                self.body = body or {}
+            def json(self):
+                return self.body
+        good = {"ok": True, "evidence": {"source": "sqlite"}, "matched": 1, "observed": {"ads": [
+            {"id": "elio-1", "advertiser": "Elio Info", "status": "stopped"}]}}
+        try:
+            with patch("studio.adintel.requests.get", side_effect=[Resp(400), Resp(200, good)]) as get:
+                pack = query_ads({"advertiser": "Elio Info", "page_id": "126"})
+            self.assertEqual(pack["ads"][0]["id"], "elio-1")
+            self.assertEqual(get.call_count, 2)
+            self.assertNotIn("pageId", get.call_args_list[1].kwargs["params"])
+        finally:
+            os.environ.pop("ADINTEL_API_URL", None)
+            os.environ.pop("ADINTEL_API_SECRET", None)
+
+    def test_route_steps_replace_raw_ad_ids(self):
+        from studio.adintel import route_for_funnel
+        os.environ["ADINTEL_API_URL"] = "https://tracker.example"
+        os.environ["ADINTEL_API_SECRET"] = "secret"
+        class Resp:
+            status_code = 200
+            def json(self):
+                return {"ok": True, "evidence": {"source": "sqlite", "asOf": "2026-10-22"},
+                        "funnel": {"id": "rec1", "name": "Algo Structure Fx"},
+                        "observed": {"storedSteps": [
+                            {"role": "family", "title": "1005340982122322"},
+                            {"role": "landing", "title": "See details", "url": "https://example.test/join"},
+                        ], "laneSteps": []},
+                        "inferred": {"storedSteps": [], "laneSteps": []},
+                        "unknown": {"storedSteps": [], "laneSteps": []}}
+        try:
+            with patch("studio.adintel.requests.get", return_value=Resp()):
+                route = route_for_funnel("rec1")
+            self.assertEqual(route["funnel_name"], "Algo Structure Fx")
+            self.assertEqual(route["steps"][0]["label"], "Ad creative")
+            self.assertEqual(route["steps"][1]["label"], "See details")
+            self.assertNotIn("1005340982122322", route["steps"][0]["label"])
+        finally:
+            os.environ.pop("ADINTEL_API_URL", None)
+            os.environ.pop("ADINTEL_API_SECRET", None)
+
+    def test_board_reports_tracker_origin_without_a_preview(self):
+        client = create_app(cfg()).test_client()
+        board = client.get("/api/boards/talking_head")
+        self.assertEqual(board.status_code, 200)
+        body = board.get_json()
+        self.assertEqual(body["intel_origin"], "fixture")
+        self.assertEqual(body["preview"]["origin"], "fixture")
+        self.assertEqual(client.get("/api/meta").get_json()["intel_origin"], "fixture")
+
+    def test_dry_board_run_is_not_stopped_by_review_gates(self):
+        c = cfg()
+        c["_db_file"] = TMP / "drygate.db"
+        os.environ["STUDIO_ONE_STAGE"] = "1"
+        self.addCleanup(os.environ.pop, "STUDIO_ONE_STAGE", None)
+        app = create_app(c)
+        with patch("studio.runner.Runner.advance", return_value={"action": "idle", "status": "created"}):
+            res = app.test_client().post("/api/boards/talking_head/run", json={"mode": "dry"})
+        self.assertEqual(res.status_code, 201, res.get_data(as_text=True))
+        jid = res.get_json()["id"]
+        job = app.test_client().get(f"/api/jobs/{jid}").get_json()
+        stages = job["job"]["brief"]["board_stages"]
+        self.assertTrue(stages)
+        self.assertTrue(all(stage.get("review") is False for stage in stages))
+
+    def test_spend_read_fails_stuck_compose_jobs(self):
+        import datetime as dt
+        c = cfg()
+        c["_db_file"] = TMP / "stuck.db"
+        r = Runner(c, log=lambda m: None)
+        old = (dt.datetime.now().astimezone() - dt.timedelta(days=2)).isoformat(timespec="seconds")
+        ids = {}
+        for jid in ("j-1020-183743-uho", "j-1020-183744-tfn"):
+            r.db.create_job(jid, "talking_head", "marco",
+                            {"persona": "marco", "template": "talking_head", "script": "Stop first."}, "dry")
+            rid, _ = r.db.new_run(jid, "compose", "dry", "ffmpeg", "compose", "local", "", {}, {}, 0.0)
+            r.db.update_run(rid, started_at=old)
+            r.db.set_job_status(jid, "running")
+            r.db.add_attempt(stage_run_id=rid, job_id=jid, stage="compose", attempt=1, mode="dry",
+                             provider="ffmpeg", model="compose", status="running", started_at=old)
+            ids[jid] = rid
+        fresh = "j-fresh-running"
+        r.db.create_job(fresh, "talking_head", "marco",
+                        {"persona": "marco", "template": "talking_head", "script": "Stop first."}, "dry")
+        fresh_id, _ = r.db.new_run(fresh, "compose", "dry", "ffmpeg", "compose", "local", "", {}, {}, 0.0)
+        r.db.set_job_status(fresh, "running")
+        r.close()
+        client = create_app(c).test_client()
+        res = client.get("/api/spend")
+        self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+        check = Runner(c, log=lambda m: None)
+        self.addCleanup(check.close)
+        recent = {row["job_id"]: row for row in res.get_json()["recent"]}
+        for jid, rid in ids.items():
+            self.assertEqual(check.db.run(rid)["status"], "failed", jid)
+            self.assertIn("timed out", check.db.run(rid)["error"])
+            self.assertEqual(check.db.job(jid)["status"], "failed", jid)
+            self.assertEqual(recent[jid]["status"], "failed")
+        self.assertEqual(check.db.run(fresh_id)["status"], "running")
+        self.assertEqual(check.db.job(fresh)["status"], "running")
+
+    def test_marco_face_sheet_is_a_placeholder_when_the_file_is_missing(self):
+        client = create_app(cfg()).test_client()
+        rows = client.get("/api/personas").get_json()
+        marco = next(row for row in rows if row["id"] == "marco")
+        ref = marco["refs"][0]
+        if ref["exists"]:
+            self.assertFalse(ref["placeholder"])
+        else:
+            self.assertTrue(ref["placeholder"])
+            self.assertFalse(ref["exists"])
 
 
 def _stage_run(job, sid):

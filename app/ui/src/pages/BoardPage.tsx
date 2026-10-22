@@ -5,13 +5,13 @@ import {
   useReactFlow, type Connection, type Edge, type Node, type NodeChange, type EdgeChange, type OnConnect, type FinalConnectionState,
 } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import { Hash, Play, Copy, Save, Plus } from "lucide-react";
+import { Hash, Play, Copy, Save, Plus, Loader2 } from "lucide-react";
 import { api, fileUrl } from "../lib/api";
 import { toast } from "../components/Toast";
 import { CATALOG, PALETTE, PORT_COLOR, portType, type Side } from "../board/catalog";
 import { applyConnection, placeNode, type Box } from "../board/graph";
 import { buildKit, buildKitPipeline, kitById, KITS } from "../board/kits";
-import { BoardCtx, nodeTypes, type Artefact, type BoardData } from "../board/nodes";
+import { BoardCtx, nodeTypes, type Artefact, type BoardData, type RouteStep } from "../board/nodes";
 
 type Lens = Side | "both";
 type FlowNode = Node<BoardData, "board">;
@@ -20,6 +20,33 @@ type GraphEdge = { id: string; source: string; target: string; sourceHandle?: st
 type FunnelMeta = { name: string; stage: string; owner: string; channel: string; sourceAdIds: string[] };
 const EMPTY_FUNNEL: FunnelMeta = { name: "", stage: "mapping", owner: "", channel: "", sourceAdIds: [] };
 
+function feedConfig(type: string, config: Record<string, string>) {
+  const cfg = { ...(config || {}) };
+  // The talking-head preset stored the fixture window. On the live tracker that
+  // window (live + 30 days) is empty for accounts whose dropdown count is not.
+  if (type === "ad_feed" && cfg.status === "live" && cfg.date_from === "2026-07-01" && cfg.date_to === "2026-10-18" && String(cfg.longevity_min || "") === "30") {
+    cfg.status = "";
+    cfg.date_from = "";
+    cfg.date_to = "";
+    cfg.longevity_min = "";
+  }
+  return cfg;
+}
+
+function presentSteps(steps: RouteStep[]): RouteStep[] {
+  const seen = new Set<string>();
+  const unique: RouteStep[] = [];
+  for (const step of steps) {
+    const label = /^\d{6,}$/.test(step.label || "") ? "Ad creative" : (step.label || "Step");
+    const key = `${step.kind || "step"}|${label}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    unique.push({ ...step, label });
+  }
+  if (unique.length <= 12) return unique;
+  return [...unique.slice(0, 11), { n: 12, kind: "step", label: `${unique.length - 11} more steps collapsed`, state: "unknown" }];
+}
+
 function toFlow(nodes: GraphNode[]): FlowNode[] {
   let selectTimeline = true;
   const flow: FlowNode[] = (nodes || []).filter((n) => CATALOG[n.type]).map((n) => {
@@ -27,7 +54,7 @@ function toFlow(nodes: GraphNode[]): FlowNode[] {
     if (selected) selectTimeline = false;
     return {
       id: n.id, type: "board" as const, position: n.position || { x: 0, y: 0 }, selected,
-      data: { nodeType: n.type, enabled: n.enabled !== false, config: n.config || {} },
+      data: { nodeType: n.type, enabled: n.enabled !== false, config: feedConfig(n.type, n.config || {}) },
     };
   });
   return flow;
@@ -54,8 +81,8 @@ function savedLabel(iso?: string) {
 function stageView(stage: { runs?: { status: string; review_status?: string; actual_cost_usd?: number; est_cost_usd?: number }[] } | undefined, jobStatus?: string) {
   const run = stage?.runs?.length ? stage.runs[stage.runs.length - 1] : undefined;
   if (!run) {
-    if (!jobStatus) return { status: "idle", actual: null as number | null, ran: false };
-    return { status: jobStatus === "done" || jobStatus === "failed" ? "blocked" : "waiting", actual: null, ran: false };
+    if (jobStatus === "created" || jobStatus === "running" || jobStatus === "partial") return { status: "waiting", actual: null as number | null, ran: false };
+    return { status: "idle", actual: null as number | null, ran: false };
   }
   let status = run.status;
   if (run.status === "succeeded" && run.review_status === "pending") status = "needs review";
@@ -92,6 +119,8 @@ function Canvas() {
   const [loaded, setLoaded] = useState("");
   const [query, setQuery] = useState("");
   const [pane, setPane] = useState<"config" | "output" | "runs">("config");
+  const [notice, setNotice] = useState("");
+  const [busyId, setBusyId] = useState("");
   const searchRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => { window.localStorage.setItem("studio:board-id", boardId); }, [boardId]);
@@ -117,6 +146,7 @@ function Canvas() {
   const timeline = nodes.find((n) => n.data.nodeType === "market_timeline");
   const previewQs = new URLSearchParams({
     advertiser: feed?.data.config.advertiser || "",
+    page_id: feed?.data.config.page_id || "",
     status: feed?.data.config.status || "",
     date_from: feed?.data.config.date_from || "",
     date_to: feed?.data.config.date_to || "",
@@ -270,9 +300,12 @@ function Canvas() {
     const fields = (preview?.funnel?.evidence?.fields || {}) as { steps?: { n?: number; kind?: string; label?: string; url?: string }[]; ad_id?: string };
     return { steps: fields.steps || [], adId: fields.ad_id || "", asOf: preview?.funnel?.evidence?.data_as_of || "" };
   }, [preview]);
-  const mapFunnel = useCallback((funnelId: string) => {
-    const { steps, adId, asOf } = funnelSteps();
-    if (!steps.length) { toast.error("No public steps in this read."); return; }
+  const mapFunnel = useCallback((funnelId: string, explicit?: RouteStep[]) => {
+    const read = funnelSteps();
+    const steps = presentSteps(explicit?.length ? explicit : read.steps);
+    const adId = read.adId;
+    const asOf = read.asOf;
+    if (!steps.length) { toast.info("No public steps in this read. Pick a funnel on the block, or replicate to scaffold ours."); return; }
     setTab("both");
     setNodes((ns) => {
       const funnel = ns.find((n) => n.id === funnelId);
@@ -286,6 +319,7 @@ function Canvas() {
           id, type: "board",
           position: placeNode(next.map(nodeBox), { x: funnel.position.x + 480 + i * (spec.width + 36), y: funnel.position.y }, { width: spec.width, height: 180 }),
           data: { nodeType: "funnel_step", enabled: true, config: {
+            title: `${step.n || i + 1}. ${step.label || "Step"}`,
             n: String(step.n || i + 1), kind: step.kind || "", label: step.label || "", url: step.url || "", ad_id: adId, data_as_of: asOf,
           } },
         });
@@ -305,28 +339,34 @@ function Canvas() {
     });
     toast.success(preview?.funnel?.evidence?.origin === "live" ? "Tracker route cards mapped. Order and links need verification." : "Public funnel mapped on the canvas");
   }, [funnelSteps, preview]);
-  const mapDirectoryFunnel = useCallback(async (funnelName: string, advertiser: string) => {
+  const mapDirectoryFunnel = useCallback(async (funnelId: string, funnelName: string) => {
+    setBusyId(`funnel:${funnelId}`);
     try {
-      const route = await api<{ steps: { n: number; kind?: string; label?: string; url?: string; state?: string; source?: string }[]; note?: string; data_as_of?: string }>(`/api/intel/funnels/${encodeURIComponent(funnelName)}/route`);
-      if (!route.steps.length) { toast.error(route.note || "No steps in this route read."); return; }
+      const route = await api<{ steps: RouteStep[]; note?: string; data_as_of?: string; funnel_name?: string }>(`/api/intel/funnels/${encodeURIComponent(funnelId)}/route`);
+      const title = route.funnel_name || funnelName || "Funnel";
+      const steps = presentSteps(route.steps || []);
+      if (!steps.length) { toast.error(route.note || "No steps in this route read."); return; }
       const prefix = `route-${Date.now().toString(36)}`;
       const x = Math.max(0, ...nodes.map((n) => n.position.x + (CATALOG[n.data.nodeType]?.width || 260))) + 160;
       const noteId = `${prefix}-head`;
       setNodes((ns) => [
         ...ns,
-        { id: noteId, type: "board", position: { x, y: 0 }, data: { nodeType: "note", enabled: true, config: { title: `${advertiser}: ${funnelName}`, notes: "Tracker route read. Cards are grouped by evidence state. Confirm sequence and links before using this as a process map." } } },
-        ...route.steps.map((step, i) => ({ id: `${prefix}-${i}`, type: "board" as const,
+        { id: noteId, type: "board", position: { x, y: 0 }, data: { nodeType: "note", enabled: true, config: { title, notes: "Tracker route read. Repeated cards are collapsed. Confirm sequence and links before using this as a process map." } } },
+        ...steps.map((step, i) => ({ id: `${prefix}-${i}`, type: "board" as const,
           position: { x: x + (i % 4) * 250, y: 290 + Math.floor(i / 4) * 250 },
-          data: { nodeType: "funnel_step", enabled: true, config: { n: String(step.n), kind: step.kind || "", label: step.label || "", url: step.url || "", state: step.state || "unknown", source: step.source || "", data_as_of: route.data_as_of || "" } } }))
+          data: { nodeType: "funnel_step", enabled: true, config: { title: `${step.n || i + 1}. ${step.label || "Step"}`, n: String(step.n || i + 1), kind: step.kind || "", label: step.label || "Step", url: step.url || "", state: step.state || "unknown", source: step.source || "", data_as_of: route.data_as_of || "" } } }))
       ]);
       setTab("both");
       setTimeout(() => fitView({ nodes: [{ id: noteId }], padding: 0.4, duration: 250 }), 40);
-      toast.success(`${route.steps.length} route cards added`);
+      toast.success(`${steps.length} route cards added`);
     } catch (e) { toast.error((e as Error).message); }
+    finally { setBusyId(""); }
   }, [nodes, fitView]);
-  const replicate = useCallback((funnelId: string) => {
-    const { steps, adId, asOf } = funnelSteps();
-    if (!steps.length) { toast.error("No public steps in this read."); return; }
+  const replicate = useCallback((funnelId: string, explicit?: RouteStep[]) => {
+    const read = funnelSteps();
+    const steps = presentSteps(explicit?.length ? explicit : read.steps);
+    const adId = read.adId;
+    const asOf = read.asOf;
     setTab("both");
     const ad = steps.find((s) => s.kind === "ad") || steps[0];
     const click = steps.find((s) => s.kind === "click");
@@ -351,7 +391,7 @@ function Canvas() {
       };
       steps.forEach((step, i) => ensure(`step-${funnelId}-${step.n || i + 1}`, "funnel_step",
         { x: funnel.position.x + 480 + i * 236, y: funnel.position.y },
-        { n: String(step.n || i + 1), kind: step.kind || "", label: step.label || "", url: step.url || "", ad_id: adId, data_as_of: asOf }));
+        { title: `${step.n || i + 1}. ${step.label || "Step"}`, n: String(step.n || i + 1), kind: step.kind || "", label: step.label || "", url: step.url || "", ad_id: adId, data_as_of: asOf }));
       const y = funnel.position.y + 320;
       const x = funnel.position.x + 480;
       ensure(briefId, "brief", { x, y }, {
@@ -371,20 +411,20 @@ function Canvas() {
           add.push({ id, source, target, sourceHandle, targetHandle });
         }
       };
-      if (preview?.funnel?.evidence?.origin !== "live") steps.forEach((step, i) => {
+      if (steps.length && preview?.funnel?.evidence?.origin !== "live" && !explicit?.length) steps.forEach((step, i) => {
         if (i === 0) return;
         link(`step-${funnelId}-${steps[i - 1].n || i}`, "step", `step-${funnelId}-${step.n || i + 1}`, "step");
       });
-      link(`step-${funnelId}-${ad.n || 1}`, "step", briefId, "source");
+      if (ad) link(`step-${funnelId}-${ad.n || 1}`, "step", briefId, "source");
       link(briefId, "brief", scriptId, "brief");
       if (click) link(`step-${funnelId}-${click.n}`, "step", scriptId, "source");
       link(scriptId, "script", voiceId, "script");
       link(voiceId, "audio", videoId, "audio");
       link(briefId, "brief", landingId, "brief");
-      link(`step-${funnelId}-${land.n || steps.length}`, "step", landingId, "source");
+      if (land) link(`step-${funnelId}-${land.n || steps.length}`, "step", landingId, "source");
       return add;
     });
-    toast.success("Our funnel is scaffolded under the public steps");
+    toast.success(steps.length ? "Our funnel is scaffolded under the public steps" : "Brief, Script, Voiceover, Video and a landing outline are on the board");
   }, [funnelSteps, variables, preview]);
 
   const previewByType: Record<string, Artefact | null> = {
@@ -507,13 +547,15 @@ function Canvas() {
   const create = useMutation({
     mutationFn: async (blank: boolean) => api("/api/boards", { method: "POST", body: blank
       ? { name: "Untitled board", graph: { nodes: [], edges: [], variables: {}, funnel: EMPTY_FUNNEL } }
-      : { name: name || "Untitled board", graph: serialize(nodes, edges, variables, funnel) } }),
+      : { name: `${(name || "Untitled board").replace(/ copy$/, "")} copy`, graph: serialize(nodes, edges, variables, funnel) } }),
     onSuccess: (row: any, blank) => {
       qc.setQueryData(["boards"], (previous: any[] | undefined) => [...(previous || []).filter((item) => item.id !== row.id), row]);
       qc.setQueryData(["board", row.id], row);
       setBoardId(row.id);
       qc.invalidateQueries({ queryKey: ["boards"] });
-      toast.success(blank ? "Blank board created" : "Board copied");
+      const message = blank ? `New board “${row.name}” is ready.` : `Copied this board to “${row.name}”.`;
+      setNotice(message);
+      toast.success(message);
     },
     onError: (e: Error) => toast.error(e.message),
   });
@@ -525,16 +567,24 @@ function Canvas() {
       const row = await api<{ id: string; mode: string; pump?: boolean }>(`/api/boards/${boardId}/run`, { body: { mode: "dry" } });
       setJobId(row.id);
       let status = "started";
-      if (row.pump) {
-        for (let i = 0; i < 24; i++) {
-          const step = await api<{ status?: string; action?: string; ok?: boolean; error?: string }>(`/api/jobs/${row.id}/advance`, { method: "POST", body: {} });
+      const paint = async () => {
+        const fresh = await api<any>(`/api/jobs/${row.id}`);
+        qc.setQueryData(["job", row.id], fresh);
+        return fresh?.job?.status as string | undefined;
+      };
+      for (let i = 0; i < 80; i++) {
+        let action = "";
+        if (row.pump) {
+          const step = await api<{ status?: string; action?: string; stage?: string; ok?: boolean; error?: string }>(`/api/jobs/${row.id}/advance`, { method: "POST", body: {} });
           status = step.status || status;
-          qc.invalidateQueries({ queryKey: ["job", row.id] });
+          action = step.action || "";
           if (step.ok === false) throw new Error(step.error || "Dry run stopped");
-          if (step.action === "idle" || step.action === "stopped") break;
-          if (status === "awaiting_review" || status === "done" || status === "failed") break;
-          if (status !== "created" && status !== "running" && status !== "partial") break;
         }
+        status = await paint() || status;
+        if (action === "idle" || action === "stopped") break;
+        if (status === "done" || status === "failed" || status === "awaiting_review") break;
+        if (!row.pump && status !== "created" && status !== "running" && status !== "partial") break;
+        await new Promise((resolve) => setTimeout(resolve, 280));
       }
       return { ...row, status };
     },
@@ -557,7 +607,8 @@ function Canvas() {
   const selectedSpec = selected ? CATALOG[selected.data.nodeType] : undefined;
   const selectedView = selected ? stageView(stages[selected.id], job?.job?.status) : null;
   const selectedPreview = selected ? previewByType[selected.data.nodeType] : null;
-  const fixture = !preview || preview.origin !== "live";
+  const trackerOrigin = preview?.origin || board?.intel_origin || meta?.intel_origin;
+  const fixture = trackerOrigin === "fixture";
   const cap = meta?.caps?.per_job;
   const needle = query.trim().toLowerCase();
   const lensIndex = tab === "intel" ? 0 : tab === "both" ? 1 : 2;
@@ -565,15 +616,22 @@ function Canvas() {
 
   const setFeed = (key: string, value: string) => {
     if (!selected) return;
-    setNodes((ns) => ns.map((n) => n.id === selected.id ? { ...n, data: { ...n.data, config: { ...n.data.config, [key]: value } } } : n));
+    setNodes((ns) => ns.map((n) => {
+      if (n.id !== selected.id) return n;
+      const config = { ...n.data.config, [key]: value };
+      if (key === "advertiser") config.page_id = "";
+      return { ...n, data: { ...n.data, config } };
+    }));
   };
 
   return (
     <BoardCtx.Provider value={{
-      keys, toggle, follow, pickEvent, setConfig, mapFunnel, replicate, addAds, buildKitPath, expandKitMap, sources, wired, persona,
+      keys, toggle, follow, pickEvent, setConfig, mapFunnel, replicate, addAds, buildKitPath, expandKitMap,       sources, wired, persona,
       personaId: variables.persona || meta?.personas?.[0]?.id || "",
       personas: meta?.personas || [],
       accounts: accountsQuery.data?.accounts || [],
+      funnels: (directoryQuery.data?.funnels || []).map((row: { id: string; name: string }) => ({ id: row.id, name: row.name })),
+      dry: true,
       boardScript: variables.script || "",
     }}>
       <div className="v3 v3-board">
@@ -582,19 +640,20 @@ function Canvas() {
           <select aria-label="Load board" className="v3-select" value={boardId} onChange={(e) => { setLoaded(""); setBoardId(e.target.value); }}>
             {(list || [{ id: "talking_head", name: "Talking head" }]).map((b: any) => <option key={b.id} value={b.id}>{b.name}{b.preset ? " · preset" : ""}</option>)}
           </select>
-          <span className={`v3-badge ${fixture ? "ex" : "ok"}`}>{fixture ? "Fixture · not live" : "Live tracker"}</span>
+          {trackerOrigin && <span className={`v3-badge ${fixture ? "ex" : "ok"}`}>{fixture ? "Fixture · not live" : "Live tracker"}</span>}
           <span className="v3-badge v3-mono">Dry run · $0.00{cap != null ? ` of $${Number(cap).toFixed(0)} cap` : ""}</span>
           <div className="v3-sp" />
           <select aria-label="Persona" className="v3-select" value={variables.persona || ""} onChange={(e) => setVariables((v) => ({ ...v, persona: e.target.value }))}>
             {(meta?.personas || []).map((p: any) => <option key={p.id} value={p.id}>{p.display}</option>)}
           </select>
           {board?.updated_at && <span className="v3-saved">{savedLabel(board.updated_at)}</span>}
-          <button type="button" className="v3-btn" onClick={() => create.mutate(true)} disabled={create.isPending}><Plus size={13} />New</button>
-          <button type="button" className="v3-btn" onClick={() => create.mutate(false)} disabled={create.isPending}><Copy size={13} />Copy</button>
+          <button type="button" className="v3-btn" onClick={() => create.mutate(true)} disabled={create.isPending}><Plus size={13} />{create.isPending ? "Working…" : "New"}</button>
+          <button type="button" className="v3-btn" onClick={() => create.mutate(false)} disabled={create.isPending}><Copy size={13} />{create.isPending ? "Copying…" : "Copy"}</button>
           <button type="button" className="v3-btn" onClick={() => save.mutate()} disabled={save.isPending}><Save size={13} />Save</button>
           <button type="button" className="v3-btn pri" onClick={() => run.mutate()} disabled={run.isPending || !hasRunnableNodes}
             title={hasRunnableNodes ? "Run executable nodes without provider spend" : "Add an executable node such as Brief, Script or Video to run"}><Play size={13} />Run (dry)</button>
         </header>
+        {notice && <div className="v3-confirm" role="status">{notice}</div>}
         <div className="v3-funnel-bar">
           <label>Funnel <input aria-label="Funnel name" value={funnel.name} placeholder="Name this funnel" onChange={(e) => setFunnel((f) => ({ ...f, name: e.target.value }))} /></label>
           <label>Stage <select aria-label="Funnel stage" value={funnel.stage} onChange={(e) => setFunnel((f) => ({ ...f, stage: e.target.value }))}>
@@ -641,7 +700,9 @@ function Canvas() {
                     {kits.map((kit) => <button key={kit.id} type="button" draggable className="palette-tile palette-tile-create" data-palette={`${kit.id}-kit`}
                       title={`${kit.description} Source: ${kit.source}`}
                       onDragStart={(e) => { e.dataTransfer.setData("application/board-kit", kit.id); e.dataTransfer.effectAllowed = "move"; }}
-                      onClick={() => addKit(kit.id)}><span className="palette-label">{kit.name}</span></button>)}
+                      onClick={async () => { setBusyId(`kit:${kit.id}`); try { addKit(kit.id); await new Promise((r) => setTimeout(r, 350)); } finally { setBusyId(""); } }}>
+                      {busyId === `kit:${kit.id}` ? <Loader2 size={14} className="v3-spin" /> : null}
+                      <span className="palette-label">{kit.name}</span></button>)}
                   </div>
                 </div>;
               })}
@@ -683,8 +744,8 @@ function Canvas() {
                 <p className="v3-muted">{directoryQuery.data.coverage}</p>
                 {(directoryQuery.data.funnels || []).filter((f: { name: string; advertisers?: string[] }) => !needle || `${f.name} ${(f.advertisers || []).join(" ")}`.toLowerCase().includes(needle)).map((f: { id: string; name: string; advertisers?: string[]; ads?: number | null }) => (
                   <button key={f.id} type="button" className="v3-dir-item"
-                    onClick={() => mapDirectoryFunnel(f.id, (f.advertisers || []).join(", ") || f.name)} title="Map tracker route cards on this board">
-                    <b>{f.name}</b><small>{(f.advertisers || []).join(", ") || "Advertiser not linked"}{f.ads != null ? ` · ${f.ads} assigned ads` : ""}</small>
+                    onClick={() => mapDirectoryFunnel(f.id, f.name)} title="Map tracker route cards on this board" disabled={busyId === `funnel:${f.id}`}>
+                    <b>{busyId === `funnel:${f.id}` ? "Loading funnel…" : f.name}</b><small>{(f.advertisers || []).join(", ") || "Advertiser not linked"}{f.ads != null ? ` · ${f.ads} assigned ads` : ""}</small>
                   </button>
                 ))}
               </div>}
@@ -750,7 +811,7 @@ function Canvas() {
                     <p className="v3-copy">Use the kit card to attach a source, review the outline and open an editable production path when needed. Save the board to keep these choices.</p>
                   )}
                   {pane === "config" && selected.data.nodeType !== "kit_master" && selected.data.nodeType !== "ad_feed" && selected.data.nodeType !== "market_timeline" && (
-                    <p className="v3-copy">This node takes its stage settings from the template. Connect a matching port to feed it.</p>
+                    <NodeInputs node={selected} nodes={nodes} edges={edges} />
                   )}
                   {pane === "output" && (
                     <>
@@ -776,6 +837,39 @@ function Canvas() {
         </div>
       </div>
     </BoardCtx.Provider>
+  );
+}
+
+function NodeInputs({ node, nodes, edges }: { node: FlowNode; nodes: FlowNode[]; edges: Edge[] }) {
+  const spec = CATALOG[node.data.nodeType];
+  const named: Record<string, [string, string][]> = {
+    brief: [["persona", "Persona"], ["offer", "Offer"], ["angle", "Angle"], ["length", "Length"], ["platform", "Platform"]],
+    script: [["script", "Script"], ["framework", "Framework"]],
+    voice: [["voice", "Voice"]],
+    video: [["format", "Format"], ["aspect", "Aspect"]],
+    still: [["prompt", "Image prompt"], ["aspect_ratio", "Aspect"]],
+    landing: [["offer", "Offer"], ["angle", "Angle"]],
+    funnel_route: [["funnel_name", "Funnel"], ["ad_id", "Ad"]],
+    funnel_step: [["label", "Label"], ["kind", "Kind"], ["url", "URL"], ["state", "State"]],
+    ad_breakdown: [["ad_id", "Ad"]],
+    teardown: [["ad_id", "Ad"]],
+  };
+  const fields = named[node.data.nodeType] || [];
+  const incoming = edges.filter((edge) => edge.target === node.id);
+  return (
+    <div className="v3-flds">
+      {spec.inputs.map((port) => {
+        const edge = incoming.find((item) => item.targetHandle === port.id);
+        const source = nodes.find((item) => item.id === edge?.source);
+        return <div className="v3-kv" key={port.id}><span>{port.id}</span><span>{source ? CATALOG[source.data.nodeType]?.headline || source.id : "Not connected"}</span></div>;
+      })}
+      {fields.map(([key, label]) => (
+        <label key={key} className="v3-fld">{label}
+          <div className="v3-inp">{node.data.config[key] || "—"}</div>
+        </label>
+      ))}
+      {!spec.inputs.length && !fields.length && <p className="v3-copy">This block has no inputs yet.</p>}
+    </div>
   );
 }
 

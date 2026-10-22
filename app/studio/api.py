@@ -12,6 +12,28 @@ from .runner import BriefError, SpendGuardError
 
 UI_DIST = Path(__file__).resolve().parent.parent / "ui" / "dist"
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
+_REF_ROOTS = (
+    Path("/workspace/personas"),
+    Path(__file__).resolve().parents[2] / "personas",
+    Path(__file__).resolve().parents[1] / "refs",
+)
+
+
+def _resolve_ref(raw):
+    """Use the stored path when the file is there. Otherwise the same filename under the persona store."""
+    path = Path(raw)
+    if path.is_file():
+        return path
+    name = path.name
+    if not name:
+        return path
+    for root in _REF_ROOTS:
+        if not root.is_dir():
+            continue
+        hit = next((p for p in root.rglob(name) if p.is_file()), None)
+        if hit:
+            return hit
+    return path
 _doctor_lock = threading.Lock()
 
 
@@ -88,7 +110,8 @@ def register(app, cfg, runner, live, bg):
         return jsonify({"live": live, "personas": [{"id": k, "display": v.get("display") or k} for k, v in pers.items()],
                         "templates": sorted(p.stem for p in TEMPLATES_DIR.glob("*.yaml")),
                         "fal_lock": db.fal_lock(), "caps": caps(), "spend": db.effective_spend(),
-                        "connections": connection_status(cfg)})
+                        "connections": connection_status(cfg),
+                        "intel_origin": "live" if configured() else "fixture"})
 
     @bp.get("/api/overview")
     def overview():
@@ -103,6 +126,7 @@ def register(app, cfg, runner, live, bg):
 
     @bp.get("/api/jobs")
     def jobs():
+        runner.reconcile()
         q, st = (request.args.get("q") or "").lower(), request.args.get("status")
         rows = [job_row(j) for j in db.jobs()]
         rows = [r for r in rows if (not q or q in f"{r['id']} {r['persona']} {r['template']}".lower()) and (not st or r["status"] == st)]
@@ -110,6 +134,7 @@ def register(app, cfg, runner, live, bg):
 
     @bp.get("/api/jobs/<jid>")
     def job(jid):
+        runner.reconcile(jid)
         j = db.job(jid) or abort(404)
         stages = []
         for d in runner.stage_defs(j):
@@ -148,18 +173,26 @@ def register(app, cfg, runner, live, bg):
     def personas():
         out = []
         for k, v in cfg["_personas"].items():
+            refs = []
+            for i, raw in enumerate(v.get("refs") or []):
+                found = _resolve_ref(raw)
+                refs.append({"i": i, "name": Path(raw).name, "exists": found.is_file(),
+                             "placeholder": not found.is_file()})
             out.append({"id": k, "display": v.get("display") or k, "look": v.get("look"), "voice_name": v.get("voice_name"),
                         "lora": (v.get("lora") or {}).get("status"), "lock": v.get("lock") or {},
-                        "refs": [{"i": i, "name": Path(r).name, "exists": Path(r).exists()} for i, r in enumerate(v.get("refs") or [])],
+                        "refs": refs,
                         "missing": P.missing(v), "lock_text": P.lock_text(v, "image")})
         return jsonify(out)
 
     @bp.get("/api/personas/<pid>/ref/<int:i>")
     def ref(pid, i):
         refs = (cfg["_personas"].get(pid) or {}).get("refs") or []
-        if i >= len(refs) or not Path(refs[i]).exists():
+        if i >= len(refs):
             abort(404)
-        return send_file(refs[i])
+        found = _resolve_ref(refs[i])
+        if not found.is_file():
+            abort(404)
+        return send_file(found)
 
     @bp.get("/api/settings")
     def settings():
@@ -176,6 +209,7 @@ def register(app, cfg, runner, live, bg):
 
     @bp.get("/api/spend")
     def spend():
+        runner.reconcile()
         rows = [dict(r) for r in db.q(
             "SELECT a.job_id, a.stage, a.mode, a.provider, a.model, a.status, a.est_cost_usd, a.actual_cost_usd, a.latency_s, a.started_at "
             "FROM attempts a ORDER BY a.id DESC LIMIT 200")]
@@ -371,7 +405,8 @@ def register(app, cfg, runner, live, bg):
     def board_public(row, estimates=None, estimate_error=None):
         body = {"id": row["id"], "name": row["name"], "preset": row["preset"], "graph": row["graph"],
                 "last_job_id": row.get("last_job_id"), "updated_at": row.get("updated_at"),
-                "estimates": estimates or {}}
+                "estimates": estimates or {},
+                "intel_origin": "live" if configured() else "fixture"}
         if estimate_error:
             body["estimate_error"] = estimate_error
         return body
@@ -450,6 +485,9 @@ def register(app, cfg, runner, live, bg):
             return jsonify({"id": jid, "mode": "live"}), 201
         if mode != "dry":
             return err("mode must be dry or live")
+        # A dry pass walks every block with mock output. Review gates stay on live runs.
+        for stage in stages:
+            stage["review"] = False
         if live:
             return err("this server was started with --live; the board only starts dry runs", 409)
         try:
@@ -488,7 +526,8 @@ def register(app, cfg, runner, live, bg):
     @bp.get("/api/intel/preview")
     def intel_preview():
         a = request.args
-        config = {"advertiser": a.get("advertiser") or "", "status": a.get("status") or "",
+        config = {"advertiser": a.get("advertiser") or "", "page_id": a.get("page_id") or "",
+                  "status": a.get("status") or "",
                   "date_from": a.get("date_from") or "", "date_to": a.get("date_to") or "",
                   "longevity_min": a.get("longevity_min") or "", "ad_id": a.get("ad_id") or "",
                   "event_id": a.get("event_id") or "", "limit": a.get("limit") or "40",

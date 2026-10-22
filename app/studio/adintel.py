@@ -268,6 +268,17 @@ def _match(ad, filters):
     return True
 
 
+def _step_label(raw):
+    """A numeric ad id is not a step name. Keep the role people can read."""
+    title = str((raw or {}).get("title") or "").strip()
+    nxt = str((raw or {}).get("next") or "").strip()
+    role = str((raw or {}).get("role") or "").strip()
+    label = title or nxt or role or "Untitled step"
+    if label.isdigit() and len(label) >= 6:
+        return "Ad creative" if role in ("family", "ad", "") else role.replace("_", " ").title()
+    return label
+
+
 def query_ads(filters=None):
     filters = filters or {}
     try:
@@ -277,19 +288,36 @@ def query_ads(filters=None):
         raise AdIntelError("limit and offset must be numbers") from None
     if not configured():
         pack = _envelope("fixture")
-        matches = [dict(a) for a in FIXTURE_ADS if _match(a, filters)]
+        wanted = (filters.get("page_id") or filters.get("pageId") or "").strip()
+        matches = []
+        for ad in FIXTURE_ADS:
+            if wanted and (ad.get("page_id") or "") != wanted:
+                continue
+            if _match(ad, filters):
+                matches.append(dict(ad))
         pack["ads"] = matches[offset:offset + limit]
         pack.update(matched=len(matches), limit=limit, offset=offset)
         return pack
-    body = _get("/ads", {
+    # advertiser is a substring on the tracker. pageId pins one account when the
+    # name is a prefix of another (James Riston also matches James Riston EU 2).
+    params = {
         "advertiser": filters.get("advertiser"),
+        "pageId": filters.get("page_id") or filters.get("pageId"),
         "from": filters.get("date_from"),
         "to": filters.get("date_to"),
         "status": filters.get("status"),
         "min_days": filters.get("longevity_min") or filters.get("longevity_min_days"),
         "limit": limit,
         "offset": offset,
-    })
+    }
+    try:
+        body = _get("/ads", params)
+    except AdIntelError as e:
+        if params.get("pageId") and "(400)" in str(e):
+            params.pop("pageId", None)
+            body = _get("/ads", params)
+        else:
+            raise
     pack = _meta(body)
     pack["ads"] = [a for a in (normalize_ad(r) for r in (body.get("observed") or {}).get("ads") or []) if a]
     pack["matched"] = body.get("matched", len(pack["ads"]))
@@ -335,7 +363,7 @@ def route_for_funnel(funnel_id, ad_id=None, landing_url=""):
         section = body.get(state) or {}
         for raw in (section.get("storedSteps") or []) + (section.get("laneSteps") or []):
             steps.append({"n": len(steps) + 1, "kind": raw.get("role") or "step",
-                          "label": raw.get("title") or raw.get("next") or raw.get("role") or "Untitled step",
+                          "label": _step_label(raw),
                           "url": raw.get("url") or "", "state": state,
                           "source": raw.get("source") or "", "checked_on": raw.get("checkedOn"),
                           "lane_id": raw.get("laneId"), "branch": raw.get("branch")})
