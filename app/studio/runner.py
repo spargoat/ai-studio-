@@ -133,13 +133,36 @@ class Runner:
             return None
         return {**sc, **route}
 
-    def provider_for(self, stage, live=None):
+    def _still_provider_choice(self, job):
+        """brief.still_provider, or None when the job keeps the default still adapter."""
+        if not job:
+            return None
+        choice = (job.get("brief") or {}).get("still_provider")
+        if choice in (None, ""):
+            return None
+        if choice not in ("fal", "higgsfield"):
+            raise BriefError("brief.still_provider must be 'higgsfield' or 'fal'")
+        return choice
+
+    def _stage_config(self, stage, live, job=None):
+        """Stage adapter for this job. A still_provider replaces stages.still for that job only."""
+        sc = dict(self.cfg["stages"][stage])
+        choice = self._still_provider_choice(job) if stage == "still" else None
+        if choice == "higgsfield":
+            route = ((self.cfg.get("fallback") or {}).get("routes") or {}).get("still") or {}
+            return {**sc, "provider": "higgsfield",
+                    "model": route.get("model") or sc["model"],
+                    "price_key": route.get("price_key") or "hf_image"}
+        if choice == "fal":
+            sc["provider"] = "fal"          # explicit fal: do not reroute this job's still on a fal lock
+            return sc
+        fb = self.fallback_route(stage, sc, live=live)
+        return fb or sc
+
+    def provider_for(self, stage, live=None, job=None):
         if live is None:
             live = self.live
-        sc = self.cfg["stages"][stage]
-        fb = self.fallback_route(stage, sc, live=live)
-        if fb:
-            sc = fb
+        sc = self._stage_config(stage, live, job)
         name = self.provider_override.get(stage, sc["provider"])
         p = make(name, self.cfg)
         if not live and p.paid:
@@ -245,6 +268,7 @@ class Runner:
             script = f"(no script: {brief.get('topic') or brief.get('headline') or 'template generates it'})"
         if len(script) > 2500:
             raise BriefError("brief.script > 2500 chars; split it (Kling max 15 s per call)")
+        self._still_provider_choice({"brief": brief})
         brief["script"] = script
         brief.setdefault("setting", "a bright, lived-in room")
         brief.setdefault("template", "talking_head")
@@ -268,7 +292,11 @@ class Runner:
             if sdef["kind"] == "brief":
                 continue
             ctx = self.build_ctx(fake, sdef, inputs={}, dry_estimate=True)
-            sc = self.cfg["stages"][sdef.get("uses", sdef["id"])]
+            key = sdef.get("uses", sdef["id"])
+            if key == "still" and brief.get("still_provider"):
+                _provider, sc = self.provider_for(key, job=fake)
+            else:
+                sc = self.cfg["stages"][key]
             units = pricing.units_for(sdef["kind"], sdef["params"], ctx)
             est = pricing.cost(self.cfg, sc["price_key"], sdef["kind"], units, sdef["params"])
             row = pricing.price_row(self.cfg, sc["price_key"])
@@ -551,7 +579,7 @@ class Runner:
         from .providers.fal import FalProvider
         meta = json.loads(run["meta_json"] or "{}")
         falm = meta.get("fal") or {}
-        provider, sc = self.provider_for(run["stage"], live=True)
+        provider, sc = self.provider_for(run["stage"], live=True, job=job)
         if not isinstance(provider, FalProvider):
             provider = FalProvider("fal", self.cfg["providers"]["fal"])
         provider.cfg = {**provider.cfg, "max_polls": 1, "poll_seconds": 0}
@@ -791,7 +819,7 @@ class Runner:
         reclaim_tmp()
         job_live = self.live or job.get("mode") == "live"
         mode = "live" if job_live else "dry"
-        provider, sc = self.provider_for(sdef.get("uses", sid), live=job_live)
+        provider, sc = self.provider_for(sdef.get("uses", sid), live=job_live, job=job)
         if self.async_poll and provider.name == "higgsfield":
             provider.cfg = {**provider.cfg, "max_polls": 1, "poll_seconds": 0}
         if self.async_fal and provider.name == "fal":
@@ -899,7 +927,7 @@ class Runner:
             return {"state": "ok"}
         job = self.db.job(job_id)
         sdef = self.def_of(self.stage_defs(job), stage_id)
-        provider, _sc = self.provider_for(sdef.get("uses", stage_id))
+        provider, _sc = self.provider_for(sdef.get("uses", stage_id), job=job)
         est = float(run["est_cost_usd"] or 0) if run else 0.0
         att_est = est if provider.paid else 0.0
         try:

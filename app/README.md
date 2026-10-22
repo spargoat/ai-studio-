@@ -71,6 +71,7 @@ The registry lives in two files:
 `python3 -m studio doctor` checks key names (never values), caps, ledger spend, failed live attempts, fal lock state, stuck runs, pending reviews and LoRAs. It exits 1 if live mode would be refused.
 If fal's last response was "User is locked / Exhausted balance", `--live` routes still/video/lipsync to Higgsfield when those fallback prices are above 0. Otherwise it is refused until you top up and run with `STUDIO_FAL_TOPPED_UP=1`.
 Higgsfield needs `HIGGSFIELD_API_KEY` plus `HIGGSFIELD_API_SECRET` (or `HIGGSFIELD_API_KEY=key_id:key_secret`). The SDK names `HF_KEY` and `HF_API_KEY`/`HF_API_SECRET` work too. A live call with the secret missing stops before anything is sent. `pip install higgsfield-client` provides the client.
+A single job can choose the still adapter with `brief.still_provider`: `higgsfield` or `fal`. Other stages stay on their config (including the fal-lock fallback). Leave the field off and the still stays fal unless that fallback applies. `templates/still_only.yaml` is brief plus still, with no LLM stage.
 Tests: `python3 -m unittest tests.test_dryrun` (they set STUDIO_MOCK_FAST=1 and STUDIO_FFMPEG_PRESET=ultrafast).
 
 ## Durable jobs on Vercel (Inngest)

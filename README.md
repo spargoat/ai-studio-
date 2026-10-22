@@ -67,7 +67,7 @@ The Python builder packs the function to about 225 MB uncompressed (`LAMBDA_SIZE
 pip install -r requirements.txt '.[score]'
 cd app/ui && npm ci && npm run build && cd ../..
 cd app
-python3 -m unittest tests.test_dryrun tests.test_workflows tests.test_higgsfield tests.test_storage tests.test_advance tests.test_assets tests.test_static tests.test_fonts tests.test_refs tests.test_tmp
+python3 -m unittest tests.test_dryrun tests.test_workflows tests.test_higgsfield tests.test_still_provider tests.test_storage tests.test_advance tests.test_assets tests.test_static tests.test_fonts tests.test_refs tests.test_tmp
 ```
 
 ## Dashboard
