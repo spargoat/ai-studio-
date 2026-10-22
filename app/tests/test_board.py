@@ -789,6 +789,86 @@ class T(unittest.TestCase):
         spent = cost(c, "llm_gpt4o_mini", "script", 1, {"input_tokens": 1000, "output_tokens": 200})
         self.assertAlmostEqual(spent, 1000 * 0.00000015 + 200 * 0.0000006, places=6)
 
+    def test_oidc_header_is_a_gateway_credential_and_is_never_returned(self):
+        import subprocess
+        from studio.providers.llm import LLMProvider
+        token = "oidc-header-secret"
+        c = cfg()
+        client = create_app(c).test_client()
+        res = client.get("/api/meta", headers={"x-vercel-oidc-token": token})
+        body = res.get_data(as_text=True)
+        self.assertNotIn(token, body)
+        row = next(item for item in res.get_json()["connections"] if item["id"] == "llm")
+        self.assertTrue(row["set"])
+        self.assertEqual(row["env"], "x-vercel-oidc-token")
+        self.assertEqual(row["mask"], "••••••••")
+        marco = next(item for item in res.get_json()["personas"] if item["id"] == "marco")
+        self.assertEqual(marco["voice_name"], "Brian")
+        self.assertNotIn("voice_id", marco)
+        blank = client.get("/api/meta", headers={"x-vercel-oidc-token": "   "})
+        self.assertFalse(next(item for item in blank.get_json()["connections"] if item["id"] == "llm")["set"])
+        os.environ["OPENAI_API_KEY"] = "sk-test"
+        self.addCleanup(os.environ.pop, "OPENAI_API_KEY", None)
+        held = client.get("/api/meta", headers={"x-vercel-oidc-token": token})
+        self.assertNotIn(token, held.get_data(as_text=True))
+        self.assertEqual(next(item for item in held.get_json()["connections"] if item["id"] == "llm")["env"], "x-vercel-oidc-token")
+        os.environ["AI_GATEWAY_API_KEY"] = "gw-test"
+        self.addCleanup(os.environ.pop, "AI_GATEWAY_API_KEY", None)
+        preferred = client.get("/api/settings", headers={"x-vercel-oidc-token": token})
+        self.assertNotIn(token, preferred.get_data(as_text=True))
+        self.assertEqual(next(item for item in preferred.get_json()["connections"] if item["id"] == "llm")["env"], "AI_GATEWAY_API_KEY")
+        os.environ.pop("AI_GATEWAY_API_KEY", None)
+        os.environ.pop("OPENAI_API_KEY", None)
+
+        c["_db_file"] = TMP / f"oidc-{id(self)}.db"
+        os.environ.update(FAL_KEY="dummy", ELEVENLABS_API_KEY="dummy", STUDIO_FAL_TOPPED_UP="1")
+        for key in ("FAL_KEY", "ELEVENLABS_API_KEY", "STUDIO_FAL_TOPPED_UP"):
+            self.addCleanup(os.environ.pop, key, None)
+        seen = {}
+
+        class Resp:
+            status_code = 200
+            text = ""
+            def json(self):
+                return {"id": "chatcmpl-oidc", "usage": {"prompt_tokens": 10, "completion_tokens": 4},
+                        "choices": [{"message": {"content": json.dumps({"script": "Leave the size."})}}]}
+
+        def post(url, json=None, headers=None, timeout=None):
+            seen["url"] = url
+            seen["auth"] = (headers or {}).get("Authorization")
+            seen["model"] = (json or {}).get("model")
+            return Resp()
+
+        app = create_app(c)
+        r = Runner(c, live=True, log=lambda m: None)
+        self.addCleanup(r.close)
+        with app.test_request_context("/api/jobs/x/advance", headers={"x-vercel-oidc-token": token}):
+            with patch("studio.providers.llm.requests.post", post):
+                jid = r.create_job({"persona": "maksim", "template": "talking_head_scripted", "topic": "the stop"})
+                self.assertEqual(r.advance(jid)["stage"], "brief")
+                step = r.advance(jid)
+        self.assertEqual(step["stage"], "script")
+        self.assertTrue(step["ok"], step)
+        self.assertEqual(seen["url"], "https://ai-gateway.vercel.sh/v1/chat/completions")
+        self.assertEqual(seen["auth"], f"Bearer {token}")
+        self.assertEqual(seen["model"], "openai/gpt-4o-mini")
+        run = r.db.latest(jid, "script")
+        folder = Path(run["output_path"]).parent
+        disk = "\n".join(path.read_text(errors="ignore") for path in folder.rglob("*") if path.is_file())
+        self.assertNotIn(token, disk)
+        self.assertNotIn(token, json.dumps(r.db.events(jid, 40)))
+        self.assertNotIn(token, json.dumps({k: run[k] for k in run.keys()}))
+        outside = LLMProvider("llm", c["providers"]["llm"])
+        with self.assertRaises(Exception) as caught:
+            outside.do_script({"stage": "script", "kind": "script", "model": "openai/gpt-4o-mini",
+                               "prompt": "x", "params": {}, "out_dir": str(TMP)})
+        self.assertIn("needs key", str(caught.exception))
+        self.assertNotIn(token, str(caught.exception))
+
+        ui = Path(__file__).resolve().parents[1] / "ui"
+        proc = subprocess.run(["node", "src/board/inputs.test.ts"], cwd=ui, capture_output=True, text=True)
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+
     def test_live_script_uses_the_gateway_and_logs_token_cost(self):
         from studio.providers.llm import LLMProvider
         c = cfg()

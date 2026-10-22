@@ -19,7 +19,7 @@ const COPY: Record<string, { title: string; blurb: string; detail: string }> = {
   adintel: { title: "Ad Intel tracker", blurb: "Read API · ads-tracker", detail: "URL and shared secret · read-only · set in the server environment" },
   fal: { title: "fal", blurb: "Stills, video, lipsync", detail: "Used when a live video stage runs" },
   elevenlabs: { title: "ElevenLabs", blurb: "Voiceover", detail: "Used when a live voice stage runs" },
-  llm: { title: "LLM", blurb: "Briefs and scripts", detail: "Vercel AI Gateway · OIDC on Vercel, or AI_GATEWAY_API_KEY. Anthropic and OpenAI stay optional overrides." },
+  llm: { title: "LLM", blurb: "Briefs and scripts", detail: "Vercel AI Gateway · OIDC header on Vercel, or AI_GATEWAY_API_KEY. Anthropic and OpenAI stay optional overrides." },
   higgsfield: { title: "Higgsfield", blurb: "Backup image/video provider", detail: "Optional fallback. Not used by the board chain." },
 };
 

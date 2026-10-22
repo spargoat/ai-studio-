@@ -44,13 +44,41 @@ def load_template(name):
     return t
 
 
+# Vercel injects the runtime OIDC token on the incoming request. It is not an env var
+# in the Python function. The value is never logged or placed in an API response.
+OIDC_HEADER = "x-vercel-oidc-token"
+
+
+def oidc_request_token():
+    """Return the per-request OIDC token, or "" when this call is outside a request."""
+    try:
+        from flask import has_request_context, request
+    except ImportError:
+        return ""
+    if not has_request_context():
+        return ""
+    return (request.headers.get(OIDC_HEADER) or "").strip()
+
+
 def key_status(provider_cfg):
-    """Return (env_name, is_set) for a provider. Never returns the value."""
+    """Return (source_name, is_set) for a provider. Never returns the secret."""
     for name in provider_cfg.get("key_env", []) or []:
         if os.environ.get(name):
             return name, True
+        if name == "VERCEL_OIDC_TOKEN" and oidc_request_token():
+            return OIDC_HEADER, True
     names = provider_cfg.get("key_env") or []
     return (names[0] if names else None), False
+
+
+def provider_secret(provider_cfg):
+    """Return (source_name, secret). The secret is empty when nothing is set. Do not log it."""
+    name, ok = key_status(provider_cfg)
+    if not ok:
+        return name, ""
+    if name == OIDC_HEADER:
+        return name, oidc_request_token()
+    return name, os.environ.get(name) or ""
 
 
 def connection_status(cfg):
@@ -72,8 +100,7 @@ def connection_status(cfg):
 
 
 def get_key(provider_cfg):
-    for name in provider_cfg.get("key_env", []) or []:
-        v = os.environ.get(name)
-        if v:
-            return v
+    _name, secret = provider_secret(provider_cfg)
+    if secret:
+        return secret
     raise RuntimeError(f"missing API key env var (one of {provider_cfg.get('key_env')})")

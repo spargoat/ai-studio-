@@ -1,23 +1,30 @@
 """LLM text stages. Live script calls go through Vercel AI Gateway.
 
-Auth is AI_GATEWAY_API_KEY when set, otherwise the deployment's VERCEL_OIDC_TOKEN.
-ANTHROPIC_API_KEY and OPENAI_API_KEY stay optional direct overrides and are used
-only when neither gateway credential is set. Dry runs never reach this class.
+Auth is AI_GATEWAY_API_KEY when set, otherwise the deployment OIDC token
+(VERCEL_OIDC_TOKEN, or the x-vercel-oidc-token header Vercel sends on each
+request). ANTHROPIC_API_KEY and OPENAI_API_KEY stay optional direct overrides
+and are used only when neither gateway credential is set. Dry runs never
+reach this class. The credential is never written to disk or the event log.
 """
 import json
-import os
 from pathlib import Path
 
 import requests
 
 from .base import Provider, ProviderError, NonRetryable
-from ..config import key_status
+from ..config import OIDC_HEADER, provider_secret
 
-_GATEWAY_ENV = ("AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN")
+_GATEWAY_SOURCES = ("AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN", OIDC_HEADER)
+
+
+def _redact(message, secret):
+    if secret and secret in message:
+        return message.replace(secret, "[redacted]")
+    return message
 
 
 def _route(name):
-    if name in _GATEWAY_ENV:
+    if name in _GATEWAY_SOURCES:
         return "gateway"
     if name == "ANTHROPIC_API_KEY":
         return "anthropic"
@@ -66,13 +73,13 @@ class LLMProvider(Provider):
     paid = True
 
     def do_llm(self, ctx):
-        name, ok = key_status(self.cfg)
-        route = _route(name) if ok else None
+        name, token = provider_secret(self.cfg)
+        route = _route(name) if token else None
         if not route:
             raise NonRetryable(
-                f"needs key: LLM stage '{ctx.get('stage')}' needs AI_GATEWAY_API_KEY or VERCEL_OIDC_TOKEN "
+                f"needs key: LLM stage '{ctx.get('stage')}' needs AI_GATEWAY_API_KEY, VERCEL_OIDC_TOKEN, "
+                "or the x-vercel-oidc-token request header "
                 "(ANTHROPIC_API_KEY or OPENAI_API_KEY remain optional overrides). Nothing was called.")
-        token = os.environ.get(name) or ""
         if route == "anthropic":
             return self._anthropic(ctx, token)
         model = ctx["model"]
@@ -109,16 +116,19 @@ class LLMProvider(Provider):
                           payload.get("id") or "", model, "anthropic", self.cfg.get("anthropic_price_key"))
 
     def _post(self, url, headers, body):
+        secret = headers.get("Authorization") or headers.get("x-api-key") or ""
+        if secret.lower().startswith("bearer "):
+            secret = secret[7:]
         try:
             res = requests.post(url, json=body, headers=headers, timeout=self.cfg.get("timeout_seconds", 60))
         except requests.RequestException as e:
-            raise ProviderError(f"llm request failed: {type(e).__name__}") from None
+            raise ProviderError(_redact(f"llm request failed: {type(e).__name__}", secret)) from None
         if res.status_code in (401, 403):
             raise NonRetryable(f"llm {res.status_code}: credential refused. Nothing was saved.")
         if res.status_code in (400, 404, 422):
-            raise NonRetryable(f"llm {res.status_code}: {res.text[:300]}")
+            raise NonRetryable(_redact(f"llm {res.status_code}: {res.text[:300]}", secret))
         if res.status_code >= 400:
-            raise ProviderError(f"llm {res.status_code}: {res.text[:300]}")
+            raise ProviderError(_redact(f"llm {res.status_code}: {res.text[:300]}", secret))
         try:
             return res.json()
         except ValueError:

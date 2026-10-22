@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ReactFlow, ReactFlowProvider, Background, Controls, MiniMap, applyNodeChanges, applyEdgeChanges,
@@ -9,6 +9,7 @@ import { Hash, Play, Copy, Save, Plus, Loader2 } from "lucide-react";
 import { api, fileUrl } from "../lib/api";
 import { toast } from "../components/Toast";
 import { CATALOG, PALETTE, PORT_COLOR, portType, type Side } from "../board/catalog";
+import { INSPECTOR_FIELDS, type InspectorField } from "../board/inputs";
 import { applyConnection, placeNode, type Box } from "../board/graph";
 import { buildKit, buildKitPipeline, kitById, KITS } from "../board/kits";
 import { BoardCtx, nodeTypes, type Artefact, type BoardData, type RouteStep } from "../board/nodes";
@@ -841,33 +842,57 @@ function Canvas() {
 }
 
 function NodeInputs({ node, nodes, edges }: { node: FlowNode; nodes: FlowNode[]; edges: Edge[] }) {
+  const { setConfig, personas, funnels, boardScript } = useContext(BoardCtx);
   const spec = CATALOG[node.data.nodeType];
-  const named: Record<string, [string, string][]> = {
-    brief: [["persona", "Persona"], ["offer", "Offer"], ["angle", "Angle"], ["length", "Length"], ["platform", "Platform"]],
-    script: [["script", "Script"], ["framework", "Framework"]],
-    voice: [["voice", "Voice"]],
-    video: [["format", "Format"], ["aspect", "Aspect"]],
-    still: [["prompt", "Image prompt"], ["aspect_ratio", "Aspect"]],
-    landing: [["offer", "Offer"], ["angle", "Angle"]],
-    funnel_route: [["funnel_name", "Funnel"], ["ad_id", "Ad"]],
-    funnel_step: [["label", "Label"], ["kind", "Kind"], ["url", "URL"], ["state", "State"]],
-    ad_breakdown: [["ad_id", "Ad"]],
-    teardown: [["ad_id", "Ad"]],
-  };
-  const fields = named[node.data.nodeType] || [];
+  const fields = INSPECTOR_FIELDS[node.data.nodeType] || [];
   const incoming = edges.filter((edge) => edge.target === node.id);
+  const write = (patch: Record<string, string>) => setConfig(node.id, patch);
+  const optionsFor = (field: InspectorField) => {
+    if (field.optionsFrom === "personas") return personas.map((p) => ({ value: p.id, label: p.display || p.id }));
+    if (field.optionsFrom === "voices") return personas.filter((p) => p.voice_name).map((p) => ({ value: p.voice_name || "", label: `${p.voice_name} · ${p.display || p.id}` }));
+    if (field.optionsFrom === "funnels") return funnels.map((row) => ({ value: row.id, label: row.name }));
+    return field.options || [];
+  };
   return (
     <div className="v3-flds">
       {spec.inputs.map((port) => {
         const edge = incoming.find((item) => item.targetHandle === port.id);
         const source = nodes.find((item) => item.id === edge?.source);
-        return <div className="v3-kv" key={port.id}><span>{port.id}</span><span>{source ? CATALOG[source.data.nodeType]?.headline || source.id : "Not connected"}</span></div>;
+        const headline = source ? (source.data.config.title || CATALOG[source.data.nodeType]?.headline || source.id) : "";
+        return (
+          <label key={port.id} className="v3-fld">{port.id} in
+            <div className="v3-inp" aria-label={`${port.id} input`}>{headline || "Not connected"}</div>
+          </label>
+        );
       })}
-      {fields.map(([key, label]) => (
-        <label key={key} className="v3-fld">{label}
-          <div className="v3-inp">{node.data.config[key] || "—"}</div>
-        </label>
-      ))}
+      {fields.map((field) => {
+        const stored = node.data.config[field.key];
+        const value = field.key === "script" ? (stored ?? boardScript) : (stored || field.fallback || "");
+        const options = optionsFor(field);
+        const onChange = (next: string) => {
+          if (field.key === "funnel_id") {
+            const row = funnels.find((item) => item.id === next);
+            write({ funnel_id: next, funnel_name: row?.name || "" });
+            return;
+          }
+          write({ [field.key]: next });
+        };
+        return (
+          <label key={field.key} className="v3-fld">{field.label}
+            {field.control === "textarea" ? (
+              <textarea className="v3-inp v3-area" aria-label={field.aria} placeholder={field.placeholder} value={value} onChange={(e) => onChange(e.target.value)} />
+            ) : field.control === "select" ? (
+              <select className="v3-inp" aria-label={field.aria} value={value} onChange={(e) => onChange(e.target.value)}>
+                {field.blank && <option value="">{field.blank}</option>}
+                {value && !options.some((opt) => opt.value === value) && <option value={value}>{field.key === "funnel_id" ? (node.data.config.funnel_name || value) : value}</option>}
+                {options.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+              </select>
+            ) : (
+              <input className="v3-inp" type={field.inputType || "text"} aria-label={field.aria} placeholder={field.placeholder} value={value} onChange={(e) => onChange(e.target.value)} />
+            )}
+          </label>
+        );
+      })}
       {!spec.inputs.length && !fields.length && <p className="v3-copy">This block has no inputs yet.</p>}
     </div>
   );

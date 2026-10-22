@@ -107,7 +107,7 @@ def register(app, cfg, runner, live, bg):
     @bp.get("/api/meta")
     def meta():
         pers = cfg["_personas"]
-        return jsonify({"live": live, "personas": [{"id": k, "display": v.get("display") or k} for k, v in pers.items()],
+        return jsonify({"live": live, "personas": [{"id": k, "display": v.get("display") or k, "voice_name": v.get("voice_name") or ""} for k, v in pers.items()],
                         "templates": sorted(p.stem for p in TEMPLATES_DIR.glob("*.yaml")),
                         "fal_lock": db.fal_lock(), "caps": caps(), "spend": db.effective_spend(),
                         "connections": connection_status(cfg),
