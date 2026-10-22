@@ -32,8 +32,16 @@ providers:
     optional_key: true          # fallback only; transport not wired yet
   llm:
     kind: llm
-    key_env: [ANTHROPIC_API_KEY, OPENAI_API_KEY]
-    optional_key: true          # live preflight doesn't require it; LLM stages fail cleanly with "needs key"
+    # Gateway first. A provider key is used only when neither gateway credential is set.
+    key_env: [AI_GATEWAY_API_KEY, VERCEL_OIDC_TOKEN, ANTHROPIC_API_KEY, OPENAI_API_KEY]
+    optional_key: true          # live preflight doesn't require it; the stage fails cleanly with "needs key"
+    base: https://ai-gateway.vercel.sh/v1
+    openai_base: https://api.openai.com/v1
+    anthropic_base: https://api.anthropic.com
+    anthropic_model: claude-haiku-4-5
+    anthropic_price_key: llm_claude_haiku_4_5
+    timeout_seconds: 60
+    max_tokens: 1024
   elevenlabs:
     kind: elevenlabs
     key_env: [ELEVENLABS_API_KEY, ELEVENLABS]
@@ -86,8 +94,8 @@ stages:
     price_key: local_ffmpeg
   llm:                          # generic text stage (templates point at it with `uses: llm`)
     provider: llm
-    model: unset (no LLM key yet)
-    price_key: llm_unpriced
+    model: openai/gpt-4o-mini
+    price_key: llm_gpt4o_mini
 
 # Price table. USD ex-VAT. Every row carries its source and check date
 # (Phase 0 assessment, AAR-72, sources S1-S9). Re-check monthly (risk #6).
@@ -106,11 +114,22 @@ prices:
   hf_image:   {unit: image, usd_per_unit: 0.0, source: "Higgsfield credits; USD per credit to confirm", checked: 2026-10-20}
   hf_video:   {unit: second, usd_per_unit: 0.0, source: "Higgsfield credits; USD per credit to confirm", checked: 2026-10-20}
   hf_lipsync: {unit: second, usd_per_unit: 0.0, source: "Higgsfield credits; USD per credit to confirm", checked: 2026-10-20}
-  llm_unpriced:
+  llm_gpt4o_mini:
     unit: call
-    usd_per_unit: 0.0
-    source: "placeholder: no LLM key/provider chosen yet; price unknown"
-    checked: 2026-10-20
+    usd_per_unit: 0.0005
+    input_usd_per_token: 0.00000015
+    output_usd_per_token: 0.0000006
+    note: "usd_per_unit is the pre-call estimate for one short script. Actual spend uses the token rates ($0.15 / $0.60 per 1M)."
+    source: "https://ai-gateway.vercel.sh/v1/models openai/gpt-4o-mini"
+    checked: 2026-10-22
+  llm_claude_haiku_4_5:
+    unit: call
+    usd_per_unit: 0.002
+    input_usd_per_token: 0.000001
+    output_usd_per_token: 0.000005
+    note: "Direct ANTHROPIC_API_KEY override only. Gateway default stays gpt-4o-mini. $1 / $5 per 1M tokens."
+    source: "https://ai-gateway.vercel.sh/v1/models anthropic/claude-haiku-4.5"
+    checked: 2026-10-22
   fal_nano_banana_2:
     unit: image
     usd_per_unit: 0.08

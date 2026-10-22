@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("STUDIO_MOCK_FAST", "1")
 os.environ.setdefault("STUDIO_FFMPEG_PRESET", "ultrafast")
 for k in ("FAL_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS", "ADINTEL_API_URL", "ADINTEL_API_SECRET",
-          "ANTHROPIC_API_KEY", "OPENAI_API_KEY"):
+          "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"):
     os.environ.pop(k, None)
 
 from studio.adintel import FIXTURE_ADS, FIXTURE_LABEL, LONGEVITY_NOTE, REFERENCE_LABEL, query_ads
@@ -767,6 +767,110 @@ class T(unittest.TestCase):
         else:
             self.assertTrue(ref["placeholder"])
             self.assertFalse(ref["exists"])
+
+    def test_script_key_clears_when_the_gateway_is_available(self):
+        from studio.pricing import cost
+        c = cfg()
+        self.assertEqual(c["stages"]["llm"]["model"], "openai/gpt-4o-mini")
+        self.assertEqual(c["stages"]["llm"]["price_key"], "llm_gpt4o_mini")
+        client = create_app(c).test_client()
+        unset = next(row for row in client.get("/api/meta").get_json()["connections"] if row["id"] == "llm")
+        self.assertFalse(unset["set"])
+        os.environ["VERCEL_OIDC_TOKEN"] = "oidc-test"
+        self.addCleanup(os.environ.pop, "VERCEL_OIDC_TOKEN", None)
+        live = next(row for row in client.get("/api/meta").get_json()["connections"] if row["id"] == "llm")
+        self.assertTrue(live["set"])
+        self.assertEqual(live["env"], "VERCEL_OIDC_TOKEN")
+        self.assertNotIn("oidc-test", json.dumps(live))
+        os.environ["AI_GATEWAY_API_KEY"] = "gw-test"
+        self.addCleanup(os.environ.pop, "AI_GATEWAY_API_KEY", None)
+        preferred = next(row for row in client.get("/api/meta").get_json()["connections"] if row["id"] == "llm")
+        self.assertEqual(preferred["env"], "AI_GATEWAY_API_KEY")
+        spent = cost(c, "llm_gpt4o_mini", "script", 1, {"input_tokens": 1000, "output_tokens": 200})
+        self.assertAlmostEqual(spent, 1000 * 0.00000015 + 200 * 0.0000006, places=6)
+
+    def test_live_script_uses_the_gateway_and_logs_token_cost(self):
+        from studio.providers.llm import LLMProvider
+        c = cfg()
+        c["_db_file"] = TMP / f"gateway-{id(self)}.db"
+        os.environ.update(FAL_KEY="dummy", ELEVENLABS_API_KEY="dummy", AI_GATEWAY_API_KEY="gw-test",
+                          STUDIO_FAL_TOPPED_UP="1")
+        for key in ("FAL_KEY", "ELEVENLABS_API_KEY", "AI_GATEWAY_API_KEY", "STUDIO_FAL_TOPPED_UP", "VERCEL_OIDC_TOKEN"):
+            self.addCleanup(os.environ.pop, key, None)
+        seen = {}
+
+        class Resp:
+            status_code = 200
+            text = ""
+            def json(self):
+                return {"id": "chatcmpl-test", "usage": {"prompt_tokens": 1000, "completion_tokens": 200},
+                        "choices": [{"message": {"content": json.dumps({
+                            "framework": "PAS", "beats": {"Problem": "Name the stop."},
+                            "script": "Decide the stop before you size the trade.", "hooks": ["Where are you wrong?"]})}}]}
+
+        def post(url, json=None, headers=None, timeout=None):
+            seen["url"] = url
+            seen["body"] = json
+            seen["auth"] = (headers or {}).get("Authorization")
+            return Resp()
+
+        r = Runner(c, live=True, log=lambda m: None)
+        self.addCleanup(r.close)
+        with patch("studio.providers.llm.requests.post", post):
+            jid = r.create_job({"persona": "maksim", "template": "talking_head_scripted", "topic": "the stop"})
+            self.assertEqual(r.advance(jid)["stage"], "brief")
+            step = r.advance(jid)
+        self.assertEqual(step["stage"], "script", step)
+        self.assertTrue(step["ok"], step)
+        self.assertEqual(seen["url"], "https://ai-gateway.vercel.sh/v1/chat/completions")
+        self.assertEqual(seen["auth"], "Bearer gw-test")
+        self.assertEqual(seen["body"]["model"], "openai/gpt-4o-mini")
+        run = r.db.latest(jid, "script")
+        self.assertAlmostEqual(run["actual_cost_usd"], 0.00027, places=6)
+        self.assertEqual(run["price_key"], "llm_gpt4o_mini")
+        written = json.loads(Path(run["output_path"]).read_text())
+        self.assertEqual(written["script"], "Decide the stop before you size the trade.")
+        self.assertIsNone(r.db.latest(jid, "still"))
+        os.environ.pop("AI_GATEWAY_API_KEY", None)
+        os.environ["OPENAI_API_KEY"] = "sk-test"
+        self.addCleanup(os.environ.pop, "OPENAI_API_KEY", None)
+        provider = LLMProvider("llm", c["providers"]["llm"])
+        with patch("studio.providers.llm.requests.post", post):
+            provider.do_script({"stage": "script", "kind": "script", "model": "openai/gpt-4o-mini",
+                                "prompt": "Write it.", "params": {"task": "script", "framework": "PAS"},
+                                "out_dir": str(TMP)})
+        self.assertEqual(seen["url"], "https://api.openai.com/v1/chat/completions")
+        self.assertEqual(seen["body"]["model"], "gpt-4o-mini")
+        os.environ.pop("OPENAI_API_KEY", None)
+        os.environ["ANTHROPIC_API_KEY"] = "ant-test"
+        self.addCleanup(os.environ.pop, "ANTHROPIC_API_KEY", None)
+
+        class Ant:
+            status_code = 200
+            text = ""
+            def json(self):
+                return {"id": "msg-test", "usage": {"input_tokens": 10, "output_tokens": 4},
+                        "content": [{"type": "text", "text": "{\"script\": \"Leave it.\"}"}]}
+
+        def apost(url, json=None, headers=None, timeout=None):
+            seen["url"] = url
+            seen["body"] = json
+            seen["key_header"] = (headers or {}).get("x-api-key")
+            return Ant()
+
+        with patch("studio.providers.llm.requests.post", apost):
+            saved = provider.do_script({"stage": "script", "kind": "script", "model": "openai/gpt-4o-mini",
+                                        "prompt": "Write it.", "params": {"task": "script"}, "out_dir": str(TMP)})
+        self.assertEqual(seen["url"], "https://api.anthropic.com/v1/messages")
+        self.assertEqual(seen["body"]["model"], "claude-haiku-4-5")
+        self.assertEqual(seen["key_header"], "ant-test")
+        self.assertEqual(saved["price_key"], "llm_claude_haiku_4_5")
+        for key in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"):
+            os.environ.pop(key, None)
+        with self.assertRaises(Exception) as caught:
+            provider.do_script({"stage": "script", "kind": "script", "model": "openai/gpt-4o-mini",
+                                "prompt": "x", "params": {}, "out_dir": str(TMP)})
+        self.assertIn("needs key", str(caught.exception))
 
 
 def _stage_run(job, sid):

@@ -720,7 +720,13 @@ class Runner:
             t0 = time.time()
             try:
                 res = provider.run(kind, ctx)
-                actual = pricing.cost(self.cfg, sc["price_key"], kind, float(res["units_actual"]), ctx["params"]) \
+                usage = ((res.get("meta") or {}).get("usage") or {})
+                price_params = ctx["params"]
+                if "input_tokens" in usage or "output_tokens" in usage:
+                    price_params = {**ctx["params"], "input_tokens": usage.get("input_tokens") or 0,
+                                    "output_tokens": usage.get("output_tokens") or 0}
+                price_key = res.get("price_key") or sc["price_key"]
+                actual = pricing.cost(self.cfg, price_key, kind, float(res["units_actual"]), price_params) \
                     if (job_live and provider.paid) else 0.0
                 self.db.update_attempt(aid, status="succeeded", actual_cost_usd=actual,
                                        provider_request_id=res.get("request_id"), finished_at=now(),
@@ -733,7 +739,7 @@ class Runner:
                 (out_dir / "meta.json").write_text(json.dumps(meta, indent=2))
                 self.db.update_run(rid, status=READY, output_path=res["output_path"], meta=meta,
                                    actual_cost_usd=actual, cost_basis=basis, attempts=attempt,
-                                   error=last_err, finished_at=now(),
+                                   price_key=price_key, error=last_err, finished_at=now(),
                                    review_status="pending" if sdef.get("review") else None)
                 self.log(job_id, sid, "info", f"v{ver} ok in {time.time()-t0:.1f}s, actual ${actual:.4f}, attempt {attempt}/{max_try}")
                 self.score_run(rid)

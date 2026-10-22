@@ -239,7 +239,8 @@ class T(unittest.TestCase):
         os.environ.update(FAL_KEY="dummy", ELEVENLABS_API_KEY="dummy", STUDIO_FAL_TOPPED_UP="1")
         try:                                                     # live with no LLM key: clean stop, nothing paid called
             c = cfg(); c["budget"] = {"global_cap_usd": 75, "per_job_cap_usd": 15}
-            for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"): os.environ.pop(k, None)
+            for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"):
+                os.environ.pop(k, None)
             lr = Runner(c, live=True, log=lambda m: None)
             j2 = lr.create_job({"id": "t-script-live", "persona": "maksim", "template": "talking_head_scripted", "topic": "x"})
             self.assertEqual(lr.run_job(j2), "failed")
