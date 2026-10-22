@@ -172,6 +172,18 @@ def _unpack_ffmpeg(archive):
     return dest
 
 
+def ffmpeg_on_disk(name):
+    """ffmpeg or ffprobe that is already executable. Does not download."""
+    override = os.environ.get("FFMPEG_BIN") if name == "ffmpeg" else os.environ.get("FFPROBE_BIN")
+    candidates = [Path(override)] if override else []
+    candidates += [APP_DIR / "bin" / name, ffmpeg_dir() / name]
+    for path in candidates:
+        if path.is_file() and os.access(path, os.X_OK):
+            _drop_archive()
+            return str(path)
+    return shutil.which(name)
+
+
 def reclaim_tmp():
     """Free scratch a previous stage left on this instance.
 
@@ -201,20 +213,14 @@ def ffmpeg_bin(name, session=None):
     Override, a binary already on disk, or PATH. On Vercel (or when
     STUDIO_FETCH_FFMPEG=1) the static archive is fetched once into the shared
     bin directory, unpacked, and the archive is deleted.
+    A dry board sets STUDIO_NO_FFMPEG_FETCH so that download never starts.
     """
-    override = os.environ.get("FFMPEG_BIN") if name == "ffmpeg" else os.environ.get("FFPROBE_BIN")
-    candidates = [Path(override)] if override else []
-    candidates += [APP_DIR / "bin" / name, ffmpeg_dir() / name]
-    for path in candidates:
-        if path.is_file() and os.access(path, os.X_OK):
-            _drop_archive()
-            return str(path)
-    found = shutil.which(name)
-    if found and not _fetch_ffmpeg():
+    found = ffmpeg_on_disk(name)
+    if found:
         return found
     archives = [APP_DIR / "bin" / FFMPEG_ARCHIVE, ffmpeg_dir() / FFMPEG_ARCHIVE]
     archive = next((p for p in archives if p.is_file() and p.stat().st_size >= 1_000_000), None)
-    if archive is None and _fetch_ffmpeg():
+    if archive is None and _fetch_ffmpeg() and os.environ.get("STUDIO_NO_FFMPEG_FETCH") != "1":
         archive = cached_download(
             ffmpeg_dir() / FFMPEG_ARCHIVE, FFMPEG_URL, f"runtime/{FFMPEG_ARCHIVE}", 1_000_000, session=session)
     if archive is not None and archive.is_file():

@@ -54,6 +54,12 @@ Set these in the Vercel project. Never commit values.
 | `INNGEST_DEV` | Set to `1` locally to use the Inngest Dev Server. Leave unset on Vercel |
 | `STUDIO_SQLITE` | Set to `1` to force the local SQLite file on Vercel |
 | `STUDIO_FETCH_FFMPEG` | Set to `1` to download the static ffmpeg outside Vercel. On Vercel this happens when `VERCEL=1` |
+| `ADINTEL_API_URL` | Ads-tracker origin, or its `/api/board` base. With `ADINTEL_API_SECRET`, Intel nodes call `/api/board/ads`, `/api/board/ads/:id`, `/api/board/advertisers`, `/api/board/funnels` and `/api/board/funnels/:id/route`. If either is unset, the board uses a labelled fixture and does not present it as live |
+| `ADINTEL_API_SECRET` | Shared server-side secret for those reads. Sent in `x-adintel-secret`, never returned to the browser |
+
+The board loads 40 ads per page by default, up to the tracker's 200-ad limit. Funnel routes load when opened. If the tracker has not yet deployed `/api/board/funnels`, the directory is labelled as a partial list derived from advertiser records. The tracker currently exposes no historical market timeline, so the live timeline is empty rather than a fixture shown as live. A route's observed, inferred and unknown cards keep their evidence state; the tracker response does not prove a complete sequence between every card. Canvas notes, links, funnel stages, handoff wires and source ads are saved in the board graph and are not runner stages.
+
+Use **New** to start a blank board or **Copy** to branch an existing one. The palette has operating maps, funnel strategies and asset workflows, including the FX Farm acquisition-to-retention map and a VSL kit. The FX Farm kit follows the dated `TWF Excalidraw acquisition-engine build spec` in Aaron's resource library; it has not been rechecked against the private live Excalidraw scene. The asset workflow kits include runnable Brief, Script, Voiceover, Image and Video nodes where supported. Dry runs use mock outputs and charge $0. The planning cards for lip-sync, distribution, payment, CRM and publication do not call providers or publish a funnel. Live generation requires configured providers and a separate approved run.
 
 ## Bundle
 

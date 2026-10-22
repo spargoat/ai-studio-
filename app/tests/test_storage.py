@@ -1,5 +1,5 @@
 """Storage helper: local passthrough, Blob upload contract, and the libSQL connection."""
-import os, sys, tempfile, unittest
+import os, sys, tempfile, time, unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -140,6 +140,66 @@ class T(unittest.TestCase):
             self.assertIsNone(db.job("local-1"))
         self.assertTrue((d / "local.db").exists())
         self.assertFalse((d / "ignored.db").exists())
+
+    def test_capacity_error_does_not_open_another_connection(self):
+        from studio import db as dbmod
+        d = Path(tempfile.mkdtemp())
+        database = DB(d / "cap.db")
+        self.addCleanup(database.close)
+
+        class Boom:
+            def __init__(self):
+                self.calls = 0
+
+            def execute(self, sql, args=()):
+                self.calls += 1
+                raise ValueError("Hrana: stream error: Server database capacity temporarily exceeded, please try again later")
+
+            def close(self):
+                raise AssertionError("a capacity error must not close and reopen")
+
+        boom = Boom()
+        original = database.conn
+        database.conn = boom
+        database.remote = True
+        try:
+            with self.assertRaises(dbmod.DatabaseBusy) as caught:
+                database.q("SELECT 1")
+            self.assertIn("busy", str(caught.exception))
+            self.assertEqual(boom.calls, 2)
+            self.assertIs(database.conn, boom)
+        finally:
+            database.conn = original
+        self.assertFalse(dbmod._stale_error(ValueError("Hrana: capacity temporarily exceeded")))
+        self.assertTrue(dbmod._stale_error(TimeoutError("Hrana: http error: connection closed before message completed")))
+
+    def test_timed_out_remote_call_does_not_wait_for_close(self):
+        from studio import db as dbmod
+        d = Path(tempfile.mkdtemp())
+        database = DB(d / "slow.db")
+        self.addCleanup(database.close)
+        old = dbmod._REMOTE_CALL_S
+        dbmod._REMOTE_CALL_S = 0.2
+        self.addCleanup(setattr, dbmod, "_REMOTE_CALL_S", old)
+
+        class Slow:
+            def execute(self, sql, args=()):
+                time.sleep(2)
+                raise AssertionError("the call should already have been abandoned")
+
+            def close(self):
+                time.sleep(2)
+
+        original = database.conn
+        database.conn = Slow()
+        database.remote = True
+        try:
+            started = time.time()
+            with self.assertRaises(TimeoutError):
+                database._call(lambda conn: conn.execute("SELECT 1"))
+            self.assertLess(time.time() - started, 1.0)
+        finally:
+            database.conn = original
 
 
 if __name__ == "__main__":

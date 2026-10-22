@@ -65,8 +65,13 @@ def units_for(kind, params, ctx):
 
 def cost(cfg, price_key, kind, units, params=None):
     row = price_row(cfg, price_key)
+    params = params or {}
+    if row.get("input_usd_per_token") is not None and ("input_tokens" in params or "output_tokens" in params):
+        spent = (float(params.get("input_tokens") or 0) * float(row["input_usd_per_token"])
+                 + float(params.get("output_tokens") or 0) * float(row.get("output_usd_per_token") or 0))
+        return round(spent, 6)
     usd = row["usd_per_unit"] * units
-    mult = (row.get("resolution_multipliers") or {}).get((params or {}).get("resolution"), 1.0)
+    mult = (row.get("resolution_multipliers") or {}).get(params.get("resolution"), 1.0)
     return round(usd * mult, 4)
 
 

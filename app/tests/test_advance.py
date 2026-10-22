@@ -17,6 +17,13 @@ APP = Path(__file__).resolve().parent.parent
 TMP = Path(tempfile.mkdtemp())
 
 
+def built_asset(suffix):
+    hits = sorted((APP / "ui" / "dist" / "assets").glob(f"index-*{suffix}"))
+    if not hits:
+        raise AssertionError(f"no built index*{suffix} under {APP / 'ui' / 'dist' / 'assets'}")
+    return "/assets/" + hits[-1].name
+
+
 def cfg():
     c = load_config()
     c["_data_dir"] = TMP
@@ -156,7 +163,7 @@ class T(unittest.TestCase):
         self.assertNotIn("advanced", cron.get_data(as_text=True))
         self.assertFalse(path.exists())
         self.assertEqual(client.get("/healthz").status_code, 200)
-        asset = client.get("/assets/index-DWHte4Qj.js")
+        asset = client.get(built_asset(".js"))
         self.assertEqual(asset.status_code, 200, asset.data[:120])
         self.assertIn("javascript", asset.content_type)
         os.environ["STUDIO_SQLITE"] = "1"
@@ -247,17 +254,40 @@ class T(unittest.TestCase):
         page = client.get("/")
         self.assertEqual(page.status_code, 302)
         self.assertIn("/login", page.headers["Location"])
-        js = client.get("/assets/index-DWHte4Qj.js")
+        js = client.get(built_asset(".js"))
         self.assertEqual(js.status_code, 200, js.data[:200])
         self.assertIn("javascript", js.content_type)
         self.assertGreater(len(js.data), 1000)
         self.assertNotIn(b"<html", js.data[:80].lower())
-        css = client.get("/assets/index-C4dCJhso.css")
+        self.assertIn("immutable", js.headers.get("Cache-Control", ""))
+        css = client.get(built_asset(".css"))
         self.assertEqual(css.status_code, 200)
         self.assertIn("css", css.content_type)
         missing = client.get("/assets/missing-hash.js")
         self.assertEqual(missing.status_code, 404)
         self.assertNotIn("Location", missing.headers)
+
+    def test_shell_does_not_open_the_database(self):
+        import re
+        path = TMP / "lazy-shell.db"
+        c = cfg()
+        c["_db_file"] = path
+        if path.exists():
+            path.unlink()
+        client = create_app(c).test_client()
+        page = client.get("/board")
+        self.assertEqual(page.status_code, 200, page.data[:200])
+        match = re.search(br"/assets/(index-[^\"']+\.js)", page.data)
+        self.assertIsNotNone(match)
+        asset = client.get("/assets/" + match.group(1).decode())
+        self.assertEqual(asset.status_code, 200)
+        self.assertIn("immutable", asset.headers.get("Cache-Control", ""))
+        self.assertFalse(path.exists())
+        self.assertEqual(client.get("/healthz").status_code, 200)
+        self.assertFalse(path.exists())
+        listed = client.get("/api/boards")
+        self.assertEqual(listed.status_code, 200, listed.data[:200])
+        self.assertTrue(path.exists())
 
 
 def _ago(seconds):

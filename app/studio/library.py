@@ -61,6 +61,16 @@ def rows(db, q=None, persona=None, promoted=None, limit=50):
     return db.q(sql + " ORDER BY promoted DESC, added_at DESC, id DESC LIMIT ?", (*a, limit))
 
 
+def pending(db, limit=100):
+    """Stage outputs waiting on a review decision. Not the approved library."""
+    return db.q(
+        """SELECT r.id, r.job_id, r.stage, r.version, r.review_status, r.output_path AS path, r.mode, r.prompt,
+                  j.persona, j.template, r.finished_at AS added_at
+           FROM stage_runs r JOIN jobs j ON j.id = r.job_id
+           WHERE r.review_status='pending' AND r.status='succeeded'
+           ORDER BY r.id DESC LIMIT ?""", (limit,))
+
+
 def promote(db, ref, note=""):
     """ref = library id, or job/stage[/vN]."""
     ensure(db)

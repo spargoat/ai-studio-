@@ -3,7 +3,9 @@ Offline only: copies files, converts .ass karaoke captions to .srt, writes post 
 import json, re, shutil, zipfile
 from pathlib import Path
 from . import library
+from .config import load_config
 from .db import now
+from .names import filename_stem, purpose_name
 
 _DLG = re.compile(r"^Dialogue:\s*\d+,([^,]+),([^,]+),(?:[^,]*,){6}(.*)$")
 
@@ -102,13 +104,22 @@ def export(db, out_dir, persona=None, promoted=False, job=None, ids=None, zip_it
     if ids:
         rows = [r for r in rows if r["id"] in set(ids)]
     out = Path(out_dir); out.mkdir(parents=True, exist_ok=True)
+    displays = {k: (v.get("display") or k) for k, v in (load_config().get("_personas") or {}).items()}
     items = []
+    used = set()
     for r in rows:
         from .storage import local
         src = Path(local(r["path"] or "") or "")
         if not src.exists():
             items.append({"library_id": r["id"], "skipped": f"missing file {src}"}); continue
-        d = out / f"{r['job_id']}_{r['stage']}_v{r['version']}"; d.mkdir(exist_ok=True)
+        label = purpose_name(displays.get(r.get("persona")) or r.get("persona") or "Asset", r.get("stage"), r.get("version"))
+        stem = filename_stem(label)
+        folder = stem
+        if folder in used:
+            folder = f"{stem} ({r['id']})"
+        used.add(folder)
+        d = out / folder
+        d.mkdir(exist_ok=True)
         run_dir = src.parent; files = []
         if (run_dir / "meta.json").exists():
             meta = json.loads((run_dir / "meta.json").read_text())
@@ -121,7 +132,10 @@ def export(db, out_dir, persona=None, promoted=False, job=None, ids=None, zip_it
             p = Path(local(raw) or "")
             if not p.exists():
                 continue
-            name = _export_name(r["stage"], asp, p.suffix or ".mp4")
+            if asp == "source":
+                name = f"{stem}{p.suffix}"
+            else:
+                name = _export_name(r["stage"], asp, p.suffix or ".mp4")
             shutil.copy2(p, d / name); files.append(name)
             tag = str(asp).replace(":", "x")
             ass = run_dir / f"captions_{tag}.ass"
@@ -133,7 +147,7 @@ def export(db, out_dir, persona=None, promoted=False, job=None, ids=None, zip_it
             shutil.copy2(run_dir / "poster.jpg", d / "poster.jpg"); files.append("poster.jpg")
         (d / "caption.txt").write_text(_caption_body(db, r, src), encoding="utf-8")
         files.append("caption.txt")
-        items.append({"library_id": r["id"], "job": r["job_id"], "stage": r["stage"], "version": r["version"],
+        items.append({"library_id": r["id"], "purpose": label, "job": r["job_id"], "stage": r["stage"], "version": r["version"],
                       "persona": r["persona"], "template": r["template"], "mode": r["mode"], "identity": r["identity"],
                       "passed": r["passed"], "reason": r["reason"], "promoted": bool(r["promoted"]),
                       "folder": d.name, "files": files})

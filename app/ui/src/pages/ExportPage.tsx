@@ -31,8 +31,8 @@ export default function ExportPage() {
           <tr key={r.id} className={`${tr} cursor-pointer`} onClick={() => toggle(r.id)}>
             <td className={td}><input type="checkbox" checked={sel.has(r.id)} onChange={() => toggle(r.id)} onClick={(e) => e.stopPropagation()} data-pick={r.id} /></td>
             <td className={`${td} w-28`} onClick={(e) => e.stopPropagation()}><Media path={r.path} className="w-24 h-24 object-cover" /></td>
-            <td className={td}><b className="text-white">#{r.id}</b> {r.promoted ? <Badge variant="primary" size="sm">★</Badge> : null} <span className="text-zinc-300">{r.job_id}/{r.stage} v{r.version}</span>
-              <div className="text-[11px] text-zinc-500">{r.persona} · {r.template} · <span className={r.mode === "live" ? "text-red-400" : ""}>{r.mode}</span></div></td>
+            <td className={td}><b className="text-white">{r.purpose || `#${r.id}`}</b> {r.promoted ? <Badge variant="primary" size="sm">★</Badge> : null}
+              <div className="text-[11px] text-zinc-500">id {r.library_id ?? r.id} · {r.job_id}/{r.stage} v{r.version} · {r.persona} · <span className={r.mode === "live" ? "text-red-400" : ""}>{r.mode}</span></div></td>
           </tr>))}</tbody></table></div>}
       {recent?.length > 0 && <Section title="Recent bundles"><ul className="text-sm divide-y divide-zinc-800">{recent.map((z: any) => (
         <li key={z.name} className="py-1.5 flex justify-between gap-2"><a href={z.url} className="text-violet-400 hover:underline truncate">{z.name}</a><span className="text-xs text-zinc-500 whitespace-nowrap">{mb(z.size)} · {z.at}</span></li>))}</ul></Section>}

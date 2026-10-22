@@ -169,7 +169,7 @@ class T(unittest.TestCase):
         r = Runner(cfg(), log=lambda m: None)                                # e2e dry job composed all aspects
         run = r.db.latest("t-e2e", "compose")
         m = json.loads(run["meta_json"])
-        exp = ["16:9", "1:1", "9:16"] if os.environ.get("STUDIO_MOCK_FAST") != "1" else ["9:16"]
+        exp = ["16:9", "1:1", "9:16"] if os.environ.get("STUDIO_MOCK_FAST") == "0" else ["9:16"]
         self.assertEqual(sorted(m["exports"]), exp)
         self.assertTrue(all(Path(p).stat().st_size > 5000 for p in m["exports"].values()))
         self.assertEqual(sorted(m["export_scores"]), exp) if len(exp) > 1 else None
@@ -246,7 +246,8 @@ class T(unittest.TestCase):
         os.environ.update(FAL_KEY="dummy", ELEVENLABS_API_KEY="dummy", STUDIO_FAL_TOPPED_UP="1")
         try:                                                     # live with no LLM key: clean stop, nothing paid called
             c = cfg(); c["budget"] = {"global_cap_usd": 75, "per_job_cap_usd": 15}
-            for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY"): os.environ.pop(k, None)
+            for k in ("ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"):
+                os.environ.pop(k, None)
             lr = Runner(c, live=True, log=lambda m: None)
             j2 = lr.create_job({"id": "t-script-live", "persona": "maksim", "template": "talking_head_scripted", "topic": "x"})
             self.assertEqual(lr.run_job(j2), "failed")
@@ -400,6 +401,40 @@ class T(unittest.TestCase):
             self.assertFalse(auth.verify(auth.sign("t-secret-abc", now=0), "t-secret-abc"))     # expired
             self.assertFalse(auth.verify(auth.sign("other"), "t-secret-abc"))                   # forged
             c.get("/logout"); self.assertEqual(c.get("/api/meta").status_code, 401)
+        finally:
+            for k, v in old.items():
+                os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)
+
+    def test_auth_disabled_switch_skips_the_gate(self):
+        from studio.web import create_app
+        keys = ("STUDIO_REQUIRE_AUTH", "STUDIO_APP_PASSWORD", "STUDIO_SESSION_SECRET", "STUDIO_AUTH_DISABLED")
+        old = {k: os.environ.get(k) for k in keys}
+        try:
+            os.environ["STUDIO_REQUIRE_AUTH"] = "1"
+            os.environ["STUDIO_APP_PASSWORD"] = "t-pass-123"
+            os.environ["STUDIO_SESSION_SECRET"] = "t-secret-abc"
+            os.environ.pop("STUDIO_AUTH_DISABLED", None)
+            closed = create_app(cfg()).test_client()
+            page = closed.get("/board")
+            self.assertEqual(page.status_code, 302)
+            self.assertIn("/login", page.headers["Location"])
+            self.assertEqual(closed.get("/api/meta").status_code, 401)
+            self.assertEqual(closed.get("/api/boards").status_code, 401)
+            os.environ["STUDIO_AUTH_DISABLED"] = "0"
+            still = create_app(cfg()).test_client()
+            self.assertEqual(still.get("/api/spend").status_code, 401)
+            os.environ["STUDIO_AUTH_DISABLED"] = "1"
+            open_ = create_app(cfg()).test_client()
+            board = open_.get("/board")
+            self.assertNotIn("/login", board.headers.get("Location", ""))
+            self.assertIn(board.status_code, (200, 503))
+            self.assertEqual(open_.get("/library").status_code, board.status_code)
+            self.assertEqual(open_.get("/api/meta").status_code, 200)
+            self.assertEqual(open_.get("/api/boards").status_code, 200)
+            self.assertEqual(open_.get("/api/spend").status_code, 200)
+            login = open_.get("/login")
+            self.assertEqual(login.status_code, 302)
+            self.assertNotIn("password", login.get_data(as_text=True).lower())
         finally:
             for k, v in old.items():
                 os.environ.pop(k, None) if v is None else os.environ.__setitem__(k, v)

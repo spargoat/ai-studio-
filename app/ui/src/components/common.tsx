@@ -23,7 +23,7 @@ export function Media({ path, poster, className = "" }: { path?: string | null; 
   const cls = `rounded-md bg-black border border-zinc-800 object-contain ${className}`;
   if (/\.(png|jpe?g|webp)$/.test(p)) return <a href={u} target="_blank" rel="noreferrer"><img src={u} loading="lazy" className={cls} alt="" /></a>;
   if (p.endsWith(".mp4")) return <video src={poster ? u : `${u}#t=0.5`} poster={poster ? fileUrl(poster) : undefined} controls playsInline preload={poster ? "none" : "metadata"} className={cls} />;
-  if (/\.(mp3|wav)$/.test(p)) return <audio src={u} controls className="w-full max-w-xs" />;
+  if (/\.(mp3|wav|m4a|ogg|aac)$/.test(p)) return <audio src={u} controls preload="metadata" className="w-full max-w-xs" />;
   return <a href={u} target="_blank" rel="noreferrer" className="text-xs text-violet-400 underline">{path.split("/").pop()}</a>;
 }
 

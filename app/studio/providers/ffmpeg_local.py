@@ -12,7 +12,7 @@ class FfmpegProvider(Provider):
 
     def do_compose(self, ctx):
         from ..compose import compose
-        fast = not ctx.get("live") and os.environ.get("STUDIO_MOCK_FAST") == "1"
+        fast = not ctx.get("live") and os.environ.get("STUDIO_MOCK_FAST", "1") != "0"
         src = ctx["inputs"].get("finish") or next(v for k, v in ctx["inputs"].items() if k != "brief")
         params = dict(ctx["params"])
         b = {k: v for k, v in (ctx.get("brief") or {}).items() if isinstance(v, str)}
@@ -25,12 +25,28 @@ class FfmpegProvider(Provider):
         return {"output_path": first, "meta": m, "units_actual": 1, "request_id": "local"}
 
     def do_finish(self, ctx):
+        if not ctx.get("live"):
+            from ..assets import ffmpeg_on_disk
+            if ffmpeg_on_disk("ffmpeg") is None:
+                from .mock import write_placeholder
+                out = Path(ctx["out_dir"]) / "final.mp4"
+                src = Path((ctx.get("inputs") or {}).get("lipsync") or "")
+                if src.is_file() and src.stat().st_size > 32:
+                    out.write_bytes(src.read_bytes())
+                else:
+                    write_placeholder("mp4", out)
+                send = Path(ctx["out_dir"]) / "final_send.mp4"
+                send.write_bytes(out.read_bytes())
+                return {"output_path": str(out),
+                        "meta": {"seconds": 1, "placeholder": True, "send_copy": str(send),
+                                 "send_mb": round(send.stat().st_size / 1e6, 3)},
+                        "units_actual": 1, "request_id": "local"}
         p = ctx["params"]
         w, h, fps = p.get("width", 1080), p.get("height", 1920), p.get("fps", 30)
         # Dry run + STUDIO_MOCK_FAST: inputs are tiny mock clips, so export at mock size. Never applies live.
-        if not ctx.get("live") and os.environ.get("STUDIO_MOCK_FAST") == "1":
-            from .mock import W, H, FPS
-            w, h, fps = W, H, FPS
+        if not ctx.get("live") and os.environ.get("STUDIO_MOCK_FAST", "1") != "0":
+            from .mock import frame_size
+            w, h, fps = frame_size()
         out = Path(ctx["out_dir"]) / "final.mp4"
         grade = ""
         if p.get("grade", "hf_warm") == "hf_warm":
@@ -41,16 +57,16 @@ class FfmpegProvider(Provider):
               f"eq=brightness='0.008*sin(2*PI*t*0.7)+0.004*sin(2*PI*t*2.3)':eval=frame,"
               f"noise=c0s={p.get('grain', 5)}:c1s=2:allf=t,format=yuv420p")
         af = f"loudnorm=I={p.get('loudnorm_i', -16)}:TP=-1.5,highpass=f=70"
-        if not ctx.get("live") and os.environ.get("STUDIO_MOCK_FAST") == "1":
-            af = "highpass=f=70"                      # tests: loudnorm is the slowest filter on tiny mock clips
+        if not ctx.get("live") and os.environ.get("STUDIO_MOCK_FAST", "1") != "0":
+            af = "highpass=f=70"                      # dry run: loudnorm is the slowest filter on tiny mock clips
         ff(["-i", ctx["inputs"]["lipsync"], "-vf", vf, "-af", af, "-c:v", "libx264", "-crf", "19",
             "-preset", p.get("preset", os.environ.get("STUDIO_FFMPEG_PRESET", "medium")), "-c:a", "aac", "-b:a", "160k", "-ar", "48000",
             "-movflags", "+faststart", "-map_metadata", "-1", str(out)], timeout=900)
         d = duration(out) or 10
         send = Path(ctx["out_dir"]) / "final_send.mp4"
         kbps = int(min(12000, (p.get("send_mb", 18) * 8192) / d - 160))
-        if not ctx.get("live") and os.environ.get("STUDIO_MOCK_FAST") == "1":
-            import shutil; shutil.copyfile(out, send)        # tests: skip the second (send-copy) encode
+        if not ctx.get("live") and os.environ.get("STUDIO_MOCK_FAST", "1") != "0":
+            import shutil; shutil.copyfile(out, send)        # dry run: skip the second (send-copy) encode
         else:
             ff(["-i", str(out), "-c:v", "libx264", "-b:v", f"{kbps}k", "-maxrate", f"{kbps}k", "-bufsize", f"{2*kbps}k",
                 "-preset", os.environ.get("STUDIO_FFMPEG_PRESET", "slow"), "-c:a", "aac", "-b:a", "128k", "-movflags", "+faststart", str(send)], timeout=900)

@@ -1,28 +1,92 @@
-// Adapted from AMN OS pages/CreditsPage.tsx: summary row, by provider / by model, recent calls table, wired to /api/spend.
+// Spend from the attempt ledger. Empty live usage stays at $0. Nothing here is estimated from a mock.
 import { useQuery } from "@tanstack/react-query";
 import { Loader2 } from "lucide-react";
-import { PageHeader, Badge } from "../components/ui";
-import { Section, Kpi, th, td, tr, Status } from "../components/common";
-import { api, usd, ts } from "../lib/api";
+import { api, ts, usd } from "../lib/api";
 
 export default function SpendPage() {
-  const { data, isLoading } = useQuery({ queryKey: ["spend"], queryFn: () => api("/api/spend") });
-  if (isLoading || !data) return <div className="py-16 flex justify-center"><Loader2 className="animate-spin text-zinc-500" /></div>;
-  const List = ({ o }: { o: Record<string, number> }) => Object.keys(o).length ? <div>{Object.entries(o).map(([k, v]) => <div key={k} className="flex justify-between py-1.5 border-b border-zinc-800/60 text-sm"><span className="text-zinc-300 font-mono text-xs truncate">{k}</span><Badge size="sm">{usd(v, 4)}</Badge></div>)}</div> : <p className="text-sm text-zinc-500">No live usage.</p>;
+  const { data, isLoading } = useQuery({ queryKey: ["spend"], queryFn: () => api<any>("/api/spend") });
+  if (isLoading || !data) return <div className="v3-page v3-loading"><Loader2 size={16} className="v3-spin" /> Loading spend</div>;
+  const cap = Number(data.caps?.global || 0);
+  const counted = Number(data.counted || 0);
+  const pct = cap > 0 ? Math.min(100, (counted / cap) * 100) : 0;
+  const providers = Object.entries(data.by_provider || {}) as [string, number][];
+  const max = Math.max(...providers.map(([, v]) => Number(v)), 0.0001);
+  const fallback = data.higgsfield_fallback || [];
   return (
-    <div>
-      <PageHeader title="Spend" badge={<Badge variant="info" size="sm">{data.calls} live calls</Badge>} description="Live spend from the attempt ledger, plus dashboard reconciliations. Dry runs cost $0." />
-      <div className="grid grid-cols-2 md:grid-cols-4 border border-zinc-800 rounded-lg mb-8 bg-zinc-900/40">
-        <Kpi label="Logged (ledger)" value={usd(data.logged)} /><Kpi label="Counted vs caps" value={usd(data.counted)} sub="includes reconciliation" />
-        <Kpi label="Global cap" value={usd(data.caps.global, 0)} sub={`${((data.counted / (data.caps.global || 1)) * 100).toFixed(0)}% used`} /><Kpi label="Per-job cap" value={usd(data.caps.per_job, 0)} />
+    <div className="v3-page">
+      <header className="lib-h">
+        <div>
+          <h1>Spend</h1>
+          <p>Live calls from the attempt ledger. Dry runs stay at $0 and are not in the bars.</p>
+        </div>
+        <span className="v3-badge">{data.calls} live calls</span>
+      </header>
+      <div className="spend-grid">
+        <section className="v3-card">
+          <h3>Budget vs cap</h3>
+          <div className="spend-fig">{usd(counted)} <small>of {usd(cap, 0)}</small></div>
+          <div className="v3-capb" aria-label="Budget used"><i style={{ width: `${pct}%` }} /></div>
+          <p className="v3-muted">{pct.toFixed(0)}% of the global cap. Per-job cap {usd(data.caps?.per_job, 0)}.</p>
+        </section>
+        <section className="v3-card">
+          <h3>Forecast</h3>
+          <div className="spend-fig">{usd(data.forecast?.month ?? 0)}</div>
+          <p className="v3-muted">{data.forecast?.note}</p>
+        </section>
+        <section className="v3-card">
+          <h3>Logged</h3>
+          <div className="spend-fig">{usd(data.logged)}</div>
+          <p className="v3-muted">Counted against caps {usd(counted)}, including reconciliation.</p>
+        </section>
       </div>
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8"><Section title="By provider"><List o={data.by_provider} /></Section><Section title="By model"><List o={data.by_model} /></Section></div>
-      <Section title="Recent attempts (live and dry)"><div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr className="border-b border-zinc-700">
-        <th className={th}>Time</th><th className={th}>Job / stage</th><th className={`${th} hidden md:table-cell`}>Model</th><th className={th}>Status</th><th className={`${th} text-right`}>Cost</th></tr></thead>
-        <tbody>{data.recent.slice(0, 80).map((r: any, i: number) => <tr key={i} className={tr}><td className={`${td} text-zinc-500`}>{ts(r.started_at)}</td>
-          <td className={td}>{r.job_id}/{r.stage} <span className={r.mode === "live" ? "text-red-400" : "text-zinc-600"}>{r.mode}</span></td>
-          <td className={`${td} hidden md:table-cell font-mono text-zinc-400`}>{r.model}</td><td className={td}><Status s={r.status} /></td>
-          <td className={`${td} text-right font-mono`}>{usd(r.actual_cost_usd, 4)}</td></tr>)}</tbody></table></div></Section>
+      <div className="spend-split">
+        <section className="v3-card">
+          <h3>Cost by provider</h3>
+          {providers.length ? providers.map(([name, cost]) => (
+            <div key={name} className="spend-row">
+              <span>{name}</span>
+              <i><b style={{ width: `${(Number(cost) / max) * 100}%` }} /></i>
+              <em>{usd(Number(cost), 4)}</em>
+            </div>
+          )) : <p className="v3-muted">No live usage.</p>}
+        </section>
+        <section className="v3-card">
+          <h3>Top APIs</h3>
+          {(data.top_apis || []).length ? (data.top_apis as any[]).map((row) => (
+            <div key={`${row.provider}-${row.api}`} className="spend-api">
+              <div><b>{row.api}</b><small>{row.provider} · {row.calls} calls</small></div>
+              <em>{usd(row.cost, 4)}</em>
+            </div>
+          )) : <p className="v3-muted">No live API calls.</p>}
+        </section>
+      </div>
+      <section className="v3-card spend-fall">
+        <h3>Higgsfield fallback</h3>
+        {fallback.length ? (
+          <ul>{fallback.map((row: any, i: number) => (
+            <li key={i}>{ts(row.started_at)} · {row.job_id}/{row.stage} · {row.model} · {row.status} · {usd(row.actual_cost_usd, 4)}</li>
+          ))}</ul>
+        ) : <p className="v3-muted">Higgsfield fallback has not been used.</p>}
+      </section>
+      <section className="v3-card">
+        <h3>Recent attempts</h3>
+        <div className="spend-table">
+          <table>
+            <thead><tr><th>Time</th><th>Job</th><th>API</th><th>Status</th><th>Cost</th></tr></thead>
+            <tbody>
+              {(data.recent || []).slice(0, 40).map((row: any, i: number) => (
+                <tr key={i}>
+                  <td>{ts(row.started_at)}</td>
+                  <td>{row.job_id}/{row.stage} · {row.mode}</td>
+                  <td>{row.provider}/{row.model}</td>
+                  <td>{row.status}</td>
+                  <td>{usd(row.actual_cost_usd, 4)}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      </section>
     </div>
   );
 }

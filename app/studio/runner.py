@@ -220,16 +220,26 @@ class Runner:
         return self.cfg["_data_dir"] / "jobs" / job_id
 
     def template(self, job):
+        brief = job.get("brief") or {}
+        if brief.get("board_stages"):
+            return {"name": brief.get("template") or "board", "stages": brief["board_stages"],
+                    "_board": True, "_path": "board"}
         return load_template(job["template"])
 
     def stage_defs(self, job):
         t = self.template(job)
+        board = bool(t.get("_board"))
         defs = []
         for s in t["stages"]:
             s = dict(s)
-            s.setdefault("needs", [] if s["id"] == "brief" else ["brief"])
-            if s["id"] != "brief" and "brief" not in s["needs"]:
-                s["needs"] = ["brief", *s["needs"]]
+            if board:
+                # Wires already became needs. Don't force every stage to wait on brief:
+                # intel nodes run before the brief exists.
+                s.setdefault("needs", [])
+            else:
+                s.setdefault("needs", [] if s["id"] == "brief" else ["brief"])
+                if s["id"] != "brief" and "brief" not in s["needs"]:
+                    s["needs"] = ["brief", *s["needs"]]
             ov = (job["brief"].get("overrides") or {}).get(s["id"]) or {}
             if "prompt" in ov:
                 s["prompt"] = ov["prompt"]
@@ -262,6 +272,8 @@ class Runner:
             raise BriefError(f"unknown persona '{brief.get('persona')}', expected one of {list(pers)}")
         script = (brief.get("script") or "").strip()
         kinds = {s["kind"] for s in load_template(brief.get("template", "talking_head"))["stages"]}
+        kinds |= {s.get("kind") for s in (brief.get("board_stages") or []) if s.get("kind")}
+        # A board script block writes the words. The template alone has voice and no script stage.
         if not script and "voice" in kinds and "script" not in kinds:
             raise BriefError("brief.script is empty")
         if not script:
@@ -289,10 +301,12 @@ class Runner:
         fake = {"brief": brief, "template": brief["template"], "id": "estimate"}
         rows = []
         for sdef in self.stage_defs(fake):
-            if sdef["kind"] == "brief":
+            if sdef["kind"] in ("brief", "intel") or sdef.get("disabled"):
+                continue
+            key = sdef.get("uses", sdef["id"])
+            if key not in self.cfg["stages"]:
                 continue
             ctx = self.build_ctx(fake, sdef, inputs={}, dry_estimate=True)
-            key = sdef.get("uses", sdef["id"])
             if key == "still" and brief.get("still_provider"):
                 _provider, sc = self.provider_for(key, job=fake)
             else:
@@ -311,6 +325,9 @@ class Runner:
         Local/CLI entry point. The Inngest workflow calls the same decide / stage /
         gate / settle steps, one durable step at a time, instead of this loop.
         """
+        return self._run_job(job_id, only)
+
+    def _run_job(self, job_id, only=None):
         self.mark_running(job_id)
         job = self.db.job(job_id)
         defs = self.stage_defs(job)
@@ -348,9 +365,65 @@ class Runner:
     def def_of(self, defs, sid):
         return next(d for d in defs if d["id"] == sid)
 
+    def _block_name(self, sdef):
+        if not sdef:
+            return "A block"
+        key = sdef.get("board_node") or sdef.get("kind") or sdef.get("id") or "block"
+        labels = {
+            "video": "Video", "voice": "Voiceover", "script": "Script", "brief": "Brief",
+            "landing": "Landing page", "still": "Still", "image": "Still",
+            "funnel_step": "Funnel step", "ad_feed": "Ad Feed", "funnel_route": "Funnel Map",
+            "intel": "Intel",
+        }
+        return labels.get(key, str(key).replace("_", " ").capitalize())
+
+    def stall_reason(self, job_id):
+        """Why a dry run stopped with blocks that never started. Named, so the canvas can show it."""
+        job = self.db.job(job_id)
+        if not job:
+            return "Dry run stopped before every block finished"
+        defs = self.stage_defs(job)
+        by_id = {d["id"]: d for d in defs}
+        lines = []
+        for sdef in defs:
+            if sdef.get("disabled"):
+                continue
+            latest = self.db.latest(job_id, sdef["id"])
+            if latest and latest["status"] == READY and self.is_ready(latest, sdef) and not self.is_stale(job_id, latest):
+                continue
+            name = self._block_name(sdef)
+            if latest and latest["status"] in ("failed", "blocked_budget"):
+                text = latest.get("error") or f"{name} failed"
+                lines.append(text if name in text else f"{name}: {text}")
+                continue
+            unmet = []
+            for dep in sdef.get("needs") or []:
+                ddef = by_id.get(dep)
+                if ddef is None:
+                    unmet.append(f"{dep} (missing)")
+                    continue
+                if ddef.get("disabled"):
+                    unmet.append(f"{self._block_name(ddef)} (turned off)")
+                    continue
+                if not self.is_ready(self.db.latest(job_id, dep), ddef):
+                    unmet.append(self._block_name(ddef))
+            if unmet:
+                lines.append(f"{name} is waiting on {', '.join(unmet)}")
+            elif latest is None or latest["status"] != READY:
+                lines.append(f"{name} did not finish")
+        if not lines:
+            return "Dry run stopped before every block finished"
+        shown = lines[:4]
+        text = "Dry run stopped. " + "; ".join(shown)
+        extra = len(lines) - len(shown)
+        if extra:
+            text += f"; and {extra} more"
+        return text
+
     def is_complete(self, job_id, defs):
+        active = [d for d in defs if not d.get("disabled")]
         return all(self.is_ready(self.db.latest(job_id, d["id"]), d)
-                   and not self.is_stale(job_id, self.db.latest(job_id, d["id"])) for d in defs)
+                   and not self.is_stale(job_id, self.db.latest(job_id, d["id"])) for d in active)
 
     def rerun(self, job_id, stage, cascade=False):
         st = self.run_job(job_id, only=stage)
@@ -365,6 +438,8 @@ class Runner:
         due_any = waiting = failed = running = False
         for sdef in defs:
             sid = sdef["id"]
+            if sdef.get("disabled"):
+                continue
             latest = self.db.latest(job_id, sid)
             if latest and latest["status"] == "running":
                 running = True
@@ -436,22 +511,62 @@ class Runner:
         waited = f" after {int(age)}s" if age is not None else ""
         return f"instance was killed or the run timed out{waited} (left running with no result)"
 
+    def _meta(self, raw):
+        if isinstance(raw, dict):
+            return raw
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
     def _run_is_stale(self, run):
-        """A fal poll stays running between requests. Any other row still running past the timeout died with the instance."""
-        meta = json.loads(run.get("meta_json") or "{}")
-        if meta.get("fal"):
+        """A fal or Higgsfield poll stays running between requests. Any other row still running past the timeout died with the instance."""
+        meta = self._meta(run.get("meta_json"))
+        if meta.get("fal") or meta.get("higgsfield"):
             return False
         age = self._run_age_s(run.get("started_at"))
         if age is None:
             return True
         return age >= self._run_timeout_s()
 
+    def _attempt_should_close(self, parent_status, meta, started_at):
+        """The spend page lists attempts. stage_run_id does not always find them.
+
+        Compose killed mid-encode left the attempt `running` after the stage_run
+        was already failed. Close the ledger row unless a stage run is still in
+        progress: a fresh run, or a fal / Higgsfield poll.
+        """
+        meta = meta or {}
+        if parent_status == "running" and (meta.get("fal") or meta.get("higgsfield")):
+            return False
+        age = self._run_age_s(started_at)
+        fresh = age is not None and age < self._run_timeout_s()
+        if parent_status == "running" or not parent_status:
+            return not fresh
+        return True
+
+    def _close_attempts_for_run(self, run, reason, stamp):
+        """Close the ledger row for this run even when stage_run_id was not stored."""
+        self.db.x(
+            """UPDATE attempts SET status='failed', error=?, finished_at=?
+               WHERE status='running' AND job_id=? AND stage=?
+                 AND (stage_run_id=? OR CAST(stage_run_id AS TEXT)=? OR started_at=?)""",
+            (reason, stamp, run["job_id"], run["stage"], run["id"], str(run["id"]), run.get("started_at")))
+
     def reconcile(self, job_id=None):
-        """Fail stage runs left running past the timeout, and drop expired compose leases.
+        """Fail stage runs left running past the timeout, then attempts the spend page still shows.
 
         Cron calls this across every job. A killed function cannot record its own failure,
         so the row stays `running` until this path marks it failed. Re-run starts a new version.
+        Inside a job scope with nothing running, skip the scan: each remote round trip is paid for.
         """
+        scope = self.db._scope
+        if scope is not None and (job_id is None or scope.job_id == job_id):
+            if not any(row["status"] == "running" for row in scope.rows):
+                return {"failed": [], "leases_released": []}
         sql = "SELECT * FROM stage_runs WHERE status='running'"
         args = ()
         if job_id:
@@ -462,16 +577,57 @@ class Runner:
             if not self._run_is_stale(run):
                 continue
             reason = self._stale_reason(run)
-            self.db.update_run(run["id"], status="failed", error=reason, finished_at=now())
-            if run["stage"] == "compose":
+            stamp = now()
+            self.db.update_run(run["id"], status="failed", error=reason, finished_at=stamp)
+            self._close_attempts_for_run(run, reason, stamp)
+            if run["stage"] == "compose" and self.db.has_table("leases"):
                 self.db.x("DELETE FROM leases WHERE name='compose' AND job_id=?", (run["job_id"],))
             self.log(run["job_id"], run["stage"], "error", reason)
             self.settle(run["job_id"])
             failed.append({"id": run["id"], "job_id": run["job_id"], "stage": run["stage"], "error": reason})
+        attempt_sql = """SELECT a.id, a.job_id, a.stage, a.started_at, r.status AS run_status, r.meta_json
+                         FROM attempts a LEFT JOIN stage_runs r ON r.id = a.stage_run_id
+                         WHERE a.status='running'"""
+        attempt_args = ()
+        if job_id:
+            attempt_sql += " AND a.job_id=?"
+            attempt_args = (job_id,)
+        touched = set()
+        for att in self.db.q(attempt_sql, attempt_args):
+            meta = self._meta(att.get("meta_json"))
+            if not self._attempt_should_close(att.get("run_status"), meta, att.get("started_at")):
+                continue
+            age = self._run_age_s(att.get("started_at"))
+            waited = f" after {int(age)}s" if age is not None else ""
+            parent = att.get("run_status")
+            if parent and parent != "running":
+                reason = f"stage run already {parent}; the attempt was still marked running{waited}"
+            else:
+                reason = self._stale_reason({"started_at": att.get("started_at")})
+            stamp = now()
+            self.db.x("UPDATE attempts SET status='failed', error=?, finished_at=? WHERE id=? AND status='running'",
+                      (reason, stamp, att["id"]))
+            self.log(att["job_id"], att["stage"], "error", reason)
+            touched.add(att["job_id"])
+        for jid in touched:
+            self.settle(jid)
         return {"failed": failed, "leases_released": self.db.release_expired_leases()}
 
     def advance(self, job_id, only=None):
-        """Run one due stage, or poll one in-flight fal request. Safe to call again."""
+        """Run one due stage, or poll one in-flight provider request. Safe to call again."""
+        with self.db.job_scope(job_id) as scope:
+            try:
+                body = self._advance_body(job_id, only)
+            finally:
+                scope.flush()
+            if isinstance(body, dict):
+                body["stages"] = scope.statuses()
+                if body.get("status") == "blocked" and not body.get("error"):
+                    body["ok"] = False
+                    body["error"] = self.stall_reason(job_id)
+            return body
+
+    def _advance_body(self, job_id, only=None):
         job = self.db.job(job_id)
         if not job:
             raise BriefError(f"no job {job_id}")
@@ -500,7 +656,19 @@ class Runner:
                     body["ok"] = False
                     body["error"] = fresh["error"]
                 return body
-            return {"action": "busy", "stage": run["stage"], "status": "running"}
+            # A template job may still be writing on another request. A board row left
+            # running means the previous request died, and waiting out the timeout
+            # left the canvas on Running with no error.
+            if not (job.get("brief") or {}).get("board_stages"):
+                return {"action": "busy", "stage": run["stage"], "status": "running"}
+            sdef = next((d for d in defs if d["id"] == run["stage"]), None)
+            reason = f"{self._block_name(sdef)} was left running with no result"
+            stamp = now()
+            self.db.update_run(run["id"], status="failed", error=reason, finished_at=stamp)
+            self._close_attempts_for_run(run, reason, stamp)
+            self.log(job_id, run["stage"], "error", reason)
+            return {"action": "stage", "stage": run["stage"], "ok": False, "pending": False,
+                    "error": reason, "status": self.settle(job_id)}
         if not only:
             bad = self._failed_stage(job_id)
             if bad:
@@ -514,6 +682,8 @@ class Runner:
         try:
             for sdef in defs:
                 sid = sdef["id"]
+                if sdef.get("disabled"):
+                    continue
                 if only and sid != only:
                     continue
                 latest = self.db.latest(job_id, sid)
@@ -546,7 +716,9 @@ class Runner:
                         message = space_note(e)
                         latest = self.db.latest(job_id, sid)
                         if latest and latest["status"] == "running":
-                            self.db.update_run(latest["id"], status="failed", error=message, finished_at=now())
+                            stamp = now()
+                            self.db.update_run(latest["id"], status="failed", error=message, finished_at=stamp)
+                            self._close_attempts_for_run(latest, message, stamp)
                         self.log(job_id, sid, "error", message)
                         return {"action": "stage", "stage": sid, "ok": False, "pending": False,
                                 "error": message, "status": self.settle(job_id)}
@@ -563,7 +735,11 @@ class Runner:
         finally:
             self.async_fal = False
             self.async_poll = False
-        return {"action": "idle", "status": self.settle(job_id)}
+        body = {"action": "idle", "status": self.settle(job_id)}
+        if body["status"] == "blocked":
+            body["ok"] = False
+            body["error"] = self.stall_reason(job_id)
+        return body
 
     def _failed_stage(self, job_id):
         """Latest run of a stage that already failed. Advance does not start another version."""
@@ -647,9 +823,12 @@ class Runner:
         persona = self.cfg["_personas"][brief["persona"]]
         cps = (next((d for d in self.stage_defs(job) if d["kind"] == "voice"), {}).get("params") or {}).get("chars_per_second", 15)
         audio_s = pricing.est_audio_seconds(brief["script"], cps)
-        if not dry_estimate:
+        # A fast dry run must not ffprobe the voice file. That probe has no timeout
+        # and ran before the video row existed, so a hang left Video on "waiting".
+        if not dry_estimate and os.environ.get("STUDIO_MOCK_FAST", "1") == "0":
             from .storage import local
-            v = self.db.latest(job["id"], "voice")
+            voice_id = next((d["id"] for d in self.stage_defs(job) if d["kind"] == "voice"), "voice")
+            v = self.db.latest(job["id"], voice_id)
             if v and v["status"] == READY and v["output_path"]:
                 audio_s = duration(local(v["output_path"])) or audio_s
         vid_param = sdef["params"].get("duration", "auto") if sdef["kind"] == "video" else "auto"
@@ -688,12 +867,14 @@ class Runner:
             prompt = f"{prompt} {lt}"
         params = {k: v for k, v in sdef["params"].items() if k not in ("duration", "chars_per_second")} \
             if sdef["kind"] in ("video", "voice") else dict(sdef["params"])
+        from .board import resolve_voice_id
         locked = refs_for_stage(persona.get("refs"), sdef["kind"])
         ref_sha = {location(e): e.get("sha256") for e in locked if location(e) and e.get("sha256")}
+        voice_id = resolve_voice_id(self.cfg.get("_personas") or {}, brief["persona"], brief.get("voice_name"))
         return {"stage": sdef["id"], "kind": sdef["kind"], "prompt": prompt, "params": params,
                 "inputs": inputs, "persona": brief["persona"], "persona_display": persona.get("display"),
                 "refs": [location(e) for e in locked if location(e)], "ref_sha256": ref_sha,
-                "voice_id": persona.get("voice_id"),
+                "voice_id": voice_id,
                 "voice_settings": persona.get("voice_settings"), "script": script_txt, "brief": brief,
                 "audio_seconds": audio_s, "video_seconds": video_s, "fail_inject": self.fail_inject}
 
@@ -706,6 +887,8 @@ class Runner:
         job_id, sid, kind = job["id"], sdef["id"], sdef["kind"]
         if kind == "brief":
             return self._run_brief(job, sdef)
+        if kind == "intel":
+            return self._run_intel(job, sdef)
         self.open_stage(job_id, sid, reuse_running=False)
         max_try, _backoff = self.retry_policy()
         for attempt in range(1, max_try + 1):
@@ -746,6 +929,8 @@ class Runner:
         defs = self.stage_defs(job)
         sdef = self.def_of(defs, stage_id)
         sid = sdef["id"]
+        if sdef.get("disabled"):
+            return {"action": "blocked", "id": sid}
         if only and sid != only:
             return {"action": "skip", "id": sid}
         latest = self.db.latest(job_id, sid)
@@ -832,6 +1017,9 @@ class Runner:
             inputs[d] = local(src)
             if is_url(src):
                 downloaded.append(inputs[d])
+        for key, src_name in (sdef.get("input_alias") or {}).items():
+            if src_name in inputs:
+                inputs[key] = inputs[src_name]
         ctx = self.build_ctx(job, sdef, inputs)
         sc = self.apply_lora_route(job, sdef, sc, ctx)
         if sdef.get("model"):
@@ -872,6 +1060,9 @@ class Runner:
                 raise NoSpace(out_dir) from e
             raise
         ctx["out_dir"] = str(out_dir)
+        if kind == "video" and sdef.get("board_node") and not ctx["inputs"].get("still"):
+            # Slice 1 has no Still node. The existing image-to-video adapter still wants a frame.
+            ctx["inputs"]["still"] = self._placeholder_still(out_dir)
         if lead:
             from .media import ff as _ff
             padded = out_dir / "voice_leadin.wav"
@@ -900,8 +1091,13 @@ class Runner:
         sdef = self.def_of(self.stage_defs(job), stage_id)
         if sdef["kind"] == "brief":
             ok = self._run_brief(job, sdef, reuse_running=reuse_running)
-            latest = self.db.latest(job_id, "brief")
+            latest = self.db.latest(job_id, sdef["id"])
             return {"state": "succeeded" if ok else "failed", "kind": "brief", "retry": False,
+                    "run_id": latest["id"] if latest else None, "version": latest["version"] if latest else None}
+        if sdef["kind"] == "intel":
+            ok = self._run_intel(job, sdef)
+            latest = self.db.latest(job_id, sdef["id"])
+            return {"state": "succeeded" if ok else "failed", "kind": "intel", "retry": False,
                     "run_id": latest["id"] if latest else None, "version": latest["version"] if latest else None}
         latest = self.db.latest(job_id, stage_id)
         if reuse_running and latest and latest["status"] == "running":
@@ -981,7 +1177,13 @@ class Runner:
         provider, sc, ctx = prep["provider"], prep["sc"], prep["ctx"]
         max_try, _backoff = self.retry_policy()
         kind = prep["sdef"]["kind"]
-        actual = pricing.cost(self.cfg, sc["price_key"], kind, float(res["units_actual"]), ctx["params"]) \
+        usage = ((res.get("meta") or {}).get("usage") or {})
+        price_params = ctx["params"]
+        price_key = res.get("price_key") or sc["price_key"]
+        if "input_tokens" in usage or "output_tokens" in usage:
+            price_params = {**ctx["params"], "input_tokens": usage.get("input_tokens") or 0,
+                            "output_tokens": usage.get("output_tokens") or 0}
+        actual = pricing.cost(self.cfg, price_key, kind, float(res["units_actual"]), price_params) \
             if (self.live and provider.paid) else 0.0
         self.db.update_attempt(aid, status="succeeded", actual_cost_usd=actual,
                                provider_request_id=res.get("request_id"), finished_at=now(),
@@ -994,7 +1196,7 @@ class Runner:
         (prep["out_dir"] / "meta.json").write_text(json.dumps(meta, indent=2))
         self.db.update_run(prep["rid"], status=READY, output_path=res["output_path"], meta=meta,
                            actual_cost_usd=actual, cost_basis=basis, attempts=attempt,
-                           error=last_err, finished_at=now(),
+                           price_key=price_key, error=last_err, finished_at=now(),
                            review_status="pending" if prep["sdef"].get("review") else None)
         self.log(job_id, sid, "info",
                  f"v{prep['ver']} ok in {time.time()-t0:.1f}s, actual ${actual:.4f}, attempt {attempt}/{max_try}")
@@ -1189,6 +1391,8 @@ class Runner:
         run = self.db.run(run_id)
         if not q.get("enabled", True) or run["stage"] not in q.get("stages", ["still", "video", "lipsync", "finish"]):
             return None
+        if self._meta(run.get("meta_json")).get("placeholder"):
+            return None
         from . import score
         if not score.scorable(run["output_path"]):
             return None
@@ -1262,20 +1466,85 @@ class Runner:
         except Exception as e:
             meta["poster_error"] = str(e)
 
+    def _placeholder_still(self, out_dir):
+        path = Path(out_dir) / "board_still.png"
+        from .providers.mock import byte_media, write_placeholder
+        if byte_media():
+            write_placeholder("png", path)
+            return str(path)
+        from .media import ff
+        ff(["-f", "lavfi", "-i", "color=c=0x1d2b3a:s=270x480", "-frames:v", "1", str(path)])
+        return str(path)
+
+    def _load_inputs(self, job, sdef):
+        from .storage import local
+        blobs = {}
+        for dep in sdef.get("needs") or []:
+            run = self.db.latest(job["id"], dep)
+            if not run or not run.get("output_path"):
+                continue
+            try:
+                blobs[dep] = json.loads(Path(local(run["output_path"])).read_text())
+            except Exception:
+                continue
+        return blobs
+
+    def _run_intel(self, job, sdef):
+        from .board import artefact_summary, intel_artefact
+        sid = sdef["id"]
+        inputs_ids = {}
+        for dep in sdef.get("needs") or []:
+            run = self.db.latest(job["id"], dep)
+            if run:
+                inputs_ids[dep] = run["id"]
+        rid, ver = self.db.new_run(job["id"], sid, self.mode, "local", "adintel", "local_ffmpeg",
+                                   "", sdef.get("params") or {}, inputs_ids, 0.0)
+        out_dir = self.job_dir(job["id"]) / sid / f"v{ver}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            artefact = intel_artefact(sdef, self._load_inputs(job, sdef))
+        except Exception as e:
+            self.db.update_run(rid, status="failed", error=str(e), finished_at=now())
+            self.log(job["id"], sid, "error", str(e))
+            return False
+        path = out_dir / "out.json"
+        path.write_text(json.dumps(artefact, indent=2))
+        self.db.update_run(rid, status=READY, output_path=str(path), meta={"summary": artefact_summary(artefact)},
+                           actual_cost_usd=0.0, cost_basis="local: $0", attempts=1, finished_at=now())
+        self.log(job["id"], sid, "info", f"v{ver} {sdef.get('task')} read ({(artefact.get('evidence') or {}).get('origin')})")
+        if not self._publish(rid, out_dir):
+            return False
+        return True
+
     def _run_brief(self, job, sdef, reuse_running=False):
         from .assets import reclaim_tmp
         reclaim_tmp()
-        latest = self.db.latest(job["id"], "brief") if reuse_running else None
+        sid = sdef["id"]
+        latest = self.db.latest(job["id"], sid) if reuse_running else None
         if latest and latest["status"] == READY and reuse_running:
             return True
         if latest and latest["status"] == "running" and reuse_running:
             rid, ver = latest["id"], latest["version"]
         else:
-            rid, ver = self.db.new_run(job["id"], "brief", self.mode, "local", "brief-resolver", "local_ffmpeg",
+            rid, ver = self.db.new_run(job["id"], sid, self.mode, "local", "brief-resolver", "local_ffmpeg",
                                        "", {}, {}, 0.0)
-        out_dir = self.job_dir(job["id"]) / "brief" / f"v{ver}"
+        out_dir = self.job_dir(job["id"]) / sid / f"v{ver}"
         out_dir.mkdir(parents=True, exist_ok=True)
-        resolved = {"brief": job["brief"], "persona": self.cfg["_personas"][job["brief"]["persona"]],
+        merged = dict(job["brief"])
+        for blob in self._load_inputs(job, sdef).values():
+            if not isinstance(blob, dict):
+                continue
+            for key in ("pattern_summary", "interpretation", "decode", "label", "topic"):
+                if blob.get(key):
+                    merged[key] = blob[key]
+        if any(k in merged for k in ("pattern_summary", "interpretation", "decode", "label")):
+            self.db.x("UPDATE jobs SET brief_json=? WHERE id=?", (json.dumps(merged), job["id"]))
+            job["brief"] = merged
+            scope = self.db._scope
+            if scope is not None and scope.job_id == job["id"] and scope.job is not None:
+                scope.job["brief"] = merged
+                scope.job["brief_json"] = json.dumps(merged)
+        resolved = {"brief": merged, "persona": self.cfg["_personas"][merged["persona"]],
                     "template": self.template(job).get("_path"),
                     "stages": {d["id"]: {"prompt": self.build_ctx(job, d, {}, dry_estimate=True)["prompt"],
                                          "params": d["params"], "needs": d["needs"], "review": d.get("review", False)}
@@ -1284,7 +1553,7 @@ class Runner:
         p.write_text(json.dumps(resolved, indent=2, default=str))
         self.db.update_run(rid, status=READY, output_path=str(p), actual_cost_usd=0.0, cost_basis="local: $0",
                            attempts=1, finished_at=now())
-        self.log(job["id"], "brief", "info", f"v{ver} resolved prompts saved")
+        self.log(job["id"], sid, "info", f"v{ver} resolved prompts saved")
         if not self._publish(rid, out_dir):
             return False
         return True

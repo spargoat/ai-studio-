@@ -3,8 +3,10 @@
 name: talking_head_scripted
 version: 1
 # talking_head + a script/hook stage (PAS or AIDA + hook variants) before the voice. The voice speaks the
-# generated script. Dry run: mock text. Live: needs an LLM key (ANTHROPIC_API_KEY or OPENAI_API_KEY); until then
-# the script stage stops the job with 'needs key' before anything paid runs.
+# generated script. Dry run: mock text. Live calls Vercel AI Gateway (AI_GATEWAY_API_KEY,
+# VERCEL_OIDC_TOKEN, or the x-vercel-oidc-token request header). ANTHROPIC_API_KEY and
+# OPENAI_API_KEY are optional overrides. With none of
+# those set, the script stage stops the job with 'needs key' before anything paid runs.
 # voice is scheduled before video (deps unchanged) so Kling's duration matches the real audio length.
 stages:
   - id: brief

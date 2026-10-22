@@ -42,6 +42,10 @@ CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, stage TEXT,
   level TEXT, message TEXT, created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS boards (
+  id TEXT PRIMARY KEY, name TEXT, preset INTEGER DEFAULT 0, graph_json TEXT,
+  last_job_id TEXT, created_at TEXT, updated_at TEXT
+);
 CREATE TABLE IF NOT EXISTS leases (
   name TEXT PRIMARY KEY, owner TEXT, job_id TEXT, expires_at TEXT
 );
@@ -52,6 +56,16 @@ _lock = threading.Lock()
 
 def now():
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+class _CursorShim:
+    lastrowid = None
+
+    def fetchall(self):
+        return []
+
+    def fetchone(self):
+        return None
 
 
 class _Row(dict):
@@ -94,9 +108,186 @@ class _LibsqlConn:
     def close(self):
         self._raw.close()
 
+    @property
+    def in_transaction(self):
+        return bool(getattr(self._raw, "in_transaction", False))
+
+
+# One Hrana execute is a network round trip. A dead stream surfaces as this
+# family of errors and has to be reopened; the next statement will not heal it.
+# "hrana" matches every libSQL error, including "capacity exceeded". Treating that
+# as a dead stream opened a second connection and made the limit worse.
+_STALE_MARKERS = (
+    "connection closed",
+    "closed before message",
+    "stream closed",
+    "stream expired",
+    "server closed",
+    "broken pipe",
+    "connection reset",
+    "not connected",
+)
+_REMOTE_CALL_S = 8.0
+
+
+def _network_url(url):
+    return (url or "").lower().startswith(("libsql:", "https:", "http:", "wss:", "ws:"))
+
+
+def _stale_error(exc):
+    if _capacity_error(exc):
+        return False
+    msg = str(exc).lower()
+    return any(marker in msg for marker in _STALE_MARKERS)
+
+
+def _capacity_error(exc):
+    msg = str(exc).lower()
+    return "capacity" in msg or "too many connections" in msg or "temporarily exceeded" in msg
+
+
+def _close_quietly(conn):
+    """Close off the request thread. libSQL close waits for the call that already timed out."""
+    try:
+        if conn is not None:
+            conn.close()
+    except Exception:
+        pass
+
+
+def _lit(value):
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        if value != value or value in (float("inf"), float("-inf")):
+            return "NULL"
+        return repr(value)
+    return "'" + str(value).replace("'", "''") + "'"
+
+
+def _render(sql, args):
+    args = tuple(args or ())
+    parts = sql.split("?")
+    if len(parts) != len(args) + 1:
+        raise ValueError(f"SQL placeholder mismatch ({len(parts) - 1} vs {len(args)})")
+    out = []
+    for part, arg in zip(parts, args):
+        out.append(part)
+        out.append(_lit(arg))
+    out.append(parts[-1])
+    return "".join(out)
+
+
+class _JobScope:
+    """One job's rows in memory, and one script of writes flushed as a single round trip."""
+
+    def __init__(self, db, job_id):
+        self.db = db
+        self.job_id = job_id
+        self.job = None
+        self.rows = []
+        self.scores = {}
+        self.stmts = []
+        self.next_run = 1
+        self.next_attempt = 1
+
+    def load(self):
+        self.job = self.db._read_one("SELECT * FROM jobs WHERE id=?", (self.job_id,))
+        if self.job:
+            self.job["brief"] = json.loads(self.job["brief_json"])
+        self.rows = self.db._read_all(
+            "SELECT * FROM stage_runs WHERE job_id=? ORDER BY version", (self.job_id,))
+        ids = self.db._read_one(
+            "SELECT (SELECT COALESCE(MAX(id),0) FROM stage_runs) AS runs, "
+            "(SELECT COALESCE(MAX(id),0) FROM attempts) AS attempts")
+        self.next_run = int(ids["runs"] or 0) + 1
+        self.next_attempt = int(ids["attempts"] or 0) + 1
+        for row in self.db._read_all("SELECT * FROM scores WHERE job_id=?", (self.job_id,)):
+            row["visual"] = json.loads(row["visual_json"] or "null")
+            row["flags"] = json.loads(row["flags_json"] or "[]")
+            self.scores[row["stage_run_id"]] = row
+
+    def buffer(self, sql, args=()):
+        self.stmts.append(_render(sql, args))
+
+    def flush(self):
+        if not self.stmts:
+            return
+        script = ";\n".join(self.stmts)
+        self.stmts = []
+        self.db._exec_script(script)
+
+    def latest(self, stage):
+        found = None
+        for row in self.rows:
+            if row["stage"] != stage:
+                continue
+            if found is None or row["version"] >= found["version"]:
+                found = row
+        return found
+
+    def runs(self, stage=None):
+        rows = self.rows
+        if stage:
+            rows = [row for row in rows if row["stage"] == stage]
+        return list(rows)
+
+    def run(self, run_id):
+        for row in self.rows:
+            if row["id"] == run_id:
+                return row
+        return None
+
+    def statuses(self):
+        latest, order = {}, []
+        for row in self.rows:
+            if row["stage"] not in latest:
+                order.append(row["stage"])
+            latest[row["stage"]] = row["status"]
+        return [{"id": sid, "status": latest[sid]} for sid in order]
+
+
+class _JobScopeCtx:
+    def __init__(self, db, job_id):
+        self.db = db
+        self.job_id = job_id
+        self.owned = False
+        self.scope = None
+
+    def __enter__(self):
+        current = self.db._scope
+        if current is not None and current.job_id == self.job_id:
+            self.owned = False
+            self.scope = current
+            return current
+        scope = _JobScope(self.db, self.job_id)
+        scope.load()
+        self.db._scope = scope
+        self.scope = scope
+        self.owned = True
+        return scope
+
+    def __exit__(self, exc_type, exc, tb):
+        if not self.owned:
+            return False
+        try:
+            self.scope.flush()
+        finally:
+            if self.db._scope is self.scope:
+                self.db._scope = None
+        return False
+
 
 class DatabaseNotConfigured(RuntimeError):
     """Vercel has no Turso/libSQL URL and STUDIO_SQLITE is not set. Do not open /tmp SQLite."""
+
+
+class DatabaseBusy(RuntimeError):
+    """Turso refused the call, or the call did not finish. The route should say so and stop."""
 
 
 def remote_database_url():
@@ -135,9 +326,135 @@ def _open(path):
 
 class DB:
     def __init__(self, path):
-        self.conn = _open(path)
-        self.conn.executescript(SCHEMA)
-        self.conn.commit()
+        self.path = path
+        self.round_trips = 0
+        self.latency_s = 0.0
+        self.fail_statements = 0
+        self.fail_scripts = 0
+        self._scope = None
+        self._tables = {}
+        self.conn = None
+        self.remote = _network_url(remote_database_url()) and os.environ.get("STUDIO_SQLITE") != "1"
+        self._connect()
+
+    def _connect(self):
+        """Open the database. A remote open that sits past the call limit becomes DatabaseBusy."""
+        if not self.remote:
+            self.conn = _open(self.path)
+            self.conn.executescript(SCHEMA)
+            self.conn.commit()
+            return
+        last = None
+        for attempt in (1, 2):
+            box = {}
+
+            def run():
+                try:
+                    conn = _open(self.path)
+                    conn.executescript(SCHEMA)
+                    if getattr(conn, "in_transaction", False):
+                        conn.commit()
+                    box["conn"] = conn
+                except BaseException as exc:
+                    box["e"] = exc
+
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            worker.join(_REMOTE_CALL_S)
+            if worker.is_alive():
+                last = TimeoutError("Hrana: http error: connection closed before message completed")
+            elif "e" in box:
+                last = box["e"]
+            else:
+                self.conn = box["conn"]
+                return
+            if attempt == 1 and (_capacity_error(last) or isinstance(last, TimeoutError)):
+                time.sleep(0.35)
+                continue
+            break
+        if _capacity_error(last) or isinstance(last, TimeoutError):
+            raise DatabaseBusy("The board database is busy. Try again in a few seconds.") from last
+        raise last
+
+    def job_scope(self, job_id):
+        """Hold this job's rows in memory and flush each stage's writes as one script."""
+        return _JobScopeCtx(self, job_id)
+
+    def _reopen(self):
+        old = self.conn
+        self.conn = None
+        threading.Thread(target=_close_quietly, args=(old,), daemon=True).start()
+        self.round_trips += 1
+        if self.latency_s:
+            time.sleep(self.latency_s)
+        self._connect()
+
+    def _call(self, op, script=False):
+        self.round_trips += 1
+        if script and self.fail_scripts:
+            self.fail_scripts -= 1
+            raise RuntimeError("Hrana: http error: connection closed before message completed")
+        if self.fail_statements:
+            self.fail_statements -= 1
+            raise RuntimeError("Hrana: http error: connection closed before message completed")
+        if self.latency_s:
+            time.sleep(self.latency_s)
+        conn = self.conn
+        if not self.remote:
+            return op(conn)
+        box = {}
+
+        def run():
+            try:
+                box["v"] = op(conn)
+            except BaseException as exc:
+                box["e"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(_REMOTE_CALL_S)
+        if worker.is_alive():
+            # close() waits for the RPC that just timed out. Doing it here held the
+            # process, and every other request on the instance, until the function died.
+            threading.Thread(target=_close_quietly, args=(conn,), daemon=True).start()
+            if self.conn is conn:
+                self.conn = None
+            raise TimeoutError("Hrana: http error: connection closed before message completed")
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
+
+    def _attempt(self, op, script=False):
+        try:
+            return self._call(op, script=script)
+        except Exception as exc:
+            if _capacity_error(exc):
+                time.sleep(0.35)
+                try:
+                    return self._call(op, script=script)
+                except Exception as again:
+                    if _capacity_error(again) or _stale_error(again):
+                        raise DatabaseBusy("The board database is busy. Try again in a few seconds.") from again
+                    raise
+            if not _stale_error(exc):
+                raise
+            self._reopen()
+            return self._call(op, script=script)
+
+    def _read_all(self, sql, args=()):
+        with _lock:
+            cur = self._attempt(lambda conn: conn.execute(sql, args))
+            return [dict(row) for row in cur.fetchall()]
+
+    def _read_one(self, sql, args=()):
+        rows = self._read_all(sql, args)
+        return rows[0] if rows else None
+
+    def _exec_script(self, script):
+        with _lock:
+            self._attempt(lambda conn: conn.executescript(script), script=True)
+            if getattr(self.conn, "in_transaction", False):
+                self._attempt(lambda conn: conn.commit())
 
     def close(self):
         # Hold the same lock as queries. A background job can still be writing
@@ -166,17 +483,37 @@ class DB:
 
     def x(self, sql, args=()):
         with _lock:
-            cur = self.conn.execute(sql, args)
-            self.conn.commit()
+            if self._scope is not None:
+                self._scope.buffer(sql, args)
+                return _CursorShim()
+            cur = self._attempt(lambda conn: conn.execute(sql, args))
+            if getattr(self.conn, "in_transaction", True):
+                self._attempt(lambda conn: conn.commit())
             return cur
 
     def q(self, sql, args=()):
-        with _lock:
-            return [dict(r) for r in self.conn.execute(sql, args).fetchall()]
+        return self._read_all(sql, args)
 
     def one(self, sql, args=()):
         r = self.q(sql, args)
         return r[0] if r else None
+
+    def has_table(self, name):
+        if name in self._tables:
+            return self._tables[name]
+        found = self.one("SELECT name FROM sqlite_master WHERE type='table' AND name=?", (name,)) is not None
+        self._tables[name] = found
+        return found
+
+    def release_expired_leases(self):
+        """Drop compose leases past their expiry. Databases without the table have nothing to release."""
+        if not self.has_table("leases"):
+            return []
+        stamp = now()
+        rows = self.q("SELECT name, job_id FROM leases WHERE expires_at <= ?", (stamp,))
+        if rows:
+            self.x("DELETE FROM leases WHERE expires_at <= ?", (stamp,))
+        return [{"name": r["name"], "job_id": r["job_id"]} for r in rows]
 
     # --- jobs
     def create_job(self, job_id, template, persona, brief, mode, batch_id=None):
@@ -185,11 +522,19 @@ class DB:
                (job_id, template, persona, json.dumps(brief), "created", mode, batch_id, t, t))
 
     def set_job_status(self, job_id, status):
-        self.x("UPDATE jobs SET status=?, updated_at=? WHERE id=?", (status, now(), job_id))
+        stamp = now()
+        self.x("UPDATE jobs SET status=?, updated_at=? WHERE id=?", (status, stamp, job_id))
+        scope = self._scope
+        if scope is not None and scope.job_id == job_id and scope.job is not None:
+            scope.job["status"] = status
+            scope.job["updated_at"] = stamp
 
     def job(self, job_id):
+        scope = self._scope
+        if scope is not None and scope.job_id == job_id:
+            return scope.job
         j = self.one("SELECT * FROM jobs WHERE id=?", (job_id,))
-        if j:
+        if j and "brief" not in j:
             j["brief"] = json.loads(j["brief_json"])
         return j
 
@@ -198,37 +543,86 @@ class DB:
 
     # --- stage runs
     def new_run(self, job_id, stage, mode, provider, model, price_key, prompt, params, inputs, est):
-        v = (self.one("SELECT MAX(version) v FROM stage_runs WHERE job_id=? AND stage=?",
-                      (job_id, stage))["v"] or 0) + 1
+        scope = self._scope if self._scope is not None and self._scope.job_id == job_id else None
+        if scope is not None:
+            found = scope.latest(stage)
+            v = (found["version"] if found else 0) + 1
+        else:
+            v = (self.one("SELECT MAX(version) v FROM stage_runs WHERE job_id=? AND stage=?",
+                          (job_id, stage))["v"] or 0) + 1
+        stamp = now()
+        params_json, inputs_json = json.dumps(params), json.dumps(inputs)
+        if scope is not None:
+            rid = scope.next_run
+            scope.next_run += 1
+            self.x("""INSERT INTO stage_runs (id, job_id, stage, version, status, mode, provider, model,
+                     price_key, prompt, params_json, inputs_json, est_cost_usd, started_at)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   (rid, job_id, stage, v, "running", mode, provider, model, price_key, prompt,
+                    params_json, inputs_json, est, stamp))
+            scope.rows.append({
+                "id": rid, "job_id": job_id, "stage": stage, "version": v, "status": "running",
+                "mode": mode, "provider": provider, "model": model, "price_key": price_key,
+                "prompt": prompt, "params_json": params_json, "inputs_json": inputs_json,
+                "output_path": None, "meta_json": None, "est_cost_usd": est, "actual_cost_usd": None,
+                "cost_basis": None, "attempts": 0, "error": None, "review_status": None,
+                "review_note": None, "reviewed_at": None, "started_at": stamp, "finished_at": None,
+            })
+            return rid, v
         cur = self.x("""INSERT INTO stage_runs (job_id, stage, version, status, mode, provider, model,
                      price_key, prompt, params_json, inputs_json, est_cost_usd, started_at)
                      VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                      (job_id, stage, v, "running", mode, provider, model, price_key, prompt,
-                      json.dumps(params), json.dumps(inputs), est, now()))
+                      params_json, inputs_json, est, stamp))
         return cur.lastrowid, v
 
     def update_run(self, run_id, **kw):
         if "meta" in kw:
             kw["meta_json"] = json.dumps(kw.pop("meta"))
+        if not kw:
+            return
         sets = ", ".join(f"{k}=?" for k in kw)
         self.x(f"UPDATE stage_runs SET {sets} WHERE id=?", (*kw.values(), run_id))
+        scope = self._scope
+        if scope is not None:
+            row = scope.run(run_id)
+            if row is not None:
+                row.update(kw)
 
     def run(self, run_id):
+        scope = self._scope
+        if scope is not None:
+            row = scope.run(run_id)
+            if row is not None:
+                return row
         return self.one("SELECT * FROM stage_runs WHERE id=?", (run_id,))
 
     def runs(self, job_id, stage=None):
+        scope = self._scope
+        if scope is not None and scope.job_id == job_id:
+            return scope.runs(stage)
         if stage:
             return self.q("SELECT * FROM stage_runs WHERE job_id=? AND stage=? ORDER BY version", (job_id, stage))
         return self.q("SELECT * FROM stage_runs WHERE job_id=? ORDER BY stage, version", (job_id,))
 
     def latest(self, job_id, stage):
+        scope = self._scope
+        if scope is not None and scope.job_id == job_id:
+            return scope.latest(stage)
         return self.one("SELECT * FROM stage_runs WHERE job_id=? AND stage=? ORDER BY version DESC LIMIT 1",
                         (job_id, stage))
 
     # --- attempts / spend
     def add_attempt(self, **kw):
+        scope = self._scope
+        if scope is not None:
+            aid = scope.next_attempt
+            scope.next_attempt += 1
+            kw = {"id": aid, **kw}
         cols = ", ".join(kw)
         cur = self.x(f"INSERT INTO attempts ({cols}) VALUES ({','.join('?'*len(kw))})", tuple(kw.values()))
+        if scope is not None:
+            return kw["id"]
         return cur.lastrowid
 
     def update_attempt(self, aid, **kw):
@@ -290,10 +684,18 @@ class DB:
                (run["id"], run["job_id"], run["stage"], run["version"], persona, path, s.get("identity"),
                 s.get("identity_min"), s.get("identity_threshold"), s.get("identity_note"), json.dumps(s.get("visual")),
                 None, None, None, json.dumps(s.get("flags", [])), passed_i, now()))
+        scope = self._scope
+        if scope is not None:
+            stored = dict(s)
+            stored["flags"] = s.get("flags") or []
+            scope.scores[run["id"]] = stored
 
     def score(self, stage_run_id):
+        scope = self._scope
+        if scope is not None and scope.run(stage_run_id) is not None:
+            return scope.scores.get(stage_run_id)
         r = self.one("SELECT * FROM scores WHERE stage_run_id=?", (stage_run_id,))
-        if r:
+        if r and "visual" not in r:
             r["visual"] = json.loads(r["visual_json"] or "null"); r["flags"] = json.loads(r["flags_json"] or "[]")
         return r
 
@@ -309,6 +711,36 @@ class DB:
 
     def events(self, job_id, limit=200):
         return self.q("SELECT * FROM events WHERE job_id=? ORDER BY id DESC LIMIT ?", (job_id, limit))
+
+    # --- boards (graph JSON; Turso when that is the connection, SQLite otherwise)
+    def save_board(self, board_id, name, graph, preset=None, last_job_id=None):
+        t = now()
+        existing = self.board(board_id)
+        blob = json.dumps(graph)
+        if existing:
+            if preset is None:
+                preset = existing["preset"]
+            self.x("UPDATE boards SET name=?, preset=?, graph_json=?, updated_at=?, last_job_id=COALESCE(?, last_job_id) WHERE id=?",
+                   (name, int(bool(preset)), blob, t, last_job_id, board_id))
+        else:
+            self.x("INSERT INTO boards (id, name, preset, graph_json, last_job_id, created_at, updated_at) VALUES (?,?,?,?,?,?,?)",
+                   (board_id, name, int(bool(preset)), blob, last_job_id, t, t))
+
+    def board(self, board_id):
+        row = self.one("SELECT * FROM boards WHERE id=?", (board_id,))
+        if row:
+            row["graph"] = json.loads(row["graph_json"] or "{}")
+            row["preset"] = bool(row["preset"])
+        return row
+
+    def boards(self):
+        rows = self.q("SELECT id, name, preset, last_job_id, created_at, updated_at FROM boards ORDER BY preset DESC, name")
+        for row in rows:
+            row["preset"] = bool(row["preset"])
+        return rows
+
+    def set_board_job(self, board_id, job_id):
+        self.x("UPDATE boards SET last_job_id=?, updated_at=? WHERE id=?", (job_id, now(), board_id))
 
     # --- leases (one compose at a time across instances; Turso when that is the database)
     def acquire_lease(self, name, owner, job_id, ttl_s):
@@ -333,10 +765,3 @@ class DB:
 
     def release_lease(self, name, owner):
         self.x("DELETE FROM leases WHERE name=? AND owner=?", (name, owner))
-
-    def release_expired_leases(self):
-        stamp = now()
-        rows = self.q("SELECT name, job_id, owner FROM leases WHERE expires_at <= ?", (stamp,))
-        if rows:
-            self.x("DELETE FROM leases WHERE expires_at <= ?", (stamp,))
-        return [{"name": r["name"], "job_id": r["job_id"]} for r in rows]
