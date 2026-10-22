@@ -118,14 +118,26 @@ def create_app(cfg, live=False):
         runner.review(jid, stage, v, note)
         return redirect(url_for("job", jid=jid))
 
+    def _start_job(jid, *, only=None, cascade=False):
+        from . import workflows
+        mode = workflows.executor_mode()
+        if mode == "inngest":
+            workflows.send_job(jid, only=only, cascade=cascade)
+        elif mode == "inline":
+            runner.rerun(jid, only, cascade) if only is not None else runner.run_job(jid)
+        elif only is not None:
+            bg(runner.rerun, jid, only, cascade)
+        else:
+            bg(runner.run_job, jid)
+
     @app.post("/job/<jid>/rerun/<stage>")
     def rerun(jid, stage):
-        bg(runner.rerun, jid, stage)
+        _start_job(jid, only=stage)
         return redirect(url_for("job", jid=jid))
 
     @app.post("/job/<jid>/resume")
     def resume(jid):
-        bg(runner.run_job, jid)
+        _start_job(jid)
         return redirect(url_for("job", jid=jid))
 
     @app.get("/classic/library")
@@ -150,4 +162,7 @@ def create_app(cfg, live=False):
 
     from .api import register
     register(app, cfg, runner, live, bg)
+    from . import workflows
+    workflows.attach(runner)
+    workflows.serve(app)                         # /api/inngest — Inngest calls stages back here
     return app

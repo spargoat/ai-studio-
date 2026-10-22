@@ -72,3 +72,59 @@ The registry lives in two files:
 If fal's last response was "User is locked / Exhausted balance", `--live` routes still/video/lipsync to Higgsfield when those fallback prices are above 0. Otherwise it is refused until you top up and run with `STUDIO_FAL_TOPPED_UP=1`.
 Higgsfield needs `HIGGSFIELD_API_KEY` plus `HIGGSFIELD_API_SECRET` (or `HIGGSFIELD_API_KEY=key_id:key_secret`). The SDK names `HF_KEY` and `HF_API_KEY`/`HF_API_SECRET` work too. A live call with the secret missing stops before anything is sent. `pip install higgsfield-client` provides the client.
 Tests: `python3 -m unittest tests.test_dryrun` (they set STUDIO_MOCK_FAST=1 and STUDIO_FFMPEG_PRESET=ultrafast).
+
+## Durable jobs on Vercel (Inngest)
+
+The API used to run each job on a background thread. The job only moved while that process was still alive, because the stage loop lived inside the request. On Vercel the function freezes or hits its max duration, the thread dies, and the row stays `running`.
+
+`studio/workflows.py` runs the same stages as an Inngest function, served by the Flask app at `/api/inngest`. `studio/db.py` is still the record of job and stage state. Inngest only sequences steps:
+
+- each stage is its own `step.run` (`open`, then the attempt)
+- a budget-cap check is its own `step.run` and, on a miss, no provider call is made
+- retries sleep with `step.sleep` for the configured backoff, then start the next attempt
+- fal (any provider with `supports_durable_poll`) is submitted once; the function then `step.sleep`s and checks status. A timeout resumes from the saved provider request id and does not submit again
+
+One Inngest run is limited to a single job (`concurrency` key `event.data.job_id`).
+
+### Executor
+
+`STUDIO_EXECUTOR` chooses how `POST /api/jobs`, resume, and rerun start work. The classic review page uses the same switch.
+
+| value | behaviour |
+| --- | --- |
+| `thread` (default) | background thread, same as a local `studio serve`. Dry-run tests leave this unset. |
+| `inline` | run on the request thread |
+| `inngest` | send `studio/job.run` and return. The job stays `created` until Inngest calls back. |
+
+The CLI (`studio new`, `studio run`, `studio rerun`) still calls `Runner.run_job` in-process. That path is the right one on a machine you keep open.
+
+### Environment
+
+| variable | required | purpose |
+| --- | --- | --- |
+| `INNGEST_EVENT_KEY` | yes, when `STUDIO_EXECUTOR=inngest` in production | lets the app send `studio/job.run`. The SDK reads it. Without it, the API returns 503 and the job is left `created`, not `running`. |
+| `INNGEST_SIGNING_KEY` | yes, in production | verifies Inngest's calls to `/api/inngest`. The SDK rejects unsigned invocations when this is set and the app is in cloud mode. |
+| `INNGEST_DEV` | local only | set to `1` (or the Dev Server URL) to use the Dev Server instead of Inngest Cloud. Leave it unset on Vercel. |
+| `STUDIO_EXECUTOR` | production | `inngest` on Vercel. `thread` or unset locally. |
+
+Install the SDK with the app (`requirements.txt` includes `inngest>=0.5.14`).
+
+### Vercel
+
+The project root for the Python app is `app/` (`app.py` builds the Flask app, `requirements.txt` installs dependencies).
+
+1. In the Vercel project, set the root directory to `app` if it is not already.
+2. Install the [Inngest integration](https://www.inngest.com/docs/deploy/vercel) from the Vercel Marketplace. It writes `INNGEST_EVENT_KEY` and `INNGEST_SIGNING_KEY` and syncs the app after each deploy so `/api/inngest` is registered.
+3. Set `STUDIO_EXECUTOR=inngest` on the Vercel project (Production, and Preview if those deployments should run jobs).
+4. Do not put the studio password in front of `/api/inngest`. The route is exempt from the sign-in gate; Inngest signs the request with `INNGEST_SIGNING_KEY`.
+5. Raise the function max duration high enough for one step (a submit, a single status check, or a local encode), not for a whole fal wait. The wait is a `step.sleep` between invocations. On the hobby plan that ceiling is 60 seconds; a long ffmpeg step still has to finish inside it.
+6. The SQLite file from `db_file` in `config/config.yaml` is the source of truth. Serverless disks are ephemeral, so that file has to live on storage that survives the next invocation (the same data directory the app already uses). Inngest does not keep a second copy of job state.
+
+Local sync against the Dev Server:
+
+```
+INNGEST_DEV=1 STUDIO_EXECUTOR=inngest python3 -m studio serve --port 8765
+npx inngest-cli@latest dev -u http://127.0.0.1:8765/api/inngest
+```
+
+Step orchestration tests (no Dev Server, no network): `python3 -m unittest tests.test_workflows`.
