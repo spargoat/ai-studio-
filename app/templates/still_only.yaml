@@ -1,0 +1,15 @@
+# One still, then stop. No voice, video, or LLM stages, so a run does not need an
+# Anthropic or OpenAI key. brief.still_provider chooses fal or higgsfield for this job.
+name: still_only
+version: 1
+stages:
+  - id: brief
+    kind: brief
+  - id: still
+    kind: image
+    review: true
+    prompt: >-
+      Photoreal vertical 9:16 selfie-style still of {look}, {setting}.
+      Natural daylight, phone-camera realism, mouth closed, looking at lens.
+      Same person as the reference images. No text, no watermark.
+    params: {aspect_ratio: "9:16", resolution: "1K", num_images: 1, output_format: png}

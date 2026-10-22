@@ -122,7 +122,11 @@ def register(app, cfg, runner, live, bg):
         j = db.job(jid) or abort(404)
         stages = []
         for d in runner.stage_defs(j):
-            sc = cfg["stages"].get(d.get("uses", d["id"]), {"provider": "local", "model": "brief-resolver"})
+            key = d.get("uses", d["id"])
+            base = cfg["stages"].get(key, {"provider": "local", "model": "brief-resolver"})
+            sc = base
+            if key in cfg.get("stages", {}):
+                _prov, sc = runner.provider_for(key, job=j)
             runs = []
             for r in db.runs(jid, d["id"]):
                 m = json.loads(r["meta_json"] or "{}")
@@ -136,7 +140,7 @@ def register(app, cfg, runner, live, bg):
                            "show_review": show_review(d["id"], d.get("review"), last.get("status"), last.get("review_status")),
                            "needs": d.get("needs") or [],
                            "provider": last.get("provider") or sc["provider"], "model": last.get("model") or sc["model"],
-                           "default_model": sc["model"], "runs": runs})
+                           "default_model": base.get("model"), "runs": runs})
         return jsonify({"job": job_row(j) | {"brief": j["brief"]}, "stages": stages, "events": db.events(jid, 60),
                         "running": jid in active})
 
@@ -211,7 +215,8 @@ def register(app, cfg, runner, live, bg):
     # ---------- actions
     def brief_from(b):
         brief = {k: v for k, v in (b or {}).items() if v not in (None, "") and k in
-                 ("id", "persona", "template", "script", "setting", "topic", "headline", "cta", "caption", "hashtags")}
+                 ("id", "persona", "template", "script", "setting", "topic", "headline", "cta", "caption", "hashtags",
+                  "still_provider")}
         return brief
 
     @bp.post("/api/estimate")
