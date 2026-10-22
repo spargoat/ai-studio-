@@ -5,6 +5,7 @@ PyYAML
 requests
 waitress
 inngest>=0.5.14
+higgsfield-client>=0.1.0
 numpy
 opencv-python-headless
 Pillow
