@@ -137,10 +137,15 @@ function Canvas() {
   const qc = useQueryClient();
   const { screenToFlowPosition, fitView } = useReactFlow();
   const flowPane = useRef<HTMLDivElement>(null);
-  const { data: meta } = useQuery({ queryKey: ["meta"], queryFn: () => api("/api/meta") });
-  const { data: list } = useQuery({ queryKey: ["boards"], queryFn: () => api<any[]>("/api/boards") });
+  const ignoreClickUntil = useRef(0);
+  const droppedOnPane = useRef(false);
+  const followJob = useRef(false);
+  const { data: meta } = useQuery({ queryKey: ["meta"], queryFn: () => api("/api/meta", { timeoutMs: 12000 }) });
+  const listQuery = useQuery({ queryKey: ["boards"], queryFn: () => api<any[]>("/api/boards", { timeoutMs: 12000 }) });
+  const list = listQuery.data;
   const [boardId, setBoardId] = useState(() => window.localStorage.getItem("studio:board-id") || "talking_head");
-  const { data: board } = useQuery({ queryKey: ["board", boardId], queryFn: () => api<any>(`/api/boards/${boardId}`), enabled: !!boardId });
+  const boardQuery = useQuery({ queryKey: ["board", boardId], queryFn: () => api<any>(`/api/boards/${boardId}`, { timeoutMs: 12000 }), enabled: !!boardId });
+  const board = boardQuery.data;
   const [nodes, setNodes] = useState<FlowNode[]>([]);
   const [edges, setEdges] = useState<Edge[]>([]);
   const [name, setName] = useState("Talking head");
@@ -223,9 +228,12 @@ function Canvas() {
   const directoryQuery = useQuery({ queryKey: ["intel-funnels"], queryFn: () => intel<any>("/api/intel/funnels"), retry: 1 });
   const { data: job } = useQuery({
     queryKey: ["job", jobId],
-    queryFn: () => api<any>(`/api/jobs/${jobId}`),
+    queryFn: () => api<any>(`/api/jobs/${jobId}`, { timeoutMs: 12000 }),
     enabled: !!jobId,
     refetchInterval: (q) => {
+      // Opening a board used to poll its last job every 2s. A stuck job then held
+      // a Turso connection for the whole visit. Poll only while this session's run is in flight.
+      if (!followJob.current) return false;
       const s = q.state.data?.job?.status;
       return !s || s === "created" || s === "running" || s === "partial" ? 2000 : false;
     },
@@ -548,6 +556,11 @@ function Canvas() {
   }, [nodes]);
   const isValid = useCallback((c: Connection | Edge) => applyConnection(edges, c, wireCtx(nodes)).ok, [edges, nodes, wireCtx]);
 
+  const pointerInPane = (x: number, y: number) => {
+    const rect = flowPane.current?.getBoundingClientRect();
+    return !!rect && rect.width > 0 && rect.height > 0 && x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
+  };
+
   const addNode = (type: string, config: Record<string, string> = {}) => {
     const spec = CATALOG[type];
     if (!spec) return;
@@ -566,14 +579,20 @@ function Canvas() {
   };
 
   const save = useMutation({
-    mutationFn: async () => api(`/api/boards/${boardId}`, { method: "PUT", body: { name, graph: serialize(nodes, edges, variables, funnel) } }),
+    mutationFn: async () => {
+      if (!loaded) throw new Error("This board has not finished loading.");
+      return api(`/api/boards/${boardId}`, { method: "PUT", body: { name, graph: serialize(nodes, edges, variables, funnel) }, timeoutMs: 12000 });
+    },
     onSuccess: (row: any) => { qc.setQueryData(["board", boardId], row); setEstimates(row.estimates || {}); setLoaded(boardId + (row.updated_at || "")); qc.invalidateQueries({ queryKey: ["boards"] }); toast.success("Board saved"); },
     onError: (e: Error) => toast.error(e.message),
   });
   const create = useMutation({
-    mutationFn: async (blank: boolean) => api("/api/boards", { method: "POST", body: blank
+    mutationFn: async (blank: boolean) => {
+      if (!blank && !loaded) throw new Error("This board has not finished loading.");
+      return api("/api/boards", { method: "POST", timeoutMs: 12000, body: blank
       ? { name: "Untitled board", graph: { nodes: [], edges: [], variables: {}, funnel: EMPTY_FUNNEL } }
-      : { name: `${(name || "Untitled board").replace(/ copy$/, "")} copy`, graph: serialize(nodes, edges, variables, funnel) } }),
+      : { name: `${(name || "Untitled board").replace(/ copy$/, "")} copy`, graph: serialize(nodes, edges, variables, funnel) } });
+    },
     onSuccess: (row: any, blank) => {
       pinnedBoards.current.add(row.id);
       qc.setQueryData(["boards"], (previous: any[] | undefined) => [...(previous || []).filter((item) => item.id !== row.id), row]);
@@ -589,7 +608,9 @@ function Canvas() {
   const run = useMutation({
     mutationFn: async () => {
       setRunError("");
-      const saved = await api<any>(`/api/boards/${boardId}`, { method: "PUT", body: { name, graph: serialize(nodes, edges, variables, funnel) } });
+      if (!loaded) throw new Error("This board has not finished loading.");
+      followJob.current = true;
+      const saved = await api<any>(`/api/boards/${boardId}`, { method: "PUT", body: { name, graph: serialize(nodes, edges, variables, funnel) }, timeoutMs: 12000 });
       qc.setQueryData(["board", boardId], saved);
       setLoaded(boardId + (saved.updated_at || ""));
       const row = await api<{ id: string; mode: string; pump?: boolean; status?: string; error?: string; stages?: { id: string; status: string }[] }>(`/api/boards/${boardId}/run`, { body: { mode: "dry" }, timeoutMs: 25000 });
@@ -650,8 +671,8 @@ function Canvas() {
       if (status === "failed" || status === "blocked") throw new Error("Dry run stopped before every block finished");
       return { ...row, status };
     },
-    onSuccess: (row) => { setRunError(""); setJobId(row.id); qc.invalidateQueries({ queryKey: ["board", boardId] }); toast.success(`Dry run ${row.id} · ${row.status}`); },
-    onError: (e: Error) => { setRunError(e.message || "Dry run failed"); toast.error(e.message); },
+    onSuccess: (row) => { followJob.current = false; setRunError(""); setJobId(row.id); qc.invalidateQueries({ queryKey: ["board", boardId] }); toast.success(`Dry run ${row.id} · ${row.status}`); },
+    onError: (e: Error) => { followJob.current = false; setRunError(e.message || "Dry run failed"); toast.error(e.message); },
   });
 
   useEffect(() => {
@@ -700,7 +721,7 @@ function Canvas() {
         <header className="v3-top">
           <div className="v3-crumb">Boards / <input aria-label="Board name" value={name} onChange={(e) => setName(e.target.value)} /></div>
           <select aria-label="Load board" className="v3-select" value={boardId} onChange={(e) => { setLoaded(""); setBoardId(e.target.value); }}>
-            {(list || [{ id: "talking_head", name: "Talking head" }]).map((b: any) => <option key={b.id} value={b.id}>{b.name}{b.preset ? " · preset" : ""}</option>)}
+            {(list || [{ id: boardId, name: listQuery.isError ? "Board list did not load" : "Loading boards…" }]).map((b: any) => <option key={b.id} value={b.id}>{b.name}{b.preset ? " · preset" : ""}</option>)}
           </select>
           {trackerOrigin && <span className={`v3-badge ${fixture ? "ex" : "ok"}`}>{fixture ? "Fixture · not live" : "Live tracker"}</span>}
           <span className="v3-badge v3-mono">Dry run · $0.00{cap != null ? ` of $${Number(cap).toFixed(0)} cap` : ""}</span>
@@ -710,12 +731,15 @@ function Canvas() {
           </select>
           {board?.updated_at && <span className="v3-saved">{savedLabel(board.updated_at)}</span>}
           <button type="button" className="v3-btn" onClick={() => create.mutate(true)} disabled={create.isPending}><Plus size={13} />{create.isPending ? "Working…" : "New"}</button>
-          <button type="button" className="v3-btn" onClick={() => create.mutate(false)} disabled={create.isPending}><Copy size={13} />{create.isPending ? "Copying…" : "Copy"}</button>
-          <button type="button" className="v3-btn" onClick={() => save.mutate()} disabled={save.isPending}><Save size={13} />Save</button>
-          <button type="button" className="v3-btn pri" onClick={() => run.mutate()} disabled={run.isPending || !hasRunnableNodes}
-            title={hasRunnableNodes ? "Run executable nodes without provider spend" : "Add an executable node such as Brief, Script or Video to run"}><Play size={13} />{run.isPending ? "Running…" : "Run (dry)"}</button>
+          <button type="button" className="v3-btn" onClick={() => create.mutate(false)} disabled={create.isPending || !loaded}><Copy size={13} />{create.isPending ? "Copying…" : "Copy"}</button>
+          <button type="button" className="v3-btn" onClick={() => save.mutate()} disabled={save.isPending || !loaded}><Save size={13} />Save</button>
+          <button type="button" className="v3-btn pri" onClick={() => run.mutate()} disabled={run.isPending || !loaded || !hasRunnableNodes}
+            title={!loaded ? "This board has not finished loading." : hasRunnableNodes ? "Run executable nodes without provider spend" : "Add an executable node such as Brief, Script or Video to run"}><Play size={13} />{run.isPending ? "Running…" : "Run (dry)"}</button>
         </header>
         {notice && <div className="v3-confirm" role="status">{notice}</div>}
+        {!loaded && !boardQuery.isError && <div className="v3-alert" role="status">Loading board…</div>}
+        {boardQuery.isError && <div className="v3-alert" role="alert">Board did not load: {(boardQuery.error as Error).message}</div>}
+        {listQuery.isError && <div className="v3-alert" role="alert">Board list did not load: {(listQuery.error as Error).message}</div>}
         {runError && <div className="v3-alert" role="alert">{runError}</div>}
         {!previewQuery.isError && previewQuery.isFetching && previewQuery.failureCount > 0 && <div className="v3-alert" role="status">Retrying preview…</div>}
         {previewQuery.isError && <div className="v3-alert" role="alert">Preview read failed: {(previewQuery.error as Error).message}</div>}
@@ -733,6 +757,8 @@ function Canvas() {
             onDragOver={(e) => { e.preventDefault(); e.dataTransfer.dropEffect = "move"; }}
             onDrop={(e) => {
               e.preventDefault();
+              if (!pointerInPane(e.clientX, e.clientY)) return;
+              droppedOnPane.current = true;
               const kitId = e.dataTransfer.getData("application/board-kit");
               if (kitById(kitId)) {
                 addKit(kitId, screenToFlowPosition({ x: e.clientX, y: e.clientY }));
@@ -765,7 +791,16 @@ function Canvas() {
                     {kits.map((kit) => <button key={kit.id} type="button" draggable className="palette-tile palette-tile-create palette-tile-kit" data-palette={`${kit.id}-kit`}
                       title={`${kit.description} Source: ${kit.source}`}
                       onDragStart={(e) => { e.dataTransfer.setData("application/board-kit", kit.id); e.dataTransfer.effectAllowed = "move"; }}
-                      onClick={async () => { setBusyId(`kit:${kit.id}`); try { addKit(kit.id); await new Promise((r) => setTimeout(r, 350)); } finally { setBusyId(""); } }}>
+                      onDragEnd={() => {
+                        ignoreClickUntil.current = Date.now() + 400;
+                        const dropped = droppedOnPane.current;
+                        droppedOnPane.current = false;
+                        if (!dropped) addKit(kit.id);
+                      }}
+                      onClick={async () => {
+                        if (Date.now() < ignoreClickUntil.current) return;
+                        setBusyId(`kit:${kit.id}`); try { addKit(kit.id); await new Promise((r) => setTimeout(r, 350)); } finally { setBusyId(""); }
+                      }}>
                       {busyId === `kit:${kit.id}` ? <Loader2 size={14} className="v3-spin" /> : null}
                       <span className="palette-label">{kit.name}</span></button>)}
                   </div>
@@ -786,7 +821,13 @@ function Canvas() {
                         return (
                           <button key={type} type="button" draggable={type !== "funnel_route"}
                             onDragStart={(e) => { e.dataTransfer.setData("application/board-node", type); e.dataTransfer.effectAllowed = "move"; }}
-                            onClick={() => addNode(type)}
+                            onDragEnd={() => {
+                              ignoreClickUntil.current = Date.now() + 400;
+                              const dropped = droppedOnPane.current;
+                              droppedOnPane.current = false;
+                              if (!dropped) addNode(type);
+                            }}
+                            onClick={() => { if (Date.now() < ignoreClickUntil.current) return; addNode(type); }}
                             data-palette={type}
                             className={`palette-tile ${intel ? "palette-tile-intel" : "palette-tile-create"}`}>
                             <span className="palette-icon"><Icon size={15} aria-hidden /></span>

@@ -15,8 +15,8 @@ for k in ("FAL_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS", "ADINTEL_API_URL", "ADI
 
 import requests
 from studio.adintel import FIXTURE_ADS, FIXTURE_LABEL, LONGEVITY_NOTE, REFERENCE_LABEL, AdIntelError, _get, clean_step_label, query_ads
-from studio.board import (BoardError, compile_board, job_brief, migrate_talking_head_layout, preview_config, preview_pack,
-                          talking_head_preset, timeline_artefact as board_timeline)
+from studio.board import (BoardError, compile_board, ensure_presets, job_brief, migrate_talking_head_layout, preview_config,
+                          preview_pack, talking_head_preset, timeline_artefact as board_timeline)
 from studio.config import connection_status, load_config
 from studio.runner import BriefError, Runner, SpendGuardError
 from studio.providers import fal, elevenlabs
@@ -465,6 +465,38 @@ class T(unittest.TestCase):
         graph = talking_head_preset()
         self.assertEqual(preview_config(graph)["event_id"], "ev_launch_northline")
         self.assertEqual(preview_config(graph)["ad_id"], "rec_4c91e2")
+
+    def test_a_board_saved_over_the_preset_is_put_back(self):
+        from studio.db import DB
+        d = Path(tempfile.mkdtemp())
+        db = DB(d / "preset.db")
+        self.addCleanup(db.close)
+        db.save_board("talking_head", "Untitled board", {
+            "nodes": [{"id": "funnel", "type": "funnel_route", "position": {"x": 0, "y": 0}, "enabled": True, "config": {}},
+                      {"id": "video", "type": "video", "position": {"x": 400, "y": 0}, "enabled": True, "config": {}}],
+            "edges": [],
+        }, preset=True)
+        ensure_presets(db)
+        row = db.board("talking_head")
+        self.assertEqual(row["name"], "Talking head")
+        self.assertTrue(row["preset"])
+        ids = {n["id"] for n in row["graph"]["nodes"]}
+        self.assertIn("ad_feed", ids)
+        self.assertIn("brief", ids)
+        self.assertIn("voice", ids)
+        self.assertNotIn("funnel_step", [n["type"] for n in row["graph"]["nodes"]])
+
+    def test_preset_save_rejects_a_graph_that_drops_its_blocks(self):
+        client = create_app(cfg()).test_client()
+        client.get("/api/boards")
+        res = client.put("/api/boards/talking_head", json={"name": "Untitled board", "graph": {
+            "nodes": [{"id": "video", "type": "video", "position": {"x": 0, "y": 0}, "enabled": True, "config": {}}],
+            "edges": [],
+        }})
+        self.assertEqual(res.status_code, 409, res.get_json())
+        loaded = client.get("/api/boards/talking_head").get_json()
+        self.assertEqual(loaded["name"], "Talking head")
+        self.assertIn("ad_feed", {n["id"] for n in loaded["graph"]["nodes"]})
 
     def test_v3_layout_migrates_only_untouched_preset_positions(self):
         preset = talking_head_preset()
@@ -1140,6 +1172,15 @@ class T(unittest.TestCase):
         self.assertIn("flowPane.current?.getBoundingClientRect()", page)
         self.assertIn("rect.left + rect.width / 2", page)
         self.assertIn("rect.top + rect.height / 2", page)
+        self.assertIn("pointerInPane", page)
+        self.assertIn("droppedOnPane", page)
+        self.assertIn("if (!dropped) addNode(type)", page)
+        self.assertIn("Board did not load:", page)
+        self.assertIn("Board list did not load:", page)
+        self.assertIn("Loading board…", page)
+        self.assertIn("This board has not finished loading.", page)
+        self.assertIn("followJob", page)
+        self.assertIn('timeoutMs: 12000', page)
         self.assertNotIn("setTimeout(() => fitView({ nodes: [{ id }], padding: 0.45, duration: 200 }), 40)", page)
         self.assertIn('draggable={type !== "funnel_route"}', page)
         self.assertIn('addNode("funnel_route", { funnel_id: f.id, funnel_name: f.name })', page)

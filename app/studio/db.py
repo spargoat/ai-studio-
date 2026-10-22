@@ -112,6 +112,8 @@ class _LibsqlConn:
 
 # One Hrana execute is a network round trip. A dead stream surfaces as this
 # family of errors and has to be reopened; the next statement will not heal it.
+# "hrana" matches every libSQL error, including "capacity exceeded". Treating that
+# as a dead stream opened a second connection and made the limit worse.
 _STALE_MARKERS = (
     "connection closed",
     "closed before message",
@@ -121,7 +123,6 @@ _STALE_MARKERS = (
     "broken pipe",
     "connection reset",
     "not connected",
-    "hrana",
 )
 _REMOTE_CALL_S = 8.0
 
@@ -131,8 +132,24 @@ def _network_url(url):
 
 
 def _stale_error(exc):
+    if _capacity_error(exc):
+        return False
     msg = str(exc).lower()
     return any(marker in msg for marker in _STALE_MARKERS)
+
+
+def _capacity_error(exc):
+    msg = str(exc).lower()
+    return "capacity" in msg or "too many connections" in msg or "temporarily exceeded" in msg
+
+
+def _close_quietly(conn):
+    """Close off the request thread. libSQL close waits for the call that already timed out."""
+    try:
+        if conn is not None:
+            conn.close()
+    except Exception:
+        pass
 
 
 def _lit(value):
@@ -266,6 +283,10 @@ class DatabaseNotConfigured(RuntimeError):
     """Vercel has no Turso/libSQL URL and STUDIO_SQLITE is not set. Do not open /tmp SQLite."""
 
 
+class DatabaseBusy(RuntimeError):
+    """Turso refused the call, or the call did not finish. The route should say so and stop."""
+
+
 def remote_database_url():
     return os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL") or ""
 
@@ -309,10 +330,48 @@ class DB:
         self.fail_scripts = 0
         self._scope = None
         self._tables = {}
-        self.conn = _open(path)
+        self.conn = None
         self.remote = _network_url(remote_database_url()) and os.environ.get("STUDIO_SQLITE") != "1"
-        self.conn.executescript(SCHEMA)
-        self.conn.commit()
+        self._connect()
+
+    def _connect(self):
+        """Open the database. A remote open that sits past the call limit becomes DatabaseBusy."""
+        if not self.remote:
+            self.conn = _open(self.path)
+            self.conn.executescript(SCHEMA)
+            self.conn.commit()
+            return
+        last = None
+        for attempt in (1, 2):
+            box = {}
+
+            def run():
+                try:
+                    conn = _open(self.path)
+                    conn.executescript(SCHEMA)
+                    if getattr(conn, "in_transaction", False):
+                        conn.commit()
+                    box["conn"] = conn
+                except BaseException as exc:
+                    box["e"] = exc
+
+            worker = threading.Thread(target=run, daemon=True)
+            worker.start()
+            worker.join(_REMOTE_CALL_S)
+            if worker.is_alive():
+                last = TimeoutError("Hrana: http error: connection closed before message completed")
+            elif "e" in box:
+                last = box["e"]
+            else:
+                self.conn = box["conn"]
+                return
+            if attempt == 1 and (_capacity_error(last) or isinstance(last, TimeoutError)):
+                time.sleep(0.35)
+                continue
+            break
+        if _capacity_error(last) or isinstance(last, TimeoutError):
+            raise DatabaseBusy("The board database is busy. Try again in a few seconds.") from last
+        raise last
 
     def job_scope(self, job_id):
         """Hold this job's rows in memory and flush each stage's writes as one script."""
@@ -321,19 +380,11 @@ class DB:
     def _reopen(self):
         old = self.conn
         self.conn = None
-        try:
-            if old is not None:
-                old.close()
-        except Exception:
-            pass
-        self.conn = _open(self.path)
-        self.remote = _network_url(remote_database_url()) and os.environ.get("STUDIO_SQLITE") != "1"
+        threading.Thread(target=_close_quietly, args=(old,), daemon=True).start()
         self.round_trips += 1
         if self.latency_s:
             time.sleep(self.latency_s)
-        self.conn.executescript(SCHEMA)
-        if getattr(self.conn, "in_transaction", False):
-            self.conn.commit()
+        self._connect()
 
     def _call(self, op, script=False):
         self.round_trips += 1
@@ -360,10 +411,11 @@ class DB:
         worker.start()
         worker.join(_REMOTE_CALL_S)
         if worker.is_alive():
-            try:
-                conn.close()
-            except Exception:
-                pass
+            # close() waits for the RPC that just timed out. Doing it here held the
+            # process, and every other request on the instance, until the function died.
+            threading.Thread(target=_close_quietly, args=(conn,), daemon=True).start()
+            if self.conn is conn:
+                self.conn = None
             raise TimeoutError("Hrana: http error: connection closed before message completed")
         if "e" in box:
             raise box["e"]
@@ -373,6 +425,14 @@ class DB:
         try:
             return self._call(op, script=script)
         except Exception as exc:
+            if _capacity_error(exc):
+                time.sleep(0.35)
+                try:
+                    return self._call(op, script=script)
+                except Exception as again:
+                    if _capacity_error(again) or _stale_error(again):
+                        raise DatabaseBusy("The board database is busy. Try again in a few seconds.") from again
+                    raise
             if not _stale_error(exc):
                 raise
             self._reopen()

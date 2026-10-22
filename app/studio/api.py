@@ -5,7 +5,9 @@ from flask import Blueprint, abort, jsonify, request, send_file
 from . import library, persona as P
 from .adintel import configured
 from .adintel import accounts as intel_accounts
-from .board import BoardError, compile_board, ensure_presets, feed_artefact, job_brief, preview_config, preview_pack
+from .board import (BoardError, compile_board, ensure_presets, feed_artefact, job_brief, preset_intact,
+                    preview_config, preview_pack)
+from .db import DatabaseBusy
 from .names import purpose_name
 from .config import connection_status, key_status, load_template
 from .runner import BriefError, SpendGuardError
@@ -58,11 +60,54 @@ class _NoFfmpegFetch:
         return False
 
 
+class _LazyDB:
+    """Connect on the first API call. Serving the shell or a hashed asset must not open Turso."""
+
+    def __init__(self, runner):
+        self._runner = runner
+        self._db = None
+        self._seeded = False
+
+    def live(self):
+        if self._db is None:
+            self._db = self._runner.db
+        if not self._seeded:
+            ensure_presets(self._db)
+            self._seeded = True
+        return self._db
+
+    def __getattr__(self, name):
+        return getattr(self.live(), name)
+
+
+def _stamp_age(stamp):
+    if not stamp:
+        return None
+    try:
+        started = dt.datetime.fromisoformat(stamp)
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        started = started.astimezone()
+    return (dt.datetime.now().astimezone() - started.astimezone()).total_seconds()
+
+
 def register(app, cfg, runner, live, bg):
-    db = runner.db
-    ensure_presets(db)
+    db = _LazyDB(runner)
     bp = Blueprint("api", __name__)
     app.json.sort_keys = False
+
+    @bp.before_request
+    def _open_database():
+        try:
+            db.live()
+        except DatabaseBusy as exc:
+            return jsonify({"error": str(exc)}), 503
+
+    @app.errorhandler(DatabaseBusy)
+    def _database_busy(exc):
+        return jsonify({"error": str(exc)}), 503
+
     active, alock = set(), threading.Lock()
     data_dir = Path(cfg["_data_dir"]).resolve()
     displays = {k: (v.get("display") or k) for k, v in (cfg.get("_personas") or {}).items()}
@@ -357,6 +402,8 @@ def register(app, cfg, runner, live, bg):
             return jsonify(body)
         except BriefError as e:
             return err(e, 409)
+        except DatabaseBusy:
+            raise
         except Exception as e:
             return err(e, 502)
 
@@ -368,16 +415,24 @@ def register(app, cfg, runner, live, bg):
         if not hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {secret}"):
             return err("unauthorized", 401)
         # failed jobs stay failed. partial here means more stages are still due, not a recorded stage error.
-        rows = db.q("SELECT id, mode FROM jobs WHERE status IN ('created','running','partial') ORDER BY updated_at LIMIT 3")
+        # One stale job. A client that is already pumping updates the row, and a scan of
+        # every open job is what held a connection until Turso reported capacity exceeded.
+        rows = db.q("SELECT id, mode, updated_at FROM jobs WHERE status IN ('created','running','partial') ORDER BY updated_at LIMIT 8")
         out = []
         for row in rows:
+            age = _stamp_age(row.get("updated_at"))
+            if age is not None and age < 45:
+                continue
             if row["mode"] == "live" and os.environ.get("STUDIO_ALLOW_LIVE") != "1":
                 out.append({"id": row["id"], "skipped": "live blocked"})
-                continue
+                break
             try:
                 out.append({"id": row["id"], **runner.advance(row["id"])})
+            except DatabaseBusy as e:
+                return err(str(e), 503)
             except Exception as e:
                 out.append({"id": row["id"], "error": str(e)})
+            break
         return jsonify({"ok": True, "advanced": out})
 
     @bp.post("/api/jobs/<jid>/resume")
@@ -515,6 +570,9 @@ def register(app, cfg, runner, live, bg):
         row = db.board(bid) or abort(404)
         body = request.get_json(force=True)
         graph = body.get("graph") or row["graph"]
+        if bid == "talking_head" and not preset_intact(graph):
+            # `err` later in this function is the estimate string, so this cannot call the helper.
+            return jsonify({"error": "The Talking head preset still needs its own blocks. Use New for another board."}), 409
         name = (body.get("name") or row["name"]).strip() or row["name"]
         db.save_board(bid, name, graph)
         saved = db.board(bid)
@@ -586,6 +644,8 @@ def register(app, cfg, runner, live, bg):
                             break
         except BriefError as e:
             return err(e, 409)
+        except DatabaseBusy:
+            raise
         except Exception as e:
             return jsonify({"error": str(e), "id": jid}), 502
         pump = status in ("created", "running", "partial") and not error

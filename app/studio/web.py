@@ -88,13 +88,35 @@ def create_app(cfg, live=False):
 
     @app.get("/assets/<path:name>")
     def ui_assets(name):
-        """Hashed Vite files. Also published from public/assets; this is the function fallback."""
-        return send_from_directory(UI_DIST / "assets", name)
+        """Hashed Vite files. Also published from public/assets; this is the function fallback.
+
+        The fallback used to answer `no-cache`, so every reload waited on this function.
+        While the function was stuck on Turso, the board chunk sat on "Loading...".
+        """
+        resp = send_from_directory(UI_DIST / "assets", name)
+        resp.cache_control.no_cache = None
+        resp.cache_control.no_store = None
+        resp.cache_control.public = True
+        resp.cache_control.max_age = 31536000
+        # Set the header last. Updating cache_control afterwards replaces a raw assignment.
+        resp.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return resp
 
     from .db import missing_on_vercel
     if missing_on_vercel():
         return app                                   # no Runner, so nothing opens /tmp SQLite or writes
-    runner = Runner(cfg, live=live, log=lambda m: None)
+
+    class _LazyRunner:
+        def __init__(self, factory):
+            self._factory = factory
+            self._runner = None
+
+        def __getattr__(self, name):
+            if self._runner is None:
+                self._runner = self._factory()
+            return getattr(self._runner, name)
+
+    runner = _LazyRunner(lambda: Runner(cfg, live=live, log=lambda m: None))
     data_dir = Path(cfg["_data_dir"]).resolve()
 
     def bg(fn, *a):

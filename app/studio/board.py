@@ -670,9 +670,18 @@ def talking_head_preset():
     }
 
 
+_PRESET_NODE_IDS = ("timeline", "ad_feed", "ad_breakdown", "funnel", "teardown", "brief", "script", "voice", "video")
+
+
+def preset_intact(graph):
+    """The talking-head preset still has its own blocks. A replicate saved on top of it does not."""
+    ids = {n.get("id") for n in ((graph or {}).get("nodes") or [])}
+    return set(_PRESET_NODE_IDS) <= ids
+
+
 def ensure_presets(db):
     row = db.board("talking_head")
-    if not row:
+    if not row or not preset_intact(row.get("graph")):
         db.save_board("talking_head", "Talking head", talking_head_preset(), preset=True)
         return
     migrated = migrate_talking_head_layout(row.get("graph") or {})
