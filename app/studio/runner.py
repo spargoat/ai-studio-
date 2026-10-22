@@ -199,6 +199,8 @@ class Runner:
             raise BriefError(f"unknown persona '{brief.get('persona')}', expected one of {list(pers)}")
         script = (brief.get("script") or "").strip()
         kinds = {s["kind"] for s in load_template(brief.get("template", "talking_head"))["stages"]}
+        kinds |= {s.get("kind") for s in (brief.get("board_stages") or []) if s.get("kind")}
+        # A board script block writes the words. The template alone has voice and no script stage.
         if not script and "voice" in kinds and "script" not in kinds:
             raise BriefError("brief.script is empty")
         if not script:
@@ -400,18 +402,52 @@ class Runner:
             started = started.astimezone()
         return (dt.datetime.now().astimezone() - started.astimezone()).total_seconds()
 
+    def _meta(self, raw):
+        if isinstance(raw, dict):
+            return raw
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+
     def _run_is_stale(self, run):
         """A fal poll stays running between requests. Any other row still running past the timeout died with the instance."""
-        meta = json.loads(run.get("meta_json") or "{}")
-        if meta.get("fal"):
+        if self._meta(run.get("meta_json")).get("fal"):
             return False
         age = self._run_age_s(run.get("started_at"))
         if age is None:
             return True
         return age >= self._run_timeout_s()
 
+    def _attempt_should_close(self, parent_status, meta, started_at):
+        """The spend page lists attempts. stage_run_id does not always find them.
+
+        Compose killed mid-encode left the attempt `running` after the stage_run
+        was already failed, and that attempt is not stored under the stage_run id
+        (the stage_run attempt counter stayed 0). Close the ledger row unless a
+        stage run is still in progress: a fresh run, or a fal poll.
+        """
+        if parent_status == "running" and (meta or {}).get("fal"):
+            return False
+        age = self._run_age_s(started_at)
+        fresh = age is not None and age < self._run_timeout_s()
+        if parent_status == "running" or not parent_status:
+            return not fresh
+        return True
+
+    def _close_attempts_for_run(self, run, reason, stamp):
+        """Close the ledger row for this run even when stage_run_id was not stored."""
+        self.db.x(
+            """UPDATE attempts SET status='failed', error=?, finished_at=?
+               WHERE status='running' AND job_id=? AND stage=?
+                 AND (stage_run_id=? OR CAST(stage_run_id AS TEXT)=? OR started_at=?)""",
+            (reason, stamp, run["job_id"], run["stage"], run["id"], str(run["id"]), run.get("started_at")))
+
     def reconcile(self, job_id=None):
-        """Fail stage runs left running past the timeout.
+        """Fail stage runs left running past the timeout, then attempts the spend page still shows.
 
         A killed function cannot record its own failure, so the row stays `running`
         until a later read or advance marks it failed. Re-run starts a new version.
@@ -430,13 +466,38 @@ class Runner:
             reason = f"instance was killed or the run timed out{waited} (left running with no result)"
             stamp = now()
             self.db.update_run(run["id"], status="failed", error=reason, finished_at=stamp)
-            self.db.x("UPDATE attempts SET status='failed', error=?, finished_at=? WHERE stage_run_id=? AND status='running'",
-                      (reason, stamp, run["id"]))
+            self._close_attempts_for_run(run, reason, stamp)
             if run["stage"] == "compose" and self.db.has_table("leases"):
                 self.db.x("DELETE FROM leases WHERE name='compose' AND job_id=?", (run["job_id"],))
             self.log(run["job_id"], run["stage"], "error", reason)
             self.settle(run["job_id"])
             failed.append({"id": run["id"], "job_id": run["job_id"], "stage": run["stage"], "error": reason})
+        attempt_sql = """SELECT a.id, a.job_id, a.stage, a.started_at, r.status AS run_status, r.meta_json
+                         FROM attempts a LEFT JOIN stage_runs r ON r.id = a.stage_run_id
+                         WHERE a.status='running'"""
+        attempt_args = ()
+        if job_id:
+            attempt_sql += " AND a.job_id=?"
+            attempt_args = (job_id,)
+        touched = set()
+        for att in self.db.q(attempt_sql, attempt_args):
+            meta = self._meta(att.get("meta_json"))
+            if not self._attempt_should_close(att.get("run_status"), meta, att.get("started_at")):
+                continue
+            age = self._run_age_s(att.get("started_at"))
+            waited = f" after {int(age)}s" if age is not None else ""
+            parent = att.get("run_status")
+            if parent and parent != "running":
+                reason = f"stage run already {parent}; the attempt was still marked running{waited}"
+            else:
+                reason = f"instance was killed or the run timed out{waited} (left running with no result)"
+            stamp = now()
+            self.db.x("UPDATE attempts SET status='failed', error=?, finished_at=? WHERE id=? AND status='running'",
+                      (reason, stamp, att["id"]))
+            self.log(att["job_id"], att["stage"], "error", reason)
+            touched.add(att["job_id"])
+        for jid in touched:
+            self.settle(jid)
         return {"failed": failed, "leases_released": self.db.release_expired_leases()}
 
     def advance(self, job_id, only=None):
@@ -496,7 +557,9 @@ class Runner:
                     message = str(e)
                     latest = self.db.latest(job_id, sid)
                     if latest and latest["status"] == "running":
-                        self.db.update_run(latest["id"], status="failed", error=message, finished_at=now())
+                        stamp = now()
+                        self.db.update_run(latest["id"], status="failed", error=message, finished_at=stamp)
+                        self._close_attempts_for_run(latest, message, stamp)
                     self.log(job_id, sid, "error", message)
                     return {"action": "stage", "stage": sid, "ok": False, "pending": False,
                             "error": message, "status": self.settle(job_id)}

@@ -12,7 +12,7 @@ import { CATALOG, PALETTE, PORT_COLOR, portType, type Side } from "../board/cata
 import { INSPECTOR_FIELDS, type InspectorField } from "../board/inputs";
 import { applyConnection, placeNode, type Box } from "../board/graph";
 import { buildKit, buildKitPipeline, kitById, KITS } from "../board/kits";
-import { BoardCtx, nodeTypes, type Artefact, type BoardData, type RouteStep } from "../board/nodes";
+import { BoardCtx, cleanStepLabel, nodeTypes, type Artefact, type BoardData, type RouteStep } from "../board/nodes";
 
 type Lens = Side | "both";
 type FlowNode = Node<BoardData, "board">;
@@ -34,11 +34,18 @@ function feedConfig(type: string, config: Record<string, string>) {
   return cfg;
 }
 
+function scaffoldScript(steps: RouteStep[], current?: string) {
+  const written = (current || "").trim();
+  if (written) return written;
+  const route = steps.map((step) => cleanStepLabel(step.label, 80)).filter((label) => label && label !== "Step").slice(0, 6).join(". ");
+  return route ? `Say this in our voice. The route is: ${route}.` : "Name the offer, then the one next step.";
+}
+
 function presentSteps(steps: RouteStep[]): RouteStep[] {
   const seen = new Set<string>();
   const unique: RouteStep[] = [];
   for (const step of steps) {
-    const label = /^\d{6,}$/.test(step.label || "") ? "Ad creative" : (step.label || "Step");
+    const label = cleanStepLabel(step.label) || "Step";
     const key = `${step.kind || "step"}|${label}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -164,6 +171,10 @@ function Canvas() {
     enabled: nodes.length > 0,
   });
   const preview = previewQuery.data || board?.preview || null;
+  const feedAds = (preview?.feed?.evidence?.fields?.waterfall || []) as unknown[];
+  // An empty waterfall during the preview read is still loading. The empty copy
+  // waits until that read has finished.
+  const feedLoading = !feedAds.length && !previewQuery.isError && (previewQuery.isPending || previewQuery.isFetching);
   const sources = useMemo(() => {
     const attached = nodes.filter((node) => node.data.nodeType === "ad_reference" && node.data.config.ad_id).map((node) => ({
       id: node.data.config.ad_id, title: node.data.config.title || node.data.config.ad_id,
@@ -398,7 +409,7 @@ function Canvas() {
       ensure(briefId, "brief", { x, y }, {
         persona: variables.persona || "", offer: variables.offer || "", angle: "", length: "30", platform: "instagram",
       });
-      ensure(scriptId, "script", { x: x + 300, y }, { script: variables.script || "" });
+      ensure(scriptId, "script", { x: x + 300, y }, { script: scaffoldScript(steps, variables.script) });
       ensure(voiceId, "voice", { x: x + 600, y }, {});
       ensure(videoId, "video", { x: x + 900, y }, { format: "talking_head", aspect: "9:16" });
       ensure(landingId, "landing", { x: x + 300, y: y + 300 }, {});
@@ -445,7 +456,7 @@ function Canvas() {
       const sv = stageView(stages[n.id], job?.job?.status);
       const runs = stages[n.id]?.runs || [];
       const path = [...runs].reverse().find((r) => r.output_path)?.output_path;
-      return { ...n, data: { ...n.data, preview: previewByType[n.data.nodeType] || null, status: sv.status, est: estimates[n.id] ?? 0, actual: sv.actual, ran: sv.ran, file: path ? fileUrl(path) : "" } };
+      return { ...n, data: { ...n.data, preview: previewByType[n.data.nodeType] || null, previewLoading: n.data.nodeType === "ad_feed" && feedLoading, status: sv.status, est: estimates[n.id] ?? 0, actual: sv.actual, ran: sv.ran, file: path ? fileUrl(path) : "" } };
     };
     for (const edge of edges) {
       const srcIn = ids.has(edge.source);
@@ -474,7 +485,7 @@ function Canvas() {
       }
     }
     return { nodes: [...visible.map(paint), ...stubs], edges: viewEdges };
-  }, [nodes, edges, tab, preview, job, estimates]);
+  }, [nodes, edges, tab, preview, job, estimates, feedLoading]);
 
   useEffect(() => {
     if (!nodes.length) return;
@@ -697,8 +708,8 @@ function Canvas() {
                 if (!kits.length) return null;
                 return <div key={group}>
                   <h6>{group}</h6>
-                  <div className="v3-grid">
-                    {kits.map((kit) => <button key={kit.id} type="button" draggable className="palette-tile palette-tile-create" data-palette={`${kit.id}-kit`}
+                  <div className="v3-grid v3-grid-kits">
+                    {kits.map((kit) => <button key={kit.id} type="button" draggable className="palette-tile palette-tile-create palette-tile-kit" data-palette={`${kit.id}-kit`}
                       title={`${kit.description} Source: ${kit.source}`}
                       onDragStart={(e) => { e.dataTransfer.setData("application/board-kit", kit.id); e.dataTransfer.effectAllowed = "move"; }}
                       onClick={async () => { setBusyId(`kit:${kit.id}`); try { addKit(kit.id); await new Promise((r) => setTimeout(r, 350)); } finally { setBusyId(""); } }}>

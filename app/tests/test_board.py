@@ -13,11 +13,11 @@ for k in ("FAL_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS", "ADINTEL_API_URL", "ADI
           "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AI_GATEWAY_API_KEY", "VERCEL_OIDC_TOKEN"):
     os.environ.pop(k, None)
 
-from studio.adintel import FIXTURE_ADS, FIXTURE_LABEL, LONGEVITY_NOTE, REFERENCE_LABEL, query_ads
-from studio.board import (BoardError, compile_board, migrate_talking_head_layout, preview_config, preview_pack,
+from studio.adintel import FIXTURE_ADS, FIXTURE_LABEL, LONGEVITY_NOTE, REFERENCE_LABEL, clean_step_label, query_ads
+from studio.board import (BoardError, compile_board, job_brief, migrate_talking_head_layout, preview_config, preview_pack,
                           talking_head_preset, timeline_artefact as board_timeline)
 from studio.config import connection_status, load_config
-from studio.runner import Runner, SpendGuardError
+from studio.runner import BriefError, Runner, SpendGuardError
 from studio.providers import fal, elevenlabs
 from studio.web import create_app
 
@@ -742,6 +742,38 @@ class T(unittest.TestCase):
                         {"persona": "marco", "template": "talking_head", "script": "Stop first."}, "dry")
         fresh_id, _ = r.db.new_run(fresh, "compose", "dry", "ffmpeg", "compose", "local", "", {}, {}, 0.0)
         r.db.set_job_status(fresh, "running")
+        r.db.add_attempt(stage_run_id=fresh_id, job_id=fresh, stage="compose", attempt=1, mode="dry",
+                         provider="ffmpeg", model="compose", status="running", started_at=r.db.one("SELECT started_at FROM stage_runs WHERE id=?", (fresh_id,))["started_at"])
+        orphan = "j-1020-orphan-ledger"
+        r.db.create_job(orphan, "talking_head", "marco",
+                        {"persona": "marco", "template": "talking_head", "script": "Stop first."}, "dry")
+        orphan_run, _ = r.db.new_run(orphan, "compose", "dry", "ffmpeg", "compose", "local", "", {}, {}, 0.0)
+        r.db.update_run(orphan_run, status="failed", error="instance was killed", finished_at=old, started_at=old)
+        r.db.set_job_status(orphan, "running")
+        r.db.add_attempt(stage_run_id=0, job_id=orphan, stage="compose", attempt=1, mode="dry",
+                         provider="ffmpeg", model="compose", status="running", started_at=old)
+        linked = "j-1020-linked-failed"
+        r.db.create_job(linked, "talking_head", "marco",
+                        {"persona": "marco", "template": "talking_head", "script": "Stop first."}, "dry")
+        linked_run, _ = r.db.new_run(linked, "compose", "dry", "ffmpeg", "compose", "local", "", {}, {}, 0.0)
+        r.db.update_run(linked_run, status="failed", error="instance was killed", finished_at=old, started_at=old)
+        r.db.set_job_status(linked, "failed")
+        r.db.add_attempt(stage_run_id=linked_run, job_id=linked, stage="compose", attempt=1, mode="dry",
+                         provider="ffmpeg", model="compose", status="running", started_at=old)
+        missing_id = "j-1020-null-ledger"
+        r.db.create_job(missing_id, "talking_head", "marco",
+                        {"persona": "marco", "template": "talking_head", "script": "Stop first."}, "dry")
+        r.db.set_job_status(missing_id, "failed")
+        r.db.add_attempt(job_id=missing_id, stage="compose", attempt=1, mode="dry",
+                         provider="ffmpeg", model="compose", status="running", started_at=old)
+        fal_job = "j-fal-still-polling"
+        r.db.create_job(fal_job, "talking_head", "marco",
+                        {"persona": "marco", "template": "talking_head", "script": "Stop first."}, "dry")
+        fal_run, _ = r.db.new_run(fal_job, "video", "dry", "fal", "kling", "local", "", {}, {}, 0.0)
+        r.db.update_run(fal_run, started_at=old, meta={"fal": {"request_id": "keep"}})
+        r.db.set_job_status(fal_job, "running")
+        r.db.add_attempt(stage_run_id=fal_run, job_id=fal_job, stage="video", attempt=1, mode="dry",
+                         provider="fal", model="kling", status="running", started_at=old)
         r.close()
         client = create_app(c).test_client()
         res = client.get("/api/spend")
@@ -756,6 +788,97 @@ class T(unittest.TestCase):
             self.assertEqual(recent[jid]["status"], "failed")
         self.assertEqual(check.db.run(fresh_id)["status"], "running")
         self.assertEqual(check.db.job(fresh)["status"], "running")
+        self.assertEqual(check.db.attempts(fresh_id)[0]["status"], "running")
+        orphan_attempt = check.db.one("SELECT status, error FROM attempts WHERE job_id=?", (orphan,))
+        self.assertEqual(orphan_attempt["status"], "failed", orphan_attempt)
+        self.assertTrue(orphan_attempt["error"])
+        linked_attempt = check.db.one("SELECT status, error FROM attempts WHERE job_id=?", (linked,))
+        self.assertEqual(linked_attempt["status"], "failed", linked_attempt)
+        self.assertIn("already failed", linked_attempt["error"])
+        null_attempt = check.db.one("SELECT status, error FROM attempts WHERE job_id=?", (missing_id,))
+        self.assertEqual(null_attempt["status"], "failed", null_attempt)
+        self.assertTrue(null_attempt["error"])
+        self.assertEqual(check.db.run(fal_run)["status"], "running")
+        self.assertEqual(check.db.attempts(fal_run)[0]["status"], "running")
+
+    def test_index_html_is_not_cached(self):
+        res = create_app(cfg()).test_client().get("/board")
+        self.assertEqual(res.status_code, 200, res.get_data(as_text=True)[:200])
+        cache = res.headers["Cache-Control"]
+        self.assertIn("no-cache", cache)
+        self.assertIn("no-store", cache)
+        self.assertIn("must-revalidate", cache)
+
+    def test_funnel_step_labels_drop_css_and_long_titles(self):
+        raw = ".logo-wordmark-brand_svg__st3{fill:#221d19} Eventbrite"
+        self.assertEqual(clean_step_label(raw), "Eventbrite")
+        self.assertEqual(clean_step_label(".a{color:red}.b{color:blue} Hello"), "Hello")
+        long = "Buy tickets to the annual city conference and the workshop that follows it this weekend"
+        short = clean_step_label(long)
+        self.assertLessEqual(len(short), 48)
+        self.assertTrue(short.endswith("…"))
+        self.assertNotIn("{", short)
+
+    def test_replicate_scaffold_dry_run_has_a_script(self):
+        graph = {"nodes": [
+            {"id": "s1", "type": "funnel_step", "enabled": True, "config": {"n": "1", "kind": "ad", "label": "In-feed video"}},
+            {"id": "s2", "type": "funnel_step", "enabled": True, "config": {"n": "2", "kind": "landing", "label": "Ticket rule"}},
+            {"id": "brief", "type": "brief", "enabled": True, "config": {"persona": "marco"}},
+            {"id": "script", "type": "script", "enabled": True, "config": {}},
+            {"id": "voice", "type": "voice", "enabled": True, "config": {}},
+            {"id": "video", "type": "video", "enabled": True, "config": {}},
+            {"id": "landing", "type": "landing", "enabled": True, "config": {}},
+        ], "edges": [
+            {"id": "a", "source": "s1", "sourceHandle": "step", "target": "brief", "targetHandle": "source"},
+            {"id": "b", "source": "brief", "sourceHandle": "brief", "target": "script", "targetHandle": "brief"},
+            {"id": "c", "source": "script", "sourceHandle": "script", "target": "voice", "targetHandle": "script"},
+            {"id": "d", "source": "s2", "sourceHandle": "step", "target": "landing", "targetHandle": "source"},
+            {"id": "e", "source": "brief", "sourceHandle": "brief", "target": "landing", "targetHandle": "brief"},
+        ]}
+        stages = compile_board(graph)
+        brief = job_brief(graph, stages)
+        self.assertIn("Ticket rule", brief["script"])
+        self.assertIn("In-feed video", brief["script"])
+        c = cfg()
+        c["_db_file"] = TMP / "scaffold.db"
+        runner = Runner(c, log=lambda m: None)
+        self.addCleanup(runner.close)
+        jid = runner.create_job(brief)
+        self.assertTrue(runner.db.job(jid)["brief"]["script"].strip())
+        with self.assertRaises(BriefError) as caught:
+            runner.create_job({"persona": "marco", "template": "talking_head", "script": "  "})
+        self.assertIn("brief.script is empty", str(caught.exception))
+
+    def test_step_card_drops_css_from_a_stored_label(self):
+        from studio.board import step_artefact
+        raw = ".logo-wordmark-brand_svg__st3{fill:#221d19} Eventbrite"
+        art = step_artefact({"n": "2", "kind": "landing", "label": raw, "url": "https://example.test/e"})
+        self.assertEqual(art["page"]["title"], "Eventbrite")
+        self.assertEqual(art["evidence"]["fields"]["label"], "Eventbrite")
+        self.assertNotIn("{", art["page"]["title"])
+
+    def test_clickthrough_layout_contracts(self):
+        root = Path(__file__).resolve().parents[1]
+        css = (root / "ui" / "src" / "index.css").read_text()
+        nodes = (root / "ui" / "src" / "board" / "nodes.tsx").read_text()
+        page = (root / "ui" / "src" / "pages" / "BoardPage.tsx").read_text()
+        fall = css.split(".v3-fall {", 1)[1].split("}", 1)[0]
+        self.assertIn("max-height: 280px", fall)
+        self.assertIn("overflow-y: auto", fall)
+        label = css.split(".palette-label {", 1)[1].split("}", 1)[0]
+        self.assertNotIn("line-clamp", label)
+        self.assertNotIn("ellipsis", label)
+        self.assertIn("overflow: visible", label)
+        self.assertIn(".v3-grid-kits { grid-template-columns: minmax(0, 1fr); }", css)
+        card = css.split(".lib-card {", 1)[1].split("}", 1)[0]
+        self.assertIn("height: auto", card)
+        self.assertIn("align-self: start", card)
+        split = css.split(".lib-split {", 1)[1].split("}", 1)[0]
+        self.assertIn("align-items: start", split)
+        self.assertIn('loading ? "Loading ads…"', nodes)
+        self.assertIn("cleanStepLabel(config.label)", nodes)
+        self.assertIn("isPending", page)
+        self.assertIn("previewLoading", page)
 
     def test_marco_face_sheet_is_a_placeholder_when_the_file_is_missing(self):
         client = create_app(cfg()).test_client()

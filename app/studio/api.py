@@ -559,7 +559,19 @@ def register(app, cfg, runner, live, bg):
     def spa(**_):
         if not (UI_DIST / "index.html").exists():
             return ("UI not built: cd ui && npm install && npm run build. The classic pages are at /classic.", 503)
-        return send_file(UI_DIST / "index.html")
+        resp = send_file(UI_DIST / "index.html", max_age=None)
+        # send_file writes Cache-Control through its cache_control object. A later
+        # raw header assignment is replaced when that object updates, which left
+        # only "no-cache" on the wire. Set the directives on the object.
+        # Hashed bundles 404 when a cached index.html still names the previous build.
+        resp.cache_control.no_cache = True
+        resp.cache_control.no_store = True
+        resp.cache_control.must_revalidate = True
+        resp.cache_control.max_age = None
+        resp.cache_control.public = None
+        resp.headers["Pragma"] = "no-cache"
+        resp.headers["Expires"] = "0"
+        return resp
 
     app.register_blueprint(bp)
     for rule in ("/", "/new", "/board", "/jobs", "/jobs/<path:x>", "/library", "/export", "/personas", "/settings", "/spend"):

@@ -7,7 +7,7 @@ Disabled nodes pass a value through when an input type matches an output type.
 import copy
 
 from .adintel import (FIXTURE_LABEL, LONGEVITY_NOTE, REFERENCE_LABEL, AdIntelError, AdIntelNotFound,
-                      ad_by_id, funnel_for, market, query_ads)
+                      ad_by_id, clean_step_label, funnel_for, market, query_ads)
 from .config import load_template
 
 # Port id, port type. Types match the board spec.
@@ -227,14 +227,39 @@ def _enabled(graph, node_type):
     return next((n for n in (graph.get("nodes") or []) if n.get("type") == node_type and n.get("enabled", True)), None)
 
 
+def scaffold_script(graph, stages):
+    """A replicate scaffold adds a script block with no copy. Dry run still needs words.
+
+    The talking-head template has a voice stage and no script stage, so an empty
+    brief.script is rejected before the script block can write one.
+    """
+    variables = graph.get("variables") or {}
+    script_cfg = (_enabled(graph, "script") or {}).get("config") or {}
+    script = (script_cfg.get("script") or "").strip() or (variables.get("script") or "").strip()
+    if script:
+        return script
+    if not any(s.get("kind") == "script" or s.get("board_node") == "script" for s in stages):
+        return ""
+    labels = []
+    for node in graph.get("nodes") or []:
+        if node.get("type") != "funnel_step":
+            continue
+        label = clean_step_label((node.get("config") or {}).get("label") or "", limit=80)
+        if label:
+            labels.append(label)
+    route = ". ".join(labels[:6])
+    if route:
+        return f"Say this in our voice. The route is: {route}."
+    return "Name the offer, then the one next step."
+
+
 def job_brief(graph, stages, job_id=None):
     """Create-block fields win over the board variables when the block has a value."""
     variables = graph.get("variables") or {}
     brief_cfg = (_enabled(graph, "brief") or {}).get("config") or {}
-    script_cfg = (_enabled(graph, "script") or {}).get("config") or {}
     voice_cfg = (_enabled(graph, "voice") or {}).get("config") or {}
     video_cfg = (_enabled(graph, "video") or {}).get("config") or {}
-    script = (script_cfg.get("script") or "").strip() or variables.get("script") or ""
+    script = scaffold_script(graph, stages)
     offer = brief_cfg.get("offer") or variables.get("offer") or ""
     angle = brief_cfg.get("angle") or ""
     return {
@@ -443,13 +468,16 @@ def timeline_artefact(config):
 
 def step_artefact(config):
     config = config or {}
+    label = clean_step_label(config.get("label") or "")
+    fields = {k: config.get(k) for k in ("n", "kind", "label", "url", "ad_id", "state", "source")}
+    fields["label"] = label
     return {
         "type": "step",
-        "page": {"url": config.get("url") or "", "title": config.get("label") or ""},
+        "page": {"url": config.get("url") or "", "title": label},
         "evidence": {"source": "board", "origin": "copy", "live": False,
                      "label": "Copied from the funnel read onto the canvas",
                      "data_as_of": config.get("data_as_of") or "",
-                     "fields": {k: config.get(k) for k in ("n", "kind", "label", "url", "ad_id", "state", "source")}},
+                     "fields": fields},
         "inference": {"note": "Placing the step on the canvas does not add a reading."},
     }
 

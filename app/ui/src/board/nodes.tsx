@@ -37,6 +37,21 @@ type AccountOpt = { advertiser: string; ads: number; page_id?: string };
 type FunnelOpt = { id: string; name: string };
 export type RouteStep = { n?: number; kind?: string; label?: string; url?: string; state?: string; source?: string };
 
+export function cleanStepLabel(raw?: string, limit = 48): string {
+  let text = String(raw || "");
+  text = text.replace(/<style[\s\S]*?<\/style>/gi, " ").replace(/<svg[\s\S]*?<\/svg>/gi, " ").replace(/<[^>]+>/g, " ");
+  const rule = /[.#][\w-]+[^{}]*\{[^{}]*\}/g;
+  let prev = "";
+  while (prev !== text) {
+    prev = text;
+    text = text.replace(rule, " ");
+  }
+  text = text.replace(/\s+/g, " ").trim();
+  if (/^\d{6,}$/.test(text)) return "Ad creative";
+  if (limit > 0 && text.length > limit) text = `${text.slice(0, limit - 1).trimEnd()}…`;
+  return text;
+}
+
 export type BoardData = {
   nodeType: string;
   enabled: boolean;
@@ -47,6 +62,7 @@ export type BoardData = {
   actual?: number | null;
   ran?: boolean;
   file?: string;
+  previewLoading?: boolean;
 };
 
 export type StubData = { nodeType: string; followId: string; side: "source" | "target" };
@@ -190,7 +206,7 @@ function collapseRoute(steps: RouteStep[]) {
   const seen = new Set<string>();
   const unique: RouteStep[] = [];
   for (const step of steps) {
-    const label = /^\d{6,}$/.test(step.label || "") ? "Ad creative" : (step.label || "Step");
+    const label = cleanStepLabel(step.label) || "Step";
     const key = `${step.kind || "step"}|${label}`;
     if (seen.has(key)) continue;
     seen.add(key);
@@ -200,7 +216,7 @@ function collapseRoute(steps: RouteStep[]) {
 }
 
 function FunnelSteps({ steps }: { steps: { label?: string }[] }) {
-  const shown = steps.filter((s) => s.label).slice(0, 5);
+  const shown = steps.map((s) => ({ ...s, label: cleanStepLabel(s.label) })).filter((s) => s.label).slice(0, 5);
   if (!shown.length) return null;
   return (
     <div className="v3-fm">
@@ -234,7 +250,7 @@ function Panels({ artefact }: { artefact?: Artefact | null }) {
   );
 }
 
-function FeedWaterfall({ nodeId, config, ads, matched }: { nodeId: string; config: Record<string, string>; ads: WaterAd[]; matched?: number }) {
+function FeedWaterfall({ nodeId, config, ads, matched, loading }: { nodeId: string; config: Record<string, string>; ads: WaterAd[]; matched?: number; loading?: boolean }) {
   const { setConfig, accounts, addAds } = useContext(BoardCtx);
   const [open, setOpen] = useState<string | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
@@ -282,14 +298,14 @@ function FeedWaterfall({ nodeId, config, ads, matched }: { nodeId: string; confi
                 <ol className="v3-steps">
                   {route.isLoading && <li>Loading route…</li>}
                   {route.isError && <li>{(route.error as Error).message}</li>}
-                  {(route.data?.steps || []).map((step) => <li key={`${id}-${step.n}`}>{step.n}. {step.label} [{step.state || "unknown"}]{step.url ? ` · ${step.url}` : ""}</li>)}
+                  {(route.data?.steps || []).map((step) => <li key={`${id}-${step.n}`}>{step.n}. {cleanStepLabel(step.label) || "Step"} [{step.state || "unknown"}]{step.url ? ` · ${step.url}` : ""}</li>)}
                   {route.data && !route.data.steps.length && <li>{route.data.note || "No route steps in this read."}</li>}
                 </ol>
               )}
             </div>
           );
         })}
-        {!ads.length && <p className="v3-muted">No ads for this account in the read.</p>}
+        {!ads.length && <p className="v3-muted">{loading ? "Loading ads…" : "No ads for this account in the read."}</p>}
       </div>
       <div className="v3-acts nodrag nopan">
         <button type="button" className="v3-mini" disabled={offset <= 0} onClick={() => { setSelected([]); setConfig(nodeId, { offset: String(Math.max(0, offset - limit)), ad_id: "" }); }}>Previous</button>
@@ -299,8 +315,8 @@ function FeedWaterfall({ nodeId, config, ads, matched }: { nodeId: string; confi
   );
 }
 
-function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
-  artefact?: Artefact | null; nodeType: string; nodeId: string; selectedEvent?: string; config: Record<string, string>;
+function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config, loading }: {
+  artefact?: Artefact | null; nodeType: string; nodeId: string; selectedEvent?: string; config: Record<string, string>; loading?: boolean;
 }) {
   const { mapFunnel, replicate, funnels, setConfig } = useContext(BoardCtx);
   const pickedRoute = useQuery({
@@ -325,7 +341,7 @@ function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
   if (nodeType === "funnel_step") {
     return (
       <div className="v3-bd">
-        <p className="v3-copy">{config.n ? `${config.n}. ` : ""}{config.label || "Step"}</p>
+        <p className="v3-copy">{config.n ? `${config.n}. ` : ""}{cleanStepLabel(config.label) || "Step"}</p>
         <p className="v3-muted">{config.kind || "step"} · {config.state || "state unrecorded"}{config.url ? ` · ${config.url}` : ""}</p>
         {safeLink(config.url) && <a className="v3-mini nodrag nopan" href={safeLink(config.url)} target="_blank" rel="noopener noreferrer">Open step</a>}
         <EvidenceBox evidence={evidence} />
@@ -335,7 +351,7 @@ function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
   const routeSteps = collapseRoute((pickedRoute.data?.steps?.length ? pickedRoute.data.steps : steps) as RouteStep[]);
   return (
     <div className="v3-bd">
-      {nodeType === "ad_feed" && <FeedWaterfall nodeId={nodeId} config={config} ads={waterfall} matched={fields.matched as number | undefined} />}
+      {nodeType === "ad_feed" && <FeedWaterfall nodeId={nodeId} config={config} ads={waterfall} matched={fields.matched as number | undefined} loading={loading} />}
       {nodeType === "funnel_route" && (
         <>
           <label className="v3-lab">Funnel
@@ -542,7 +558,7 @@ function KitBody({ id, config }: { id: string; config: Record<string, string> })
       {route.isLoading && <p className="v3-muted">Reading source route…</p>}
       {route.isError && <p className="v3-warn">Source route read failed: {(route.error as Error).message}</p>}
       {route.data && <><p className="v3-muted">{route.data.origin === "live" ? "Live tracker read" : "Fixture example, not live"}. Steps retain their recorded state.</p>
-        {route.data.steps.length ? <ol>{route.data.steps.map((step, i) => <li key={`${step.n}-${i}`}><b>{step.n}. {step.label}</b>
+        {route.data.steps.length ? <ol>{route.data.steps.map((step, i) => <li key={`${step.n}-${i}`}><b>{step.n}. {cleanStepLabel(step.label) || "Step"}</b>
           <small>{step.state || "state unknown"} · {step.kind || "step"}{safeLink(step.url) && <> · <a href={safeLink(step.url)} target="_blank" rel="noopener noreferrer">Open step</a></>}</small>
         </li>)}</ol> : <p className="v3-muted">{route.data.note || "No route steps in this read."}</p>}</>}
     </details>}
@@ -601,7 +617,7 @@ export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "boa
       <div className="v3-node-clip">
         <header className="v3-h">
           <span className={`v3-ic ${intel ? "in" : "cr"}`}><Icon size={14} aria-hidden /></span>
-          <h3 className="v3-title">{data.config.title || spec.headline}</h3>
+          <h3 className="v3-title">{data.nodeType === "funnel_step" ? (cleanStepLabel(data.config.title || data.config.label) || spec.headline) : (data.config.title || spec.headline)}</h3>
           <span className="v3-hm">
             {data.nodeType === "market_timeline" && <span className={live && hasTimeline ? "v3-live" : "v3-fix"}>{live ? hasTimeline ? "LIVE" : "NO SERIES" : "FIXTURE"}</span>}
             {data.nodeType === "ad_feed" && count != null && <span className="v3-mono">{count}</span>}
@@ -620,7 +636,7 @@ export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "boa
           </div>
         )}
         {data.nodeType === "kit_master" ? <KitBody id={id} config={data.config} /> : canvas ? <CanvasBody id={id} nodeType={data.nodeType} config={data.config} /> : intel
-          ? <IntelBody artefact={data.preview} nodeType={data.nodeType} nodeId={id} selectedEvent={data.config.event_id} config={data.config} />
+          ? <IntelBody artefact={data.preview} nodeType={data.nodeType} nodeId={id} selectedEvent={data.config.event_id} config={data.config} loading={data.previewLoading} />
           : <CreateBody id={id} nodeType={data.nodeType} config={data.config} file={data.file} />}
         {!canvas && <footer className="v3-ft">
           <span className={`v3-st ${statusClass(status)}`}>{status}</span>

@@ -5,6 +5,7 @@ contract when ADINTEL_API_URL and ADINTEL_API_SECRET are both set. Otherwise
 it serves labelled fixtures. No failed live read falls back to a fixture.
 """
 import os
+import re
 from urllib.parse import quote
 
 import requests
@@ -268,6 +269,29 @@ def _match(ad, filters):
     return True
 
 
+_STYLE_BLOCK = re.compile(r"<style\b[^>]*>.*?</style>", re.I | re.S)
+_SVG_BLOCK = re.compile(r"<svg\b[^>]*>.*?</svg>", re.I | re.S)
+_TAG = re.compile(r"<[^>]+>")
+_CSS_RULE = re.compile(r"[.#][\w-]+[^{}]*\{[^{}]*\}")
+
+
+def clean_step_label(label, limit=48):
+    """Page titles scraped from the live site include CSS and SVG rules. Keep the words."""
+    text = _STYLE_BLOCK.sub(" ", str(label or ""))
+    text = _SVG_BLOCK.sub(" ", text)
+    text = _TAG.sub(" ", text)
+    previous = None
+    while previous != text:
+        previous = text
+        text = _CSS_RULE.sub(" ", text)
+    text = re.sub(r"\s+", " ", text).strip(" -|")
+    if text.isdigit() and len(text) >= 6:
+        return "Ad creative"
+    if limit and len(text) > limit:
+        text = text[:limit - 1].rstrip() + "…"
+    return text
+
+
 def _step_label(raw):
     """A numeric ad id is not a step name. Keep the role people can read."""
     title = str((raw or {}).get("title") or "").strip()
@@ -276,7 +300,7 @@ def _step_label(raw):
     label = title or nxt or role or "Untitled step"
     if label.isdigit() and len(label) >= 6:
         return "Ad creative" if role in ("family", "ad", "") else role.replace("_", " ").title()
-    return label
+    return clean_step_label(label) or "Untitled step"
 
 
 def query_ads(filters=None):
