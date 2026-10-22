@@ -8,7 +8,21 @@ marco:
     style: 0.0
     use_speaker_boost: true
   refs:
-  - /workspace/personas/marco/ref_lock/face_sheet/marco_face_sheet_LOCKED.jpg
+  - role: identity_primary
+    url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/marco/face_front_v4.png
+    pathname: refs/marco/face_front_v4.png
+    sha256: 81b49d10f4ed86d9be541691f837bfee0d0cb7b327a1a250e24894b035eb321f
+    note: v4 face, approved for now; predates the age change to early to mid 20s
+  - role: identity_secondary
+    url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/marco/face_sheet_v4.jpg
+    pathname: refs/marco/face_sheet_v4.jpg
+    sha256: 22631a6eba872f99c4445b69921efa6543def8b7f9980b7c5ad3c357a2e94503
+    note: v4 face, approved for now; predates the age change to early to mid 20s
+  - role: outfit
+    url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/marco/outfit_build_only.png
+    pathname: refs/marco/outfit_build_only.png
+    sha256: 0149e741bffb928de1060497bd3d7ec66531547eb0d5717972df3b67ae519d51
+    note: outfit build only; never a primary face
   look: early-to-mid-20s man, dark brown loose wavy curls, light stubble, navy knit, calm and economical
   lora:
     trigger: mrcstrlng man
@@ -49,7 +63,7 @@ marco:
     banned_context:
     - farmhouse/Lake Como/Engadin (Maksim lane)
     - lifestyle shown as proof of trading income
-    identity_ref_note: locked face sheet v4 (MF3 + MF8 eyes), 15 Oct
+  identity_ref_note: locked face sheet v4 (MF3 + MF8 eyes), 15 Oct. Approved for now; the v4 face predates the age change to early to mid 20s.
 maksim:
   display: Maksim Petrov
   voice_id: 6sXsAlJKKBf265ucBSRt
@@ -60,9 +74,23 @@ maksim:
     style: 0.0
     use_speaker_boost: true
   refs:
-  - /workspace/ai_studio/app/refs/maksim/01_front.jpg
-  - /workspace/ai_studio/app/refs/maksim/02_34_left.jpg
-  - /workspace/ai_studio/app/refs/maksim/03_selfie_v3.jpg
+  - role: identity_primary
+    url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/maksim/identity_c1_frontal.jpg
+    pathname: refs/maksim/identity_c1_frontal.jpg
+    sha256: 11e55549481bf58ea98a89445c50f75ccc9112e3b6b5f82ecb5025a6f99ef82b
+  - role: identity_secondary
+    url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/maksim/identity_c2_34.jpg
+    pathname: refs/maksim/identity_c2_34.jpg
+    sha256: 630bb1287dbf2de15fdaafd898d53f7045c4e79b3ea744f684e13ec9c5f3ebfd
+  - role: outfit
+    url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/maksim/outfit.jpg
+    pathname: refs/maksim/outfit.jpg
+    sha256: 567a96798d138c910529293532aab9bc00daa383c2309da14d40f6136721a36e
+  - role: face_sheet_secondary
+    url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/maksim/face_sheet_secondary.jpg
+    pathname: refs/maksim/face_sheet_secondary.jpg
+    sha256: 34f2c4f7339dfea25e1f617b51a4c1d9d770309eb6edeebcb93ba7acae2b73f4
+    note: extra face sheet; never the primary face
   look: the man in the reference images, early 50s, swept-back ash-blond/grey hair, salt-and-pepper 3-5mm stubble, deep forehead
     lines, grey crew-neck knit, calm and precise
   pronunciation: Mak-seem, never Maxime
@@ -176,9 +204,12 @@ maksim:
     - /workspace/review_bundle/aleks_ready_to_post/post3/05.jpg
     - /workspace/review_bundle/aleks_ready_to_post_batch2/post4/01.jpg
     identity_refs:
-    - /workspace/ai_studio/app/refs/maksim/01_front.jpg
-    - /workspace/ai_studio/app/refs/maksim/02_34_left.jpg
-    - /workspace/ai_studio/app/refs/maksim/03_selfie_v3.jpg
+    - url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/maksim/identity_c1_frontal.jpg
+      pathname: refs/maksim/identity_c1_frontal.jpg
+      sha256: 11e55549481bf58ea98a89445c50f75ccc9112e3b6b5f82ecb5025a6f99ef82b
+    - url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/maksim/identity_c2_34.jpg
+      pathname: refs/maksim/identity_c2_34.jpg
+      sha256: 630bb1287dbf2de15fdaafd898d53f7045c4e79b3ea744f684e13ec9c5f3ebfd
   lock:
     sources:
     - aar58/ref_lock/candidates.md
@@ -217,7 +248,26 @@ callum:
     style: 0.1
     use_speaker_boost: true
   refs:
-  - /workspace/personas/callum/ref_lock/face_sheet/callum_face_sheet_LOCKED.jpg
+  - role: identity_primary
+    url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/callum/face_sheet.png
+    pathname: refs/callum/face_sheet.png
+    sha256: 0be396e75b28ec0592e449a5b4a5bcfd84e9063cdafaac9c6339cdd608b96429
+  - role: character
+    url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/callum/char_sheet.png
+    pathname: refs/callum/char_sheet.png
+    sha256: dc2d15bbeac23a15609d91b610f536ce35a7173ed6bcc4d61d1ca6483b31d65c
+  - role: detail
+    url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/callum/detail.png
+    pathname: refs/callum/detail.png
+    sha256: 2dc5b4241c7a33e22f54ba7d5d17c39cdd93dde5de9db910c5e902cfaec754b0
+  - role: handwriting
+    url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/callum/handwriting.png
+    pathname: refs/callum/handwriting.png
+    sha256: 7dbb594ead3fe8f92492ee77fda1e5333a0fe793e547dc0795b6dd788613355e
+  - role: backstory
+    url: https://7oogdifawz8eutkx.public.blob.vercel-storage.com/refs/callum/backstory.md
+    pathname: refs/callum/backstory.md
+    sha256: fcf6fd64bb14a880cd77579ff19f5760ce473f502c7e0c54f64163e4864453b4
   look: British man, 23-25, padel kit, candid and dry
   lora:
     trigger: clmbrt man

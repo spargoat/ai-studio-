@@ -111,14 +111,14 @@ Install the SDK with the app (`requirements.txt` includes `inngest>=0.5.14`).
 
 ### Vercel
 
-The project root for the Python app is `app/` (`app.py` builds the Flask app, `requirements.txt` installs dependencies).
+The Vercel project root is the repository root, not `app/`. The function entrypoint is `app.wsgi:app` (`pyproject.toml` `[tool.vercel]`, `vercel.json`). `app/app.py` is not an entrypoint.
 
-1. In the Vercel project, set the root directory to `app` if it is not already.
+1. In the Vercel project, clear a root directory of `app` if one is set. The build command and `functions["app/wsgi.py"]` are written for the repository root.
 2. Install the [Inngest integration](https://www.inngest.com/docs/deploy/vercel) from the Vercel Marketplace. It writes `INNGEST_EVENT_KEY` and `INNGEST_SIGNING_KEY` and syncs the app after each deploy so `/api/inngest` is registered.
 3. Set `STUDIO_EXECUTOR=inngest` on the Vercel project (Production, and Preview if those deployments should run jobs).
-4. Do not put the studio password in front of `/api/inngest`. The route is exempt from the sign-in gate; Inngest signs the request with `INNGEST_SIGNING_KEY`.
-5. Raise the function max duration high enough for one step (a submit, a single status check, or a local encode), not for a whole fal wait. The wait is a `step.sleep` between invocations. On the hobby plan that ceiling is 60 seconds; a long ffmpeg step still has to finish inside it.
-6. The SQLite file from `db_file` in `config/config.yaml` is the source of truth. Serverless disks are ephemeral, so that file has to live on storage that survives the next invocation (the same data directory the app already uses). Inngest does not keep a second copy of job state.
+4. Do not put the studio password in front of `/api/inngest`. The route is exempt from the sign-in gate; Inngest signs the request with `INNGEST_SIGNING_KEY`. `/api/cron/advance` is exempt the same way and checks `CRON_SECRET` itself.
+5. `vercel.json` requests `maxDuration` 300 for one step (a submit, a single status check, or a local encode), not for a whole fal wait. The wait is a `step.sleep` between invocations. A Hobby plan may cap the function below 300 seconds; a long ffmpeg step still has to finish inside that cap.
+6. Job and stage rows stay in the database (`db.py`). On Vercel that database is Turso (`TURSO_DATABASE_URL` / `TURSO_AUTH_TOKEN`). With no URL, the app returns 503 instead of opening SQLite in `/tmp`. Inngest does not keep a second copy of job state.
 
 Local sync against the Dev Server:
 

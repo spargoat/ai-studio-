@@ -1,8 +1,10 @@
 import json
+import os
 import sqlite3
 import threading
 import time
 import datetime as dt
+from pathlib import Path
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
@@ -40,6 +42,9 @@ CREATE TABLE IF NOT EXISTS events (
   id INTEGER PRIMARY KEY AUTOINCREMENT, job_id TEXT, stage TEXT,
   level TEXT, message TEXT, created_at TEXT
 );
+CREATE TABLE IF NOT EXISTS leases (
+  name TEXT PRIMARY KEY, owner TEXT, job_id TEXT, expires_at TEXT
+);
 """
 
 _lock = threading.Lock()
@@ -49,11 +54,88 @@ def now():
     return dt.datetime.now().astimezone().isoformat(timespec="seconds")
 
 
+class _Row(dict):
+    """Mapping row so `dict(row)` and `row["col"]` match sqlite3.Row."""
+
+
+class _Cursor:
+    def __init__(self, cur):
+        self._cur = cur
+        self.lastrowid = cur.lastrowid
+
+    def fetchall(self):
+        desc = self._cur.description or ()
+        names = [d[0] for d in desc]
+        rows = self._cur.fetchall()
+        if not names:
+            return rows
+        return [_Row(zip(names, row)) for row in rows]
+
+    def fetchone(self):
+        rows = self.fetchall()
+        return rows[0] if rows else None
+
+
+class _LibsqlConn:
+    """sqlite3-shaped wrapper around a libSQL connection (no row_factory)."""
+
+    def __init__(self, raw):
+        self._raw = raw
+
+    def execute(self, sql, args=()):
+        return _Cursor(self._raw.execute(sql, args))
+
+    def executescript(self, sql):
+        self._raw.executescript(sql)
+
+    def commit(self):
+        self._raw.commit()
+
+    def close(self):
+        self._raw.close()
+
+
+class DatabaseNotConfigured(RuntimeError):
+    """Vercel has no Turso/libSQL URL and STUDIO_SQLITE is not set. Do not open /tmp SQLite."""
+
+
+def remote_database_url():
+    return os.environ.get("TURSO_DATABASE_URL") or os.environ.get("LIBSQL_URL") or ""
+
+
+def missing_on_vercel():
+    """True when a Vercel instance would otherwise hide jobs in ephemeral SQLite."""
+    if os.environ.get("VERCEL") != "1":
+        return False
+    if os.environ.get("STUDIO_SQLITE") == "1":
+        return False
+    return not remote_database_url()
+
+
+def _open(path):
+    """Turso/libSQL when a URL is set. Local SQLite otherwise, except on Vercel.
+
+    On Vercel, /tmp SQLite disappears with the instance. Refuse to open it
+    unless STUDIO_SQLITE=1 is set explicitly for a test.
+    """
+    url = remote_database_url()
+    if url and os.environ.get("STUDIO_SQLITE") != "1":
+        import libsql
+        token = os.environ.get("TURSO_AUTH_TOKEN") or os.environ.get("LIBSQL_AUTH_TOKEN") or ""
+        raw = libsql.connect(database=url, auth_token=token, _check_same_thread=False)
+        return _LibsqlConn(raw)
+    if missing_on_vercel():
+        raise DatabaseNotConfigured("Database not configured")
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
 class DB:
     def __init__(self, path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        self.conn = sqlite3.connect(str(path), check_same_thread=False, timeout=30)
-        self.conn.row_factory = sqlite3.Row
+        self.conn = _open(path)
         self.conn.executescript(SCHEMA)
         self.conn.commit()
 
@@ -202,10 +284,12 @@ class DB:
         return sum(v["effective"] for v in self.spend_summary().values())
 
     def save_score(self, run, persona, path, s):
+        passed = s.get("passed")
+        passed_i = None if passed is None else int(bool(passed))
         self.x("INSERT OR REPLACE INTO scores VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (run["id"], run["job_id"], run["stage"], run["version"], persona, path, s.get("identity"),
                 s.get("identity_min"), s.get("identity_threshold"), s.get("identity_note"), json.dumps(s.get("visual")),
-                None, None, None, json.dumps(s.get("flags", [])), int(bool(s.get("passed"))), now()))
+                None, None, None, json.dumps(s.get("flags", [])), passed_i, now()))
 
     def score(self, stage_run_id):
         r = self.one("SELECT * FROM scores WHERE stage_run_id=?", (stage_run_id,))
@@ -225,3 +309,34 @@ class DB:
 
     def events(self, job_id, limit=200):
         return self.q("SELECT * FROM events WHERE job_id=? ORDER BY id DESC LIMIT ?", (job_id, limit))
+
+    # --- leases (one compose at a time across instances; Turso when that is the database)
+    def acquire_lease(self, name, owner, job_id, ttl_s):
+        """Take `name` unless another owner still holds an unexpired lease. True when this owner holds it."""
+        exp = (dt.datetime.now().astimezone() + dt.timedelta(seconds=int(ttl_s))).isoformat(timespec="seconds")
+        with _lock:
+            self.conn.execute(
+                """INSERT INTO leases (name, owner, job_id, expires_at) VALUES (?,?,?,?)
+                   ON CONFLICT(name) DO UPDATE SET
+                     owner=excluded.owner, job_id=excluded.job_id, expires_at=excluded.expires_at
+                   WHERE leases.expires_at <= ? OR leases.owner = excluded.owner""",
+                (name, owner, job_id, exp, now()))
+            self.conn.commit()
+            row = self.conn.execute("SELECT owner FROM leases WHERE name=?", (name,)).fetchone()
+        if row is None:
+            return False
+        got = row["owner"] if not isinstance(row, tuple) else row[0]
+        return got == owner
+
+    def lease(self, name):
+        return self.one("SELECT * FROM leases WHERE name=?", (name,))
+
+    def release_lease(self, name, owner):
+        self.x("DELETE FROM leases WHERE name=? AND owner=?", (name, owner))
+
+    def release_expired_leases(self):
+        stamp = now()
+        rows = self.q("SELECT name, job_id, owner FROM leases WHERE expires_at <= ?", (stamp,))
+        if rows:
+            self.x("DELETE FROM leases WHERE expires_at <= ?", (stamp,))
+        return [{"name": r["name"], "job_id": r["job_id"]} for r in rows]

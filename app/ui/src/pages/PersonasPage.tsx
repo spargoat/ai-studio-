@@ -27,9 +27,11 @@ export default function PersonasPage() {
             {p.voice_name && <Badge variant="info" size="sm">voice {p.voice_name}</Badge>}{p.lora && <Badge size="sm">LoRA: {p.lora}</Badge>}</div>
           {p.look && <p className="text-sm text-zinc-400 mb-4">{p.look}</p>}
           <Section title={`Reference images (${p.refs.length})`}>
+            {p.identity_ref_note && <p className="text-xs text-amber-400/90 mb-2">{p.identity_ref_note}</p>}
             <div className="flex gap-2 overflow-x-auto">{p.refs.map((r: any) => r.exists ? (
-              <a key={r.i} href={`/api/personas/${p.id}/ref/${r.i}`} target="_blank" rel="noreferrer" className="shrink-0"><img src={`/api/personas/${p.id}/ref/${r.i}`} alt={r.name} className="h-40 rounded-md border border-zinc-800 object-cover" loading="lazy" /><div className="text-[10px] text-zinc-500 mt-1 truncate w-32">{r.name}</div></a>)
-              : <div key={r.i} className="text-xs text-red-400">missing: {r.name}</div>)}</div>
+              r.image === false ? <a key={r.i} href={`/api/personas/${p.id}/ref/${r.i}`} className="text-xs text-violet-400 underline self-center">{r.role}: {r.name}</a> :
+              <a key={r.i} href={`/api/personas/${p.id}/ref/${r.i}`} target="_blank" rel="noreferrer" className="shrink-0"><img src={`/api/personas/${p.id}/ref/${r.i}`} alt={r.name} className="h-40 rounded-md border border-zinc-800 object-cover" loading="lazy" /><div className="text-[10px] text-zinc-500 mt-1 truncate w-32">{r.role} · {r.name}</div>{r.note && <div className="text-[10px] text-amber-400/80 w-32">{r.note}</div>}</a>)
+              : <div key={r.i} className="text-xs text-red-400">missing: {r.role} {r.name}</div>)}</div>
           </Section>
           <Section title="Lock">
             <table className="w-full text-sm"><tbody>{Object.entries(p.lock).filter(([k]) => k !== "sources").map(([k, v]) => (

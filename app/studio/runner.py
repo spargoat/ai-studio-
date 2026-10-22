@@ -6,6 +6,7 @@ import random
 import shutil
 import string
 import time
+import uuid
 from pathlib import Path
 
 from .config import key_status, load_template
@@ -14,6 +15,7 @@ from . import pricing
 from .media import duration, poster
 from .providers import make, ProviderError, NonRetryable
 from .providers.higgsfield import HiggsfieldPending, HiggsfieldProvider
+from .providers.fal import FalPending
 
 READY = "succeeded"
 
@@ -41,6 +43,7 @@ class Runner:
         self.fail_inject = fail_inject or {}
         self.provider_override = provider_override or {}
         self.async_poll = False          # advance(): one higgsfield status check per request, no blocking wait
+        self.async_fal = False          # advance(): one fal queue poll per request, no blocking wait
         self.db = DB(cfg["_db_file"])
         self.log_fn = log
         if live:
@@ -92,8 +95,10 @@ class Runner:
                                   f"({lock['job_id']}/{lock['stage']}: exhausted balance). Top up at fal.ai, then "
                                   "rerun with STUDIO_FAL_TOPPED_UP=1 (or price the fallback routes in config)")
 
-    def check_budget(self, job_id, est):
-        if not self.live:
+    def check_budget(self, job_id, est, live=None):
+        if live is None:
+            live = self.live
+        if not live:
             return
         g, j, d = self.caps()
         spent_job = self.db.live_spend(job_id)
@@ -113,11 +118,13 @@ class Runner:
         self.db.log(job_id, stage, level, msg)
         self.log_fn(f"[{self.mode}] {job_id} {stage or '-'} {level}: {msg}")
 
-    def fallback_route(self, stage, sc):
+    def fallback_route(self, stage, sc, live=None):
         """fal locked + a priced fallback route -> that route, else None. Never used in dry-run."""
+        if live is None:
+            live = self.live
         fb = self.cfg.get("fallback") or {}
         route = (fb.get("routes") or {}).get(stage)
-        if not (self.live and fb.get("enabled") and route and sc["provider"] == "fal"):
+        if not (live and fb.get("enabled") and route and sc["provider"] == "fal"):
             return None
         if os.environ.get("STUDIO_FAL_TOPPED_UP") == "1" or not self.db.fal_lock():
             return None
@@ -126,72 +133,18 @@ class Runner:
             return None
         return {**sc, **route}
 
-    def provider_for(self, stage):
+    def provider_for(self, stage, live=None):
+        if live is None:
+            live = self.live
         sc = self.cfg["stages"][stage]
-        fb = self.fallback_route(stage, sc)
+        fb = self.fallback_route(stage, sc, live=live)
         if fb:
             sc = fb
         name = self.provider_override.get(stage, sc["provider"])
         p = make(name, self.cfg)
-        if not self.live and p.paid:
+        if not live and p.paid:
             p = make("mock", self.cfg)   # DRY_RUN: every paid adapter is swapped for the mock
         return p, sc
-
-    def advance(self, job_id, only=None):
-        """Run one due stage, or poll one in-flight Higgsfield request. Safe to call again.
-
-        A paid Higgsfield stage submits once and returns ``pending``. The next call checks that
-        request and downloads the output when it is completed. It does not submit a second job.
-        """
-        job = self.db.job(job_id)
-        if not job:
-            raise BriefError(f"no job {job_id}")
-        running = [r for r in self.db.runs(job_id) if r["status"] == "running"]
-        if running:
-            run = running[-1]
-            meta = json.loads(run["meta_json"] or "{}")
-            if meta.get("higgsfield"):
-                self._poll_higgsfield(job, run)
-                fresh = self.db.run(run["id"])
-                pending = fresh["status"] == "running"
-                body = {"action": "poll", "stage": run["stage"], "ok": fresh["status"] == READY or pending,
-                        "pending": pending, "status": self.db.job(job_id)["status"]}
-                if fresh["status"] == "failed" and fresh.get("error"):
-                    body["ok"] = False
-                    body["error"] = fresh["error"]
-                return body
-            return {"action": "busy", "stage": run["stage"], "status": "running"}
-        self.async_poll = True
-        try:
-            defs = self.stage_defs(job)
-            for sdef in defs:
-                sid = sdef["id"]
-                if only and sid != only:
-                    continue
-                latest = self.db.latest(job_id, sid)
-                deps_ok = all(self.is_ready(self.db.latest(job_id, d), self.def_of(defs, d)) for d in sdef["needs"])
-                if not deps_ok:
-                    continue
-                if latest and latest["status"] == READY and latest["review_status"] == "rejected" and not only:
-                    continue
-                due = only is not None or latest is None or latest["status"] != READY or self.is_stale(job_id, latest)
-                if not due:
-                    continue
-                self.db.set_job_status(job_id, "running")
-                result = self.run_stage(job, sdef)
-                body = {"action": "stage", "stage": sid, "ok": result is True or result == "pending",
-                        "pending": result == "pending", "status": self.db.job(job_id)["status"]}
-                if result is False:
-                    latest = self.db.latest(job_id, sid)
-                    if latest and latest.get("error"):
-                        body["error"] = latest["error"]
-                    if self.db.job(job_id)["status"] == "running":
-                        self.db.set_job_status(job_id, "failed")
-                        body["status"] = "failed"
-                return body
-        finally:
-            self.async_poll = False
-        return {"action": "idle", "status": self.db.job(job_id)["status"]}
 
     def _poll_higgsfield(self, job, run):
         """One status check for a submitted Higgsfield request. Downloads the output when it is done."""
@@ -377,6 +330,279 @@ class Runner:
             st = self.run_job(job_id)
         return st
 
+    def settle(self, job_id):
+        """Set job status from what is already stored. Does not run a stage."""
+        job = self.db.job(job_id)
+        defs = self.stage_defs(job)
+        due_any = waiting = failed = running = False
+        for sdef in defs:
+            sid = sdef["id"]
+            latest = self.db.latest(job_id, sid)
+            if latest and latest["status"] == "running":
+                running = True
+                continue
+            if latest and latest["status"] in ("failed", "blocked_budget"):
+                failed = True
+                continue
+            deps_ok = all(self.is_ready(self.db.latest(job_id, d), self.def_of(defs, d)) for d in sdef["needs"])
+            if not deps_ok:
+                continue
+            if latest and latest["status"] == READY and latest["review_status"] == "rejected":
+                waiting = True
+                continue
+            if latest is None or latest["status"] != READY or self.is_stale(job_id, latest):
+                due_any = True
+                continue
+            if sdef.get("review") and latest["review_status"] != "approved":
+                if latest["review_status"] != "pending":
+                    self.db.update_run(latest["id"], review_status="pending")
+                waiting = True
+        if running:
+            st = "running"
+        elif failed:
+            st = "failed"
+        elif due_any:
+            st = "partial"
+        elif waiting:
+            st = "awaiting_review"
+        elif self.is_complete(job_id, defs):
+            st = "done"
+        else:
+            st = "blocked"
+        self.db.set_job_status(job_id, st)
+        if st == "done":
+            from . import library
+            for sid in library.FINAL:
+                lr = self.db.latest(job_id, sid)
+                if lr and lr["status"] == READY:
+                    library.add(self.db, lr, "final output of a done job")
+        return st
+
+    def _run_timeout_s(self):
+        """Past the 300s function limit, so a stage that is still writing is not failed underneath itself."""
+        try:
+            return max(1, int(os.environ.get("STUDIO_RUN_TIMEOUT_S") or 360))
+        except ValueError:
+            return 360
+
+    def _lease_ttl_s(self):
+        try:
+            raw = os.environ.get("STUDIO_LEASE_TTL_S")
+            return max(1, int(raw)) if raw else self._run_timeout_s()
+        except ValueError:
+            return self._run_timeout_s()
+
+    def _run_age_s(self, started_at):
+        if not started_at:
+            return None
+        try:
+            started = dt.datetime.fromisoformat(started_at)
+        except ValueError:
+            return None
+        if started.tzinfo is None:
+            started = started.astimezone()
+        return (dt.datetime.now().astimezone() - started.astimezone()).total_seconds()
+
+    def _stale_reason(self, run):
+        age = self._run_age_s(run.get("started_at"))
+        waited = f" after {int(age)}s" if age is not None else ""
+        return f"instance was killed or the run timed out{waited} (left running with no result)"
+
+    def _run_is_stale(self, run):
+        """A fal poll stays running between requests. Any other row still running past the timeout died with the instance."""
+        meta = json.loads(run.get("meta_json") or "{}")
+        if meta.get("fal"):
+            return False
+        age = self._run_age_s(run.get("started_at"))
+        if age is None:
+            return True
+        return age >= self._run_timeout_s()
+
+    def reconcile(self, job_id=None):
+        """Fail stage runs left running past the timeout, and drop expired compose leases.
+
+        Cron calls this across every job. A killed function cannot record its own failure,
+        so the row stays `running` until this path marks it failed. Re-run starts a new version.
+        """
+        sql = "SELECT * FROM stage_runs WHERE status='running'"
+        args = ()
+        if job_id:
+            sql += " AND job_id=?"
+            args = (job_id,)
+        failed = []
+        for run in self.db.q(sql, args):
+            if not self._run_is_stale(run):
+                continue
+            reason = self._stale_reason(run)
+            self.db.update_run(run["id"], status="failed", error=reason, finished_at=now())
+            if run["stage"] == "compose":
+                self.db.x("DELETE FROM leases WHERE name='compose' AND job_id=?", (run["job_id"],))
+            self.log(run["job_id"], run["stage"], "error", reason)
+            self.settle(run["job_id"])
+            failed.append({"id": run["id"], "job_id": run["job_id"], "stage": run["stage"], "error": reason})
+        return {"failed": failed, "leases_released": self.db.release_expired_leases()}
+
+    def advance(self, job_id, only=None):
+        """Run one due stage, or poll one in-flight fal request. Safe to call again."""
+        job = self.db.job(job_id)
+        if not job:
+            raise BriefError(f"no job {job_id}")
+        self.reconcile(job_id)
+        job = self.db.job(job_id)
+        defs = self.stage_defs(job)
+        running = [r for r in self.db.runs(job_id) if r["status"] == "running"]
+        if running:
+            run = running[-1]
+            meta = json.loads(run["meta_json"] or "{}")
+            if meta.get("higgsfield"):
+                self._poll_higgsfield(job, run)
+                fresh = self.db.run(run["id"])
+                pending = fresh["status"] == "running"
+                body = {"action": "poll", "stage": run["stage"], "ok": fresh["status"] == READY or pending,
+                        "pending": pending, "status": self.settle(job_id)}
+                if fresh["status"] == "failed" and fresh.get("error"):
+                    body["ok"] = False
+                    body["error"] = fresh["error"]
+                return body
+            if meta.get("fal"):
+                self._poll_fal(job, run)
+                fresh = self.db.run(run["id"])
+                body = {"action": "poll", "stage": run["stage"], "status": self.settle(job_id)}
+                if fresh and fresh["status"] == "failed" and fresh.get("error"):
+                    body["ok"] = False
+                    body["error"] = fresh["error"]
+                return body
+            return {"action": "busy", "stage": run["stage"], "status": "running"}
+        if not only:
+            bad = self._failed_stage(job_id)
+            if bad:
+                message = bad.get("error") or f"{bad['stage']} {bad['status']}"
+                if job["status"] != "failed":
+                    self.log(job_id, bad["stage"], "error", f"not advancing: {message}")
+                return {"action": "stopped", "stage": bad["stage"], "ok": False, "pending": False,
+                        "error": message, "status": self.settle(job_id)}
+        self.async_fal = True
+        self.async_poll = True
+        try:
+            for sdef in defs:
+                sid = sdef["id"]
+                if only and sid != only:
+                    continue
+                latest = self.db.latest(job_id, sid)
+                deps_ok = all(self.is_ready(self.db.latest(job_id, d), self.def_of(defs, d)) for d in sdef["needs"])
+                if not deps_ok:
+                    if only:
+                        self.log(job_id, sid, "warn", "cannot rerun: upstream not ready/approved")
+                    continue
+                if latest and latest["status"] == READY and latest["review_status"] == "rejected" and not only:
+                    continue
+                due = only is not None or latest is None or latest["status"] != READY or self.is_stale(job_id, latest)
+                if not due:
+                    continue
+                lease = None
+                if sdef["kind"] == "compose":
+                    lease = f"{job_id}:{uuid.uuid4().hex}"
+                    if not self.db.acquire_lease("compose", lease, job_id, self._lease_ttl_s()):
+                        held = self.db.lease("compose") or {}
+                        whose = held.get("job_id")
+                        return {"action": "busy", "stage": sid, "status": job["status"],
+                                "reason": "compose lease held" + (f" by {whose}" if whose else "")}
+                self.db.set_job_status(job_id, "running")
+                try:
+                    try:
+                        result = self.run_stage(job, sdef)
+                    except (BriefError, SpendGuardError):
+                        raise
+                    except Exception as e:
+                        from .storage import space_note
+                        message = space_note(e)
+                        latest = self.db.latest(job_id, sid)
+                        if latest and latest["status"] == "running":
+                            self.db.update_run(latest["id"], status="failed", error=message, finished_at=now())
+                        self.log(job_id, sid, "error", message)
+                        return {"action": "stage", "stage": sid, "ok": False, "pending": False,
+                                "error": message, "status": self.settle(job_id)}
+                    body = {"action": "stage", "stage": sid, "ok": result is True or result == "pending",
+                            "pending": result == "pending", "status": self.settle(job_id)}
+                    if result is False:
+                        latest = self.db.latest(job_id, sid)
+                        if latest and latest.get("error"):
+                            body["error"] = latest["error"]
+                    return body
+                finally:
+                    if lease:
+                        self.db.release_lease("compose", lease)
+        finally:
+            self.async_fal = False
+            self.async_poll = False
+        return {"action": "idle", "status": self.settle(job_id)}
+
+    def _failed_stage(self, job_id):
+        """Latest run of a stage that already failed. Advance does not start another version."""
+        job = self.db.job(job_id)
+        for sdef in self.stage_defs(job):
+            latest = self.db.latest(job_id, sdef["id"])
+            if latest and latest["status"] in ("failed", "blocked_budget"):
+                return latest
+        return None
+
+    def _poll_fal(self, job, run):
+        """One status check for a submitted fal request. Downloads the output when it is done."""
+        from .providers.fal import FalProvider
+        meta = json.loads(run["meta_json"] or "{}")
+        falm = meta.get("fal") or {}
+        provider, sc = self.provider_for(run["stage"], live=True)
+        if not isinstance(provider, FalProvider):
+            provider = FalProvider("fal", self.cfg["providers"]["fal"])
+        provider.cfg = {**provider.cfg, "max_polls": 1, "poll_seconds": 0}
+        try:
+            result = provider._wait(falm["request_id"], falm["status_url"], falm["response_url"], timeout=90)
+        except FalPending as e:
+            falm["status"] = e.status
+            meta["fal"] = falm
+            self.db.update_run(run["id"], meta=meta)
+            self.log(job["id"], run["stage"], "info", f"fal {falm['request_id']} still {e.status}")
+            return False
+        except Exception as e:
+            if falm.get("aid"):
+                self.db.update_attempt(falm["aid"], status="failed", error=str(e), finished_at=now())
+            from .storage import space_note
+            message = space_note(e)
+            self.db.update_run(run["id"], status="failed", error=message, finished_at=now())
+            self.log(job["id"], run["stage"], "error", f"fal poll failed: {message}")
+            return False
+        from .assets import reclaim_tmp
+        reclaim_tmp()
+        out_dir = self.job_dir(job["id"]) / run["stage"] / f"v{run['version']}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            res = provider.save_result(falm["kind"], result, out_dir)
+        except Exception as e:
+            from .storage import space_note
+            message = space_note(e)
+            self.db.update_run(run["id"], status="failed", error=message, finished_at=now())
+            self.log(job["id"], run["stage"], "error", f"fal download failed: {message}")
+            return False
+        res["request_id"] = falm["request_id"]
+        job_live = True
+        actual = pricing.cost(self.cfg, falm.get("price_key") or sc["price_key"], falm["kind"],
+                              float(res["units_actual"]), {}) if job_live else 0.0
+        if falm.get("aid"):
+            self.db.update_attempt(falm["aid"], status="succeeded", actual_cost_usd=actual,
+                                   provider_request_id=falm["request_id"], finished_at=now())
+        out_meta = res.get("meta") or {}
+        self._thumb(res["output_path"], out_dir, out_meta)
+        (out_dir / "meta.json").write_text(json.dumps(out_meta, indent=2))
+        sdef = next((d for d in self.stage_defs(job) if d["id"] == run["stage"]), {})
+        self.db.update_run(run["id"], status=READY, output_path=res["output_path"], meta=out_meta,
+                           actual_cost_usd=actual, attempts=falm.get("attempt") or run["attempts"],
+                           finished_at=now(), review_status="pending" if sdef.get("review") else None)
+        self.score_run(run["id"])
+        if not self._publish(run["id"], out_dir):
+            return False
+        self.log(job["id"], run["stage"], "info", f"v{run['version']} fal {falm['request_id']} completed")
+        return True
+
     def review(self, job_id, stage, verdict, note=""):
         run = self.db.latest(job_id, stage)
         if not run or run["status"] != READY:
@@ -394,19 +620,21 @@ class Runner:
         cps = (next((d for d in self.stage_defs(job) if d["kind"] == "voice"), {}).get("params") or {}).get("chars_per_second", 15)
         audio_s = pricing.est_audio_seconds(brief["script"], cps)
         if not dry_estimate:
+            from .storage import local
             v = self.db.latest(job["id"], "voice")
             if v and v["status"] == READY and v["output_path"]:
-                audio_s = duration(v["output_path"]) or audio_s
+                audio_s = duration(local(v["output_path"])) or audio_s
         vid_param = sdef["params"].get("duration", "auto") if sdef["kind"] == "video" else "auto"
         video_s = pricing.auto_video_seconds(audio_s) if vid_param in (None, "auto") else int(vid_param)
         fmt = {"look": persona.get("look", ""), "setting": brief.get("setting", ""),
                "persona": persona.get("display", brief["persona"]), "script": brief["script"]}
         fmt.update({k: v for k, v in brief.items() if isinstance(v, str) and k not in fmt})
         script_txt = brief["script"]
+        from .storage import local
         for d, pth in (inputs or {}).items():
             if pth and str(pth).endswith(".json") and d != "brief":
                 try:
-                    t = json.loads(Path(pth).read_text())
+                    t = json.loads(Path(local(pth)).read_text())
                 except Exception:
                     continue
                 fmt[d] = t.get("text", ""); fmt[f"{d}_first"] = (t.get("items") or [""])[0]
@@ -417,7 +645,7 @@ class Runner:
                 if sd["kind"] == "script":
                     lr = self.db.latest(job["id"], sd["id"])
                     if lr and lr["status"] == READY and lr["output_path"]:
-                        script_txt = json.loads(Path(lr["output_path"]).read_text()).get("script") or script_txt
+                        script_txt = json.loads(Path(local(lr["output_path"])).read_text()).get("script") or script_txt
 
         class _Keep(dict):
             def __missing__(self, k):
@@ -426,15 +654,18 @@ class Runner:
         if sdef["kind"] == "script":
             from .frameworks import prompt as fw_prompt
             prompt = (prompt + " " if prompt else "") + fw_prompt(sdef.get("params") or {}, persona, brief)
-        from .persona import lock_text
+        from .persona import location, lock_text, refs_for_stage
         lt = lock_text(persona, sdef["kind"])
         if lt and prompt:
             prompt = f"{prompt} {lt}"
         params = {k: v for k, v in sdef["params"].items() if k not in ("duration", "chars_per_second")} \
             if sdef["kind"] in ("video", "voice") else dict(sdef["params"])
+        locked = refs_for_stage(persona.get("refs"), sdef["kind"])
+        ref_sha = {location(e): e.get("sha256") for e in locked if location(e) and e.get("sha256")}
         return {"stage": sdef["id"], "kind": sdef["kind"], "prompt": prompt, "params": params,
                 "inputs": inputs, "persona": brief["persona"], "persona_display": persona.get("display"),
-                "refs": persona.get("refs") or [], "voice_id": persona.get("voice_id"),
+                "refs": [location(e) for e in locked if location(e)], "ref_sha256": ref_sha,
+                "voice_id": persona.get("voice_id"),
                 "voice_settings": persona.get("voice_settings"), "script": script_txt, "brief": brief,
                 "audio_seconds": audio_s, "video_seconds": video_s, "fail_inject": self.fail_inject}
 
@@ -555,14 +786,24 @@ class Runner:
     def _assemble(self, job, sdef, existing=None):
         """Build provider + ctx for a stage. Creates the stage_run row unless `existing` is that row."""
         job_id, sid, kind = job["id"], sdef["id"], sdef["kind"]
-        provider, sc = self.provider_for(sdef.get("uses", sid))
+        from .assets import reclaim_tmp
+        from .storage import is_url, local
+        reclaim_tmp()
+        job_live = self.live or job.get("mode") == "live"
+        mode = "live" if job_live else "dry"
+        provider, sc = self.provider_for(sdef.get("uses", sid), live=job_live)
         if self.async_poll and provider.name == "higgsfield":
             provider.cfg = {**provider.cfg, "max_polls": 1, "poll_seconds": 0}
-        inputs_ids, inputs = {}, {}
+        if self.async_fal and provider.name == "fal":
+            provider.cfg = {**provider.cfg, "max_polls": 1, "poll_seconds": 0}
+        inputs_ids, inputs, downloaded = {}, {}, []
         for d in sdef["needs"]:
             r = self.db.latest(job_id, d)
             inputs_ids[d] = r["id"]
-            inputs[d] = r["output_path"]
+            src = r["output_path"]
+            inputs[d] = local(src)
+            if is_url(src):
+                downloaded.append(inputs[d])
         ctx = self.build_ctx(job, sdef, inputs)
         sc = self.apply_lora_route(job, sdef, sc, ctx)
         if sdef.get("model"):
@@ -574,26 +815,34 @@ class Runner:
         if kind == "compose":
             v = self.db.latest(job_id, "voice")
             ap = v and json.loads(v["meta_json"] or "{}").get("alignment_path")
+            if ap:
+                ap = local(ap)
             if ap and Path(ap).exists():
                 ls_def = next((d for d in self.stage_defs(job) if d["kind"] == "lipsync"), None)
                 al_off = float(((ls_def or {}).get("params") or {}).get("audio_lead_in_s") or 0)
                 ctx["params"]["_alignment"], ctx["params"]["_alignment_offset"] = ap, al_off
-        ctx["live"] = self.live
+        ctx["live"] = job_live
         if lead:
             ctx["audio_seconds"] = round(ctx["audio_seconds"] + float(lead), 2)
         units = pricing.units_for(kind, ctx["params"] if kind != "video" else sdef["params"], ctx)
         est = pricing.cost(self.cfg, sc["price_key"], kind, units, ctx["params"])
         created = existing is None
         if created:
-            label = provider.name if self.live else (
+            label = provider.name if job_live else (
                 f"mock (dry-run of {sc['provider']})" if provider.name == "mock" else provider.name)
-            rid, ver = self.db.new_run(job_id, sid, self.mode, label, sc["model"], sc["price_key"], ctx["prompt"],
+            rid, ver = self.db.new_run(job_id, sid, mode, label, sc["model"], sc["price_key"], ctx["prompt"],
                                        {**ctx["params"], **({"duration": ctx["video_seconds"]} if kind == "video" else {})},
                                        inputs_ids, est)
         else:
             rid, ver = existing["id"], existing["version"]
         out_dir = self.job_dir(job_id) / sid / f"v{ver}"
-        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            out_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            from .storage import NoSpace
+            if getattr(e, "errno", None) == 28:
+                raise NoSpace(out_dir) from e
+            raise
         ctx["out_dir"] = str(out_dir)
         if lead:
             from .media import ff as _ff
@@ -605,9 +854,10 @@ class Runner:
             {k: v for k, v in ctx.items() if k not in ("fail_inject",)}, indent=2, default=str))
         if created:
             self.log(job_id, sid, "info", f"v{ver} est ${est:.4f} ({units:.3g} x {pricing.describe(self.cfg, sc['price_key'])})"
-                     + ("" if self.live or not provider.paid and provider.name != "mock" else " [DRY_RUN: mock, $0 charged]"))
+                     + ("" if job_live or not provider.paid and provider.name != "mock" else " [DRY_RUN: mock, $0 charged]"))
         return {"rid": rid, "ver": ver, "ctx": ctx, "provider": provider, "sc": sc, "est": est,
-                "units": units, "out_dir": out_dir, "job": job, "sdef": sdef, "inputs": inputs}
+                "units": units, "out_dir": out_dir, "job": job, "sdef": sdef, "inputs": inputs,
+                "downloaded": downloaded, "job_live": job_live, "mode": mode}
 
     def _open_payload(self, prep):
         max_try, backoff = self.retry_policy()
@@ -671,6 +921,7 @@ class Runner:
         return f"attempt {attempt}: {type(exc).__name__}: {exc}"
 
     def _mark_attempt_failed(self, prep, aid, attempt, exc, *, nonretry, t0):
+        from .storage import space_note
         max_try, backoff = self.retry_policy()
         last_err = self._fail_message(attempt, exc, nonretry=nonretry)
         self.db.update_attempt(aid, status="failed", error=str(exc), actual_cost_usd=0.0 if nonretry else None,
@@ -678,11 +929,14 @@ class Runner:
         if nonretry:
             self.log(prep["job"]["id"], prep["sdef"]["id"], "error", f"non-retryable: {exc}")
         else:
+            # Same note the one-stage path puts on a crashed stage: how much /tmp was left.
+            last_err = space_note(last_err)
             delay = self._backoff_seconds(attempt, backoff)
             self.log(prep["job"]["id"], prep["sdef"]["id"], "error", last_err + (
                 f"; retrying in {delay}s" if attempt < max_try else "; giving up"))
         retry = (not nonretry) and attempt < max_try
         if not retry:
+            last_err = space_note(last_err)
             self.db.update_run(prep["rid"], status="failed", error=last_err, attempts=attempt, finished_at=now())
         return {"state": "failed", "retry": retry, "error": last_err,
                 "backoff": self._backoff_seconds(attempt, backoff)}
@@ -717,6 +971,9 @@ class Runner:
         self.log(job_id, sid, "info",
                  f"v{prep['ver']} ok in {time.time()-t0:.1f}s, actual ${actual:.4f}, attempt {attempt}/{max_try}")
         self.score_run(prep["rid"])
+        if not self._publish(prep["rid"], prep["out_dir"], prep.get("downloaded")):
+            err = (self.db.run(prep["rid"]) or {}).get("error") or "publish failed"
+            return {"state": "failed", "retry": False, "error": err}
         return {"state": "succeeded", "retry": False, "run_id": prep["rid"]}
 
     def _terminal_attempt(self, run, prev, attempt):
@@ -793,6 +1050,17 @@ class Runner:
             self.db.update_run(prep["rid"], status="running", meta=meta, attempts=attempt)
             self.log(job_id, stage_id, "info",
                      f"v{prep['ver']} submitted to higgsfield ({e.request_id}); poll on the next advance")
+            return {"state": "pending", "retry": False, "request_id": e.request_id}
+        except FalPending as e:
+            meta = json.loads(self.db.run(prep["rid"])["meta_json"] or "{}")
+            meta["fal"] = {"request_id": e.request_id, "status_url": e.status_url,
+                           "response_url": e.response_url, "status": e.status, "kind": sdef["kind"],
+                           "model": sc["model"], "attempt": attempt, "aid": aid,
+                           "price_key": sc["price_key"], "version": prep["ver"]}
+            self.db.update_attempt(aid, status="running", provider_request_id=e.request_id)
+            self.db.update_run(prep["rid"], status="running", meta=meta, attempts=attempt)
+            self.log(job_id, stage_id, "info",
+                     f"v{prep['ver']} submitted to fal ({e.request_id}); poll on the next advance")
             return {"state": "pending", "retry": False, "request_id": e.request_id}
         except NonRetryable as e:
             return self._mark_attempt_failed(prep, aid, attempt, e, nonretry=True, t0=t0)
@@ -902,9 +1170,12 @@ class Runner:
         try:
             s = score.score_file(self.cfg, persona, run["output_path"], n_frames or q.get("frames", 5), run["stage"])
         except Exception as e:
-            self.log(run["job_id"], run["stage"], "warn", f"quality score failed: {e}"); return None
-        if "error" in s:
-            return None
+            self.log(run["job_id"], run["stage"], "warn", f"quality score failed: {e}")
+            s = score.unscored(self.cfg, str(e))
+        if s.get("error"):
+            s = score.unscored(self.cfg, s["error"])
+        if run["stage"] == "still" and run.get("mode") == "dry":
+            s = score.mark_dry_still(s)
         self.db.save_score(run, persona, run["output_path"], s)
         meta = json.loads(run["meta_json"] or "{}")
         if len(meta.get("exports") or {}) > 1:      # compose: score every aspect export, keep in run meta
@@ -912,14 +1183,28 @@ class Runner:
             meta["export_scores"] = {}
             for asp, pth in meta["exports"].items():
                 es = s if pth == run["output_path"] else _sc.score_file(self.cfg, persona, pth, n_frames or q.get("frames", 5), run["stage"])
+                if es.get("error"):
+                    es = _sc.unscored(self.cfg, es["error"])
                 meta["export_scores"][asp] = {k: es.get(k) for k in ("identity", "passed", "flags", "visual")}
             self.db.update_run(run_id, meta=meta)
-            bad = [a for a, v in meta["export_scores"].items() if not v["passed"]]
+            bad = [a for a, v in meta["export_scores"].items() if v.get("passed") is False]
             if bad:
                 self.log(run["job_id"], run["stage"], "warn", f"compose exports flagged: {', '.join(bad)}")
-        idt = "n/a" if s["identity"] is None else f"{s['identity']:.3f}"
-        self.log(run["job_id"], run["stage"], "warn" if s["flags"] else "info",
-                 f"v{run['version']} quality: identity {idt} " + ("PASS" if s["passed"] else "FLAGGED: " + "; ".join(s["flags"])))
+        note = str(s.get("identity_note") or "")
+        if note == score.DRY_RUN_IDENTITY:
+            idt = note
+        elif s.get("identity") is None and note.startswith("not scored"):
+            idt = "not scored"
+        else:
+            idt = "n/a" if s["identity"] is None else f"{s['identity']:.3f}"
+        if s.get("passed") is True:
+            verdict = "PASS"
+        elif s.get("passed") is False:
+            verdict = "FLAGGED: " + "; ".join(s["flags"])
+        else:
+            verdict = "not scored"
+        self.log(run["job_id"], run["stage"], "warn" if s.get("passed") is False else "info",
+                 f"v{run['version']} quality: identity {idt} " + verdict)
         return s
 
     def apply_lora_route(self, job, sdef, sc, ctx):
@@ -950,6 +1235,8 @@ class Runner:
             meta["poster_error"] = str(e)
 
     def _run_brief(self, job, sdef, reuse_running=False):
+        from .assets import reclaim_tmp
+        reclaim_tmp()
         latest = self.db.latest(job["id"], "brief") if reuse_running else None
         if latest and latest["status"] == READY and reuse_running:
             return True
@@ -970,6 +1257,41 @@ class Runner:
         self.db.update_run(rid, status=READY, output_path=str(p), actual_cost_usd=0.0, cost_basis="local: $0",
                            attempts=1, finished_at=now())
         self.log(job["id"], "brief", "info", f"v{ver} resolved prompts saved")
+        if not self._publish(rid, out_dir):
+            return False
+        return True
+
+    def _free_scratch(self, out_dir, downloaded=None):
+        """Drop a stage directory and its downloaded inputs once Blob has them.
+
+        Local runs keep the files: the DB path is the file itself.
+        """
+        from . import storage
+        if not storage.enabled():
+            return
+        out_dir = Path(out_dir)
+        shutil.rmtree(out_dir, ignore_errors=True)
+        for directory in (out_dir.parent, out_dir.parent.parent):
+            try:
+                directory.rmdir()
+            except OSError:
+                break
+        for path in downloaded or []:
+            storage.release_local(path)
+
+    def _publish(self, run_id, out_dir, downloaded=None):
+        """Upload the stage directory. A Blob rejection fails this run instead of raising."""
+        from .storage import publish_run, space_note
+        try:
+            url = publish_run(self.db, run_id, out_dir)
+        except Exception as e:
+            message = space_note(e)
+            self.db.update_run(run_id, status="failed", error=message, finished_at=now())
+            run = self.db.run(run_id)
+            self.log(run["job_id"] if run else "?", run["stage"] if run else None, "error", message)
+            return False
+        if url:
+            self._free_scratch(out_dir, downloaded)
         return True
 
     def set_override(self, job_id, stage, params=None, model=None, price_key=None, prompt=None):

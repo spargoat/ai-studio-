@@ -4,13 +4,13 @@
 - optional text overlays [{text, start, end, pos: top|center|bottom}]
 - optional music bed, side-chain ducked under the voice
 - exports per aspect (9:16, 1:1, 16:9), cropped around the detected face or padded (solid colour, no blur)."""
+import gc
 import os
 import re
 import subprocess
 from pathlib import Path
 from .media import ff, duration
 
-FONT_DIR = "/workspace/creative/fonts/twf_caption"
 ASPECTS = {"9:16": (1080, 1920), "1:1": (1080, 1080), "16:9": (1920, 1080)}
 
 
@@ -51,8 +51,10 @@ def spread(text, start, end):
 
 def speech_span(media, noise_db=-35, min_sil=0.25):
     """(start, end) of speech in the audio track via silencedetect. Local, no models."""
-    r = subprocess.run(["ffmpeg", "-i", str(media), "-af", f"silencedetect=n={noise_db}dB:d={min_sil}", "-f", "null", "-"],
-                       capture_output=True, text=True)
+    from .assets import ffmpeg_bin
+    r = subprocess.run([ffmpeg_bin("ffmpeg"), "-threads", "1", "-i", str(media),
+                        "-af", f"silencedetect=n={noise_db}dB:d={min_sil}", "-f", "null", "-"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     d = duration(media) or 0
     starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", r.stderr)]
     ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", r.stderr)]
@@ -127,6 +129,8 @@ def _esc(p):
 # ---------- framing
 def face_center(video, n=5):
     from . import score
+    if not score.available():
+        return None
     xs, ys = [], []
     for f in score.frames(str(video), n):
         _, box = score.embed(f)
@@ -168,8 +172,25 @@ def frame_filter(sw, sh, tw, th, mode, center, pad_color="black", zoom=0.5, side
     return f"scale={w2}:{h2},crop={tw}:{th}:{x}:{y},setsar=1"
 
 
+def caption_face(cap):
+    """(fonts directory, ASS family, drawtext font file).
+
+    A configured fonts_dir is used only when it exists and contains a .ttf.
+    Otherwise the bundled DejaVu Sans faces are used. libass then resolves the
+    family from fontsdir, and drawtext gets fontfile=, with no fontconfig lookup.
+    """
+    from .assets import FONT_FAMILY, font_dir, font_file
+    requested = Path((cap or {}).get("fonts_dir") or "")
+    faces = sorted(requested.glob("*.ttf")) if requested.is_dir() else []
+    if faces:
+        bold = next((p for p in faces if "bold" in p.name.lower()), None)
+        return requested, (cap.get("font_name") or FONT_FAMILY), str(bold or faces[0])
+    return font_dir(), FONT_FAMILY, font_file()
+
+
 def overlay_filters(overlays, w, h, font):
     out = []
+    font = _esc(font)
     for o in overlays or []:
         y = {"top": "h*0.08", "center": "(h-text_h)/2", "bottom": "h*0.86"}.get(o.get("pos", "top"), "h*0.08")
         size = int(o.get("size_pct", 7.5 if h > w else 5) / 100 * min(w, h))   # 9:16 default bigger (was 5%)
@@ -183,17 +204,17 @@ def overlay_filters(overlays, w, h, font):
 # ---------- main
 def compose(src, out_dir, params, script=None, fast=False):
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
-    cap = params.get("captions") or {}
-    fonts = cap.get("fonts_dir", FONT_DIR)
-    bold = str(Path(fonts) / "TWFCaption-Bold.ttf")
+    cap = dict(params.get("captions") or {})
+    fonts, font_name, fontfile = caption_face(cap)
+    cap["font_name"] = font_name
     words = []
     is_img = str(src).lower().endswith((".png", ".jpg", ".jpeg", ".webp"))
     if cap.get("enabled", True) and not is_img:
         al = params.get("_alignment") if cap.get("use_alignment", True) else None
         words = word_times(script=None if cap.get("vtt") else script, vtt=cap.get("vtt"), media=src,
                            alignment=al, offset=float(params.get("_alignment_offset") or 0))
-    from .media import FONT
-    sw, sh = map(int, subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries",
+    from .assets import ffmpeg_bin
+    sw, sh = map(int, subprocess.run([ffmpeg_bin("ffprobe"), "-v", "error", "-select_streams", "v:0", "-show_entries",
                                       "stream=width,height", "-of", "csv=p=0", str(src)],
                                      capture_output=True, text=True).stdout.strip().split(",")[:2])
     center = face_center(src, 1 if fast else 5)
@@ -209,13 +230,14 @@ def compose(src, out_dir, params, script=None, fast=False):
         if words:
             ass = ass_file(words, tw, th, out_dir / f"captions_{tag}.ass", cap)
             vf.append(f"subtitles='{_esc(ass)}':fontsdir='{_esc(fonts)}'")
-        vf += overlay_filters(params.get("overlays"), tw, th, bold if Path(bold).exists() else FONT)
+        vf += overlay_filters(params.get("overlays"), tw, th, fontfile)
         if is_img:
             out = out_dir / f"compose_{tag}.png"
-            ff(["-i", str(src), "-vf", ",".join(vf), "-frames:v", "1", str(out)])
+            ff(["-threads", "1", "-i", str(src), "-filter_threads", "1", "-vf", ",".join(vf),
+                "-frames:v", "1", str(out)])
             return asp, str(out)
         out = out_dir / f"compose_{tag}.mp4"
-        args = ["-i", str(src)]
+        args = ["-threads", "1", "-i", str(src)]
         if music.get("path"):
             vol = music.get("volume", 0.18)
             args += ["-stream_loop", "-1", "-i", music["path"]]
@@ -227,16 +249,22 @@ def compose(src, out_dir, params, script=None, fast=False):
             args += ["-filter_complex", f"[0:v]{','.join(vf)}[vo];{af}", "-map", "[vo]", "-map", "[a]"]
         else:
             args += ["-vf", ",".join(vf), "-map", "0:v", "-map", "0:a?"]
-        args += ["-c:v", "libx264", "-crf", "20", "-preset", os.environ.get("STUDIO_FFMPEG_PRESET", "medium"),
+        # One thread and a short lookahead. Three parallel libx264 encodes exhausted the 2 GB instance.
+        args += ["-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
+                 "-max_muxing_queue_size", "128",
+                 "-c:v", "libx264", "-crf", "20", "-preset", os.environ.get("STUDIO_FFMPEG_PRESET", "medium"),
+                 "-x264-params", "threads=1:sync-lookahead=0",
                  "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-shortest", "-movflags", "+faststart", str(out)]
         ff(args, timeout=900)
         return asp, str(out)
-    from concurrent.futures import ThreadPoolExecutor
     fmts = params.get("formats", ["9:16", "1:1", "16:9"])
     if fast and os.environ.get("STUDIO_COMPOSE_ALL") != "1":
         fmts = fmts[:1]                       # tests: one aspect; STUDIO_COMPOSE_ALL=1 or STUDIO_MOCK_FAST=0 = full
-    with ThreadPoolExecutor(max_workers=len(fmts) or 1) as ex:      # aspects encode in parallel
-        exports = dict(ex.map(one, fmts))
+    exports = {}
+    for asp in fmts:
+        key, path = one(asp)
+        exports[key] = path
+        gc.collect()                          # drop the last encode's buffers before the next aspect
     return {"exports": exports, "words": len(words), "face_center": center, "source": str(src),
             "caption_source": ("elevenlabs alignment" if words and params.get("_alignment") and cap.get("use_alignment", True)
                                else "vtt" if cap.get("vtt") else "script"), "music": music.get("path")}

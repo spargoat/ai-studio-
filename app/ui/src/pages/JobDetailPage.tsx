@@ -9,13 +9,25 @@ import { toast } from "../components/Toast";
 import { Status, Media, Section } from "../components/common";
 import { api, usd, ts, fileUrl } from "../lib/api";
 
-function Scores({ sc }: { sc: any }) {
-  if (!sc) return null;
+const SCORED_STAGES = ["still", "video", "lipsync", "finish", "compose"];
+
+function identityText(sc: any) {
+  if (String(sc.identity_note || "") === "dry run, self-reference") return "dry run, self-reference";
+  if (sc.identity != null) return sc.identity.toFixed(2);
+  if (String(sc.identity_note || "").startsWith("not scored") || sc.passed == null) return "not scored";
+  return "n/a";
+}
+
+function Scores({ sc, stage }: { sc: any; stage: string }) {
+  if (!sc) {
+    if (!SCORED_STAGES.includes(stage)) return null;
+    return <div className="flex flex-wrap gap-1 mt-1"><Badge size="sm">identity not scored</Badge><Badge size="sm">visual not scored</Badge></div>;
+  }
   return (
     <div className="flex flex-wrap gap-1 mt-1">
-      <Badge variant={sc.passed ? "success" : "danger"} size="sm">{sc.passed ? "PASS" : "FLAG"}</Badge>
-      <Badge variant="info" size="sm">identity {sc.identity == null ? "n/a" : sc.identity.toFixed(2)}</Badge>
-      {sc.visual && <Badge size="sm">{sc.visual.width}x{sc.visual.height} · sharp {Math.round(sc.visual.sharpness)}</Badge>}
+      {sc.passed == null ? <Badge size="sm">not scored</Badge> : <Badge variant={sc.passed ? "success" : "danger"} size="sm">{sc.passed ? "PASS" : "FLAG"}</Badge>}
+      <Badge variant="info" size="sm">identity {identityText(sc)}</Badge>
+      {sc.visual ? <Badge size="sm">{sc.visual.width}x{sc.visual.height} · sharp {Math.round(sc.visual.sharpness)}</Badge> : <Badge size="sm">visual not scored</Badge>}
       <Badge size="sm" title="needs an LLM key">copy/brand/engagement: not scored</Badge>
       {(sc.flags || []).map((f: string) => <div key={f} className="w-full text-[11px] text-red-400">{f}</div>)}
     </div>
@@ -51,18 +63,18 @@ function StageRow({ jid, s, running }: { jid: string; s: any; running: boolean }
         <div>{last.output_path && <Media path={last.output_path} poster={last.poster} className="w-full max-h-80" />}</div>
         <div className="text-xs text-zinc-400 space-y-1">
           <div><b className="text-white">v{last.version}</b> · {last.mode} · {usd(last.actual_cost_usd, 3)} · tries {last.attempts} · {ts(last.finished_at || last.started_at)}</div>
-          <Scores sc={last.score} />
+          <Scores sc={last.score} stage={s.id} />
           {last.exports && <div>exports: {Object.entries(last.exports).map(([a, p]: any) => <a key={a} href={fileUrl(p)} target="_blank" rel="noreferrer" className="text-violet-400 mr-2 underline">{a}</a>)}</div>}
           {last.review_note && <div>note: {last.review_note}</div>}
           {last.error && last.status !== "succeeded" && <div className="text-red-400 whitespace-pre-wrap">{String(last.error).slice(0, 400)}</div>}
           <div className="flex flex-col sm:flex-row gap-2 pt-2">
-            {last.status === "succeeded" && s.id !== "brief" && <>
+            {s.show_review && <>
               <div className="flex-1"><Input inputSize="sm" placeholder="Reason (required to reject)" value={note} onChange={(e) => setNote(e.target.value)} /></div>
               <div className="flex gap-2 flex-wrap">
                 <Button size="sm" variant="success" icon={<Check size={13} />} loading={review.isPending && review.variables === "approved"} onClick={() => review.mutate("approved")} data-approve={s.id}>Approve v{last.version}</Button>
                 <Button size="sm" variant="danger" icon={<X size={13} />} disabled={!note.trim()} title={note.trim() ? "" : "Write a reason first"} loading={review.isPending && review.variables === "rejected"} onClick={() => review.mutate("rejected")}>Reject</Button>
-                <Button size="sm" variant="ghost" icon={<BookmarkPlus size={13} />} loading={addLib.isPending} onClick={() => addLib.mutate()} title="Add to library as promoted">Library</Button>
               </div></>}
+            {last.status === "succeeded" && s.id !== "brief" && <Button size="sm" variant="ghost" icon={<BookmarkPlus size={13} />} loading={addLib.isPending} onClick={() => addLib.mutate()} title="Add to library as promoted">Library</Button>}
             {s.id !== "brief" && <Button size="sm" variant="secondary" icon={<RotateCcw size={13} />} disabled={running} loading={rerun.isPending} onClick={() => rerun.mutate()}>Re-run</Button>}
           </div>
         </div>

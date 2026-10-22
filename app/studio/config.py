@@ -22,8 +22,16 @@ def load_yaml(path):
 def load_config(path=None):
     cfg = load_yaml(path or os.environ.get("STUDIO_CONFIG", APP_DIR / "config/config.yaml"))
     cfg["_personas"] = load_yaml(APP_DIR / "config/personas.yaml")
-    cfg["_data_dir"] = (APP_DIR / cfg.get("data_dir", "data")).resolve()
-    cfg["_db_file"] = (APP_DIR / cfg.get("db_file", "data/studio.db")).resolve()
+    if os.environ.get("VERCEL") == "1":
+        # The deployment filesystem is read-only outside /tmp. Job bytes live in Blob;
+        # this directory is only the scratch space for one stage.
+        data = Path(os.environ.get("STUDIO_TMP") or "/tmp/studio-data")
+        data.mkdir(parents=True, exist_ok=True)
+        cfg["_data_dir"] = data
+        cfg["_db_file"] = data / "studio.db"
+    else:
+        cfg["_data_dir"] = (APP_DIR / cfg.get("data_dir", "data")).resolve()
+        cfg["_db_file"] = (APP_DIR / cfg.get("db_file", "data/studio.db")).resolve()
     return cfg
 
 
