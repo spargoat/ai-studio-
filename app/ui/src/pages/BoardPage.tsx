@@ -356,29 +356,6 @@ function Canvas() {
     });
     toast.success(preview?.funnel?.evidence?.origin === "live" ? "Tracker route cards mapped. Order and links need verification." : "Public funnel mapped on the canvas");
   }, [funnelSteps, preview]);
-  const mapDirectoryFunnel = useCallback(async (funnelId: string, funnelName: string) => {
-    setBusyId(`funnel:${funnelId}`);
-    try {
-      const route = await intel<{ steps: RouteStep[]; note?: string; data_as_of?: string; funnel_name?: string }>(`/api/intel/funnels/${encodeURIComponent(funnelId)}/route`);
-      const title = route.funnel_name || funnelName || "Funnel";
-      const steps = presentSteps(route.steps || []);
-      if (!steps.length) { toast.error(route.note || "No steps in this route read."); return; }
-      const prefix = `route-${Date.now().toString(36)}`;
-      const x = Math.max(0, ...nodes.map((n) => n.position.x + (CATALOG[n.data.nodeType]?.width || 260))) + 160;
-      const noteId = `${prefix}-head`;
-      setNodes((ns) => [
-        ...ns,
-        { id: noteId, type: "board", position: { x, y: 0 }, data: { nodeType: "note", enabled: true, config: { title, notes: "Tracker route read. Repeated cards are collapsed. Confirm sequence and links before using this as a process map." } } },
-        ...steps.map((step, i) => ({ id: `${prefix}-${i}`, type: "board" as const,
-          position: { x: x + (i % 4) * 250, y: 290 + Math.floor(i / 4) * 250 },
-          data: { nodeType: "funnel_step", enabled: true, config: { title: `${step.n || i + 1}. ${step.label || "Step"}`, n: String(step.n || i + 1), kind: step.kind || "", label: step.label || "Step", url: step.url || "", state: step.state || "unknown", source: step.source || "", data_as_of: route.data_as_of || "" } } }))
-      ]);
-      setTab("both");
-      setTimeout(() => fitView({ nodes: [{ id: noteId }], padding: 0.4, duration: 250 }), 40);
-      toast.success(`${steps.length} route cards added`);
-    } catch (e) { toast.error((e as Error).message); }
-    finally { setBusyId(""); }
-  }, [nodes, fitView]);
   const replicate = useCallback((funnelId: string, explicit?: RouteStep[]) => {
     const read = funnelSteps();
     const steps = presentSteps(explicit?.length ? explicit : read.steps);
@@ -461,7 +438,10 @@ function Canvas() {
       const sv = stageView(stages[n.id], job?.job?.status);
       const runs = stages[n.id]?.runs || [];
       const path = [...runs].reverse().find((r) => r.output_path)?.output_path;
-      return { ...n, data: { ...n.data, preview: previewByType[n.data.nodeType] || null, previewLoading: n.data.nodeType === "ad_feed" && feedLoading, status: sv.status, est: estimates[n.id] ?? 0, actual: sv.actual, ran: sv.ran, file: path ? fileUrl(path) : "" } };
+      const inherited = n.data.nodeType === "funnel_route" && !n.data.config.funnel_id && n.id !== "funnel"
+        ? null
+        : (previewByType[n.data.nodeType] || null);
+      return { ...n, data: { ...n.data, preview: inherited, previewLoading: n.data.nodeType === "ad_feed" && feedLoading, status: sv.status, est: estimates[n.id] ?? 0, actual: sv.actual, ran: sv.ran, file: path ? fileUrl(path) : "" } };
     };
     for (const edge of edges) {
       const srcIn = ids.has(edge.source);
@@ -543,7 +523,7 @@ function Canvas() {
   }, [nodes]);
   const isValid = useCallback((c: Connection | Edge) => applyConnection(edges, c, wireCtx(nodes)).ok, [edges, nodes, wireCtx]);
 
-  const addNode = (type: string) => {
+  const addNode = (type: string, config: Record<string, string> = {}) => {
     const spec = CATALOG[type];
     if (!spec) return;
     setTab((current) => (current === "both" || current === spec.side ? current : "both"));
@@ -552,8 +532,11 @@ function Canvas() {
     setNodes((ns) => [...ns, {
       id, type: "board",
       position: placeNode(ns.map(nodeBox), { x: 48, y: 48 }, size),
-      data: { nodeType: type, enabled: true, config: {} },
+      data: { nodeType: type, enabled: true, config },
     }]);
+    if (type === "funnel_route") {
+      setTimeout(() => fitView({ nodes: [{ id }], padding: 0.45, duration: 200 }), 40);
+    }
   };
 
   const save = useMutation({
@@ -583,7 +566,7 @@ function Canvas() {
       const saved = await api<any>(`/api/boards/${boardId}`, { method: "PUT", body: { name, graph: serialize(nodes, edges, variables, funnel) } });
       qc.setQueryData(["board", boardId], saved);
       setLoaded(boardId + (saved.updated_at || ""));
-      const row = await api<{ id: string; mode: string; pump?: boolean; status?: string; error?: string }>(`/api/boards/${boardId}/run`, { body: { mode: "dry" }, timeoutMs: 25000 });
+      const row = await api<{ id: string; mode: string; pump?: boolean; status?: string; error?: string; stages?: { id: string; status: string }[] }>(`/api/boards/${boardId}/run`, { body: { mode: "dry" }, timeoutMs: 25000 });
       setJobId(row.id);
       let status = row.status || "started";
       const paint = async () => {
@@ -591,18 +574,35 @@ function Canvas() {
         qc.setQueryData(["job", row.id], fresh);
         return fresh?.job?.status as string | undefined;
       };
+      const applyStages = (stages?: { id: string; status: string }[], jobStatus?: string) => {
+        if (!stages?.length && !jobStatus) return;
+        qc.setQueryData(["job", row.id], (prev: any) => {
+          const base = prev || { job: { id: row.id, status: jobStatus || "running" }, stages: [] };
+          const next = (base.stages || []).map((entry: { id: string; runs?: Record<string, unknown>[] }) => ({ ...entry, runs: [...(entry.runs || [])] }));
+          for (const item of stages || []) {
+            if (!item?.id || !item.status) continue;
+            let stage = next.find((entry: { id: string }) => entry.id === item.id);
+            if (!stage) { stage = { id: item.id, runs: [] }; next.push(stage); }
+            const runs = stage.runs?.length ? [...stage.runs] : [{}];
+            runs[runs.length - 1] = { ...(runs[runs.length - 1] || {}), status: item.status };
+            stage.runs = runs;
+          }
+          return { ...base, job: { ...(base.job || {}), id: row.id, status: jobStatus || base.job?.status }, stages: next };
+        });
+      };
       const fail = async (message: string) => {
         try { status = await paint() || status; } catch { /* the banner still reports the run error */ }
         throw new Error(message);
       };
+      applyStages(row.stages, row.status);
       if (row.error) await fail(row.error);
       for (let i = 0; i < 80; i++) {
         let action = "";
         if (row.pump) {
-          const step = await api<{ status?: string; action?: string; stage?: string; ok?: boolean; error?: string }>(`/api/jobs/${row.id}/advance`, { method: "POST", body: {}, timeoutMs: 25000 });
+          const step = await api<{ status?: string; action?: string; stage?: string; ok?: boolean; error?: string; stages?: { id: string; status: string }[] }>(`/api/jobs/${row.id}/advance`, { method: "POST", body: {}, timeoutMs: 25000 });
           status = step.status || status;
           action = step.action || "";
-          await paint();
+          applyStages(step.stages, step.status);
           if (step.ok === false || step.error) throw new Error(step.error || "Dry run stopped");
         } else {
           status = await paint() || status;
@@ -613,6 +613,7 @@ function Canvas() {
         if (!row.pump && status !== "created" && status !== "running" && status !== "partial") break;
         await new Promise((resolve) => setTimeout(resolve, 280));
       }
+      if (row.pump) status = await paint() || status;
       return { ...row, status };
     },
     onSuccess: (row) => { setRunError(""); setJobId(row.id); qc.invalidateQueries({ queryKey: ["board", boardId] }); toast.success(`Dry run ${row.id} · ${row.status}`); },
@@ -749,7 +750,7 @@ function Canvas() {
                         const Icon = spec.icon;
                         const intel = spec.side === "intel";
                         return (
-                          <button key={type} type="button" draggable
+                          <button key={type} type="button" draggable={type !== "funnel_route"}
                             onDragStart={(e) => { e.dataTransfer.setData("application/board-node", type); e.dataTransfer.effectAllowed = "move"; }}
                             onClick={() => addNode(type)}
                             data-palette={type}
@@ -774,8 +775,8 @@ function Canvas() {
                 <p className="v3-muted">{directoryQuery.data.coverage}</p>
                 {(directoryQuery.data.funnels || []).filter((f: { name: string; advertisers?: string[] }) => !needle || `${f.name} ${(f.advertisers || []).join(" ")}`.toLowerCase().includes(needle)).map((f: { id: string; name: string; advertisers?: string[]; ads?: number | null }) => (
                   <button key={f.id} type="button" className="v3-dir-item"
-                    onClick={() => mapDirectoryFunnel(f.id, f.name)} title="Map tracker route cards on this board" disabled={busyId === `funnel:${f.id}`}>
-                    <b>{busyId === `funnel:${f.id}` ? "Loading funnel…" : f.name}</b><small>{(f.advertisers || []).join(", ") || "Advertiser not linked"}{f.ads != null ? ` · ${f.ads} assigned ads` : ""}</small>
+                    onClick={() => addNode("funnel_route", { funnel_id: f.id, funnel_name: f.name })} title="Add this funnel as a Funnel Map block">
+                    <b>{f.name}</b><small>{(f.advertisers || []).join(", ") || "Advertiser not linked"}{f.ads != null ? ` · ${f.ads} assigned ads` : ""}</small>
                   </button>
                 ))}
               </div>}

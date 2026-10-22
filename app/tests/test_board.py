@@ -1018,6 +1018,11 @@ class T(unittest.TestCase):
         self.assertIn("v3-alert", page)
         self.assertIn("setRunError", page)
         self.assertIn("timeoutMs: 25000", page)
+        self.assertIn('draggable={type !== "funnel_route"}', page)
+        self.assertIn('addNode("funnel_route", { funnel_id: f.id, funnel_name: f.name })', page)
+        self.assertIn("Add this funnel as a Funnel Map block", page)
+        self.assertNotIn("mapDirectoryFunnel", page)
+        self.assertIn("Funnel Map block. Choose a funnel in the inspector", nodes)
         self.assertIn("pinnedBoards", page)
         self.assertIn("INTEL_TIMEOUT_MS", api_src)
         self.assertIn("Request timed out", api_src)
@@ -1343,6 +1348,63 @@ class T(unittest.TestCase):
         self.assertFalse(mock_fast())
         self.assertEqual(frame_size(), (1080, 1920, 30))
         self.assertEqual(placeholder_seconds(15), 15.0)
+
+    def test_dry_run_round_trips_stay_small_when_each_call_is_slow(self):
+        """A remote libSQL call is one round trip. Thirty stages must stay in seconds, not minutes."""
+        import time
+        nodes = [{"id": f"n{i}", "type": "market_timeline", "position": {"x": 0, "y": i * 20},
+                  "enabled": True, "config": {}} for i in range(30)]
+        graph = {"nodes": nodes, "edges": [], "variables": {"persona": "marco", "offer": "a checklist",
+                 "script": "Decide the stop before you size the trade."}}
+        c = cfg()
+        c["_db_file"] = TMP / "latency.db"
+        url = str(TMP / "latency-libsql.db")
+        os.environ["TURSO_DATABASE_URL"] = url
+        self.addCleanup(os.environ.pop, "TURSO_DATABASE_URL", None)
+        os.environ.pop("STUDIO_SQLITE", None)
+        runner = Runner(c, log=lambda m: None)
+        self.assertTrue(type(runner.db.conn).__name__ == "_LibsqlConn")
+        brief = job_brief(graph, compile_board(graph))
+        jid = runner.create_job(brief)
+        runner.db.round_trips = 0
+        runner.db.latency_s = 0.02
+        started = time.monotonic()
+        with runner.db.job_scope(jid):
+            status = "created"
+            for _ in range(40):
+                step = runner.advance(jid)
+                status = step.get("status") or status
+                if step.get("ok") is False or step.get("action") in ("idle", "stopped") or status in ("done", "failed", "awaiting_review"):
+                    break
+        elapsed = time.monotonic() - started
+        self.assertEqual(status, "done", step)
+        self.assertLess(elapsed, 8, f"{elapsed:.2f}s and {runner.db.round_trips} round trips")
+        self.assertLess(runner.db.round_trips, 80, runner.db.round_trips)
+        self.assertEqual(runner.db.job(jid)["status"], "done")
+        runner.db.latency_s = 0
+        runner.db.round_trips = 0
+        self.assertEqual(len(runner.db.runs(jid)), 30)
+        runner.db.q("SELECT * FROM scores WHERE job_id=?", (jid,))
+        runner.db.events(jid, 60)
+        runner.db.job(jid)
+        # Paint is one job read, one runs list, one scores list, one event list.
+        self.assertLess(runner.db.round_trips, 8, runner.db.round_trips)
+        detail = create_app(c).test_client().get(f"/api/jobs/{jid}").get_json()
+        self.assertEqual(detail["job"]["status"], "done")
+        self.assertEqual(sum(1 for stage in detail["stages"] if _stage_status(detail, stage["id"]) == "succeeded"), 30)
+
+    def test_stale_hrana_stream_is_reopened(self):
+        c = cfg()
+        c["_db_file"] = TMP / "reconnect.db"
+        runner = Runner(c, log=lambda m: None)
+        runner.db.fail_statements = 1
+        jid = runner.create_job({"persona": "marco", "template": "talking_head",
+                                 "script": "Decide the stop before you size the trade."})
+        self.assertEqual(runner.db.job(jid)["persona"], "marco")
+        runner.db.fail_scripts = 1
+        step = runner.advance(jid)
+        self.assertTrue(step.get("ok"), step)
+        self.assertEqual(runner.db.latest(jid, step["stage"])["status"], "succeeded")
 
 
 def _stage_run(job, sid):

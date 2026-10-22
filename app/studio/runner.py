@@ -244,6 +244,10 @@ class Runner:
 
     def run_job(self, job_id, only=None):
         """Run every stage that is due. `only` restricts to one stage (rerun-only)."""
+        with self.db.job_scope(job_id):
+            return self._run_job(job_id, only)
+
+    def _run_job(self, job_id, only=None):
         job = self.db.job(job_id)
         defs = self.stage_defs(job)
         self.db.set_job_status(job_id, "running")
@@ -452,6 +456,10 @@ class Runner:
         A killed function cannot record its own failure, so the row stays `running`
         until a later read or advance marks it failed. Re-run starts a new version.
         """
+        scope = self.db._scope
+        if scope is not None and (job_id is None or scope.job_id == job_id):
+            if not any(row["status"] == "running" for row in scope.rows):
+                return {"failed": [], "leases_released": []}
         sql = "SELECT * FROM stage_runs WHERE status='running'"
         args = ()
         if job_id:
@@ -502,6 +510,16 @@ class Runner:
 
     def advance(self, job_id, only=None):
         """Run one due stage, or poll one in-flight fal request. Safe to call again."""
+        with self.db.job_scope(job_id) as scope:
+            try:
+                body = self._advance_body(job_id, only)
+            finally:
+                scope.flush()
+            if isinstance(body, dict):
+                body["stages"] = scope.statuses()
+            return body
+
+    def _advance_body(self, job_id, only=None):
         job = self.db.job(job_id)
         if not job:
             raise BriefError(f"no job {job_id}")

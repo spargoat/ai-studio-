@@ -149,18 +149,42 @@ def register(app, cfg, runner, live, bg):
     def job(jid):
         runner.reconcile(jid)
         j = db.job(jid) or abort(404)
+        all_runs = db.runs(jid)
+        if any(r["status"] == "running" for r in all_runs):
+            runner.reconcile(jid)
+            j = db.job(jid) or abort(404)
+            all_runs = db.runs(jid)
+        by_stage = {}
+        for r in all_runs:
+            by_stage.setdefault(r["stage"], []).append(r)
+        latest = {sid: rows[-1] for sid, rows in by_stage.items() if rows}
+
+        def stale(run):
+            if run["status"] != "succeeded":
+                return False
+            for name, rid in json.loads(run["inputs_json"] or "{}").items():
+                cur = latest.get(name)
+                if cur and cur["id"] != rid:
+                    return True
+            return False
+
+        scores = {}
+        for row in db.q("SELECT * FROM scores WHERE job_id=?", (jid,)):
+            row["visual"] = json.loads(row["visual_json"] or "null")
+            row["flags"] = json.loads(row["flags_json"] or "[]")
+            scores[row["stage_run_id"]] = row
         stages = []
         for d in runner.stage_defs(j):
             sc = cfg["stages"].get(d.get("uses", d["id"]), {"provider": "local", "model": "brief-resolver"})
             runs = []
-            for r in db.runs(jid, d["id"]):
+            for r in by_stage.get(d["id"], []):
                 m = json.loads(r["meta_json"] or "{}")
-                sco = db.score(r["id"])
+                sco = scores.get(r["id"])
                 runs.append({k: r[k] for k in ("id", "version", "status", "review_status", "review_note", "mode", "provider", "model",
                                                 "output_path", "actual_cost_usd", "est_cost_usd", "attempts", "error", "started_at", "finished_at")}
                             | {"exports": m.get("exports"), "poster": m.get("poster"), "score": sco,
                                "summary": m.get("summary"),
-                               "stale": r["status"] == "succeeded" and runner.is_stale(jid, r)})
+                               "stale": stale(r)})
             last = runs[-1] if runs else {}
             stages.append({"id": d["id"], "kind": d["kind"], "review": bool(d.get("review")), "needs": d.get("needs") or [],
                            "provider": last.get("provider") or sc["provider"], "model": last.get("model") or sc["model"],
@@ -520,21 +544,25 @@ def register(app, cfg, runner, live, bg):
         os.environ["STUDIO_NO_FFMPEG_FETCH"] = "1"
         try:
             try:
-                budget = float(os.environ.get("STUDIO_DRY_BUDGET_S") or 12)
+                budget = float(os.environ.get("STUDIO_DRY_BUDGET_S") or 18)
             except ValueError:
-                budget = 12.0
+                budget = 18.0
             deadline = time.monotonic() + max(0.0, budget)
-            status, error = "created", None
-            while time.monotonic() < deadline:
-                step = runner.advance(jid)
-                status = step.get("status") or status
-                if step.get("ok") is False:
-                    error = step.get("error") or "Dry run stopped"
-                    break
-                if step.get("action") in ("idle", "stopped"):
-                    break
-                if status not in ("created", "running", "partial"):
-                    break
+            status, error, stages = "created", None, None
+            # One read of this job, then each stage is a single write batch.
+            # Reloading latest() per node is what made Turso take 30–60s a stage.
+            with runner.db.job_scope(jid):
+                while time.monotonic() < deadline:
+                    step = runner.advance(jid)
+                    status = step.get("status") or status
+                    stages = step.get("stages", stages)
+                    if step.get("ok") is False:
+                        error = step.get("error") or "Dry run stopped"
+                        break
+                    if step.get("action") in ("idle", "stopped"):
+                        break
+                    if status not in ("created", "running", "partial"):
+                        break
         except BriefError as e:
             return err(e, 409)
         except Exception as e:
@@ -545,7 +573,7 @@ def register(app, cfg, runner, live, bg):
             else:
                 os.environ["STUDIO_NO_FFMPEG_FETCH"] = previous
         pump = status in ("created", "running", "partial") and not error
-        body = {"id": jid, "mode": "dry", "pump": pump, "status": status}
+        body = {"id": jid, "mode": "dry", "pump": pump, "status": status, "stages": stages or []}
         if error:
             body["error"] = error
         return jsonify(body), 201

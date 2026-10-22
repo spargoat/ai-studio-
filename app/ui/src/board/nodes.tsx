@@ -351,7 +351,7 @@ function FeedWaterfall({ nodeId, config }: { nodeId: string; config: Record<stri
 function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
   artefact?: Artefact | null; nodeType: string; nodeId: string; selectedEvent?: string; config: Record<string, string>;
 }) {
-  const { mapFunnel, replicate, funnels, setConfig } = useContext(BoardCtx);
+  const { mapFunnel, replicate } = useContext(BoardCtx);
   const pickedRoute = useQuery({
     queryKey: ["funnel-route", config.funnel_id],
     queryFn: () => intel<{ steps: RouteStep[]; note?: string; funnel_name?: string }>(`/api/intel/funnels/${encodeURIComponent(config.funnel_id)}/route`),
@@ -387,17 +387,8 @@ function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
       {nodeType === "ad_feed" && <FeedWaterfall nodeId={nodeId} config={config} />}
       {nodeType === "funnel_route" && (
         <>
-          <label className="v3-lab">Funnel
-            <select aria-label="Funnel" className="v3-in" value={config.funnel_id || ""}
-              onChange={(e) => {
-                const row = funnels.find((item) => item.id === e.target.value);
-                setConfig(nodeId, { funnel_id: e.target.value, funnel_name: row?.name || "" });
-              }}>
-              <option value="">From the connected ad</option>
-              {funnels.map((row) => <option key={row.id} value={row.id}>{row.name}</option>)}
-            </select>
-          </label>
           {config.funnel_name && <p className="v3-muted">{config.funnel_name}</p>}
+          {!config.funnel_id && !routeSteps.length && <p className="v3-muted">Funnel Map block. Choose a funnel in the inspector, or connect an ad.</p>}
           {!pickedRoute.isError && pickedRoute.isFetching && pickedRoute.failureCount === 0 && <p className="v3-muted">Loading funnel…</p>}
           {!pickedRoute.isError && pickedRoute.isFetching && pickedRoute.failureCount > 0 && <p className="v3-warn">Retrying funnel…</p>}
           {pickedRoute.isError && <p className="v3-warn">Funnel read failed: {(pickedRoute.error as Error).message}</p>}
