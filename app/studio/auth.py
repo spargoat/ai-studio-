@@ -6,7 +6,7 @@ from flask import jsonify, redirect, render_template_string, request, url_for
 
 COOKIE = "studio_session"
 SESSION_S = 14 * 24 * 3600
-PUBLIC = ("/login", "/logout", "/favicon.ico", "/healthz", "/api/cron/advance")
+PUBLIC = ("/login", "/logout", "/favicon.ico", "/healthz", "/api/inngest", "/api/cron/advance")
 _fail, _flock = {}, threading.Lock()
 
 LOGIN = """<!doctype html><html lang=en><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">

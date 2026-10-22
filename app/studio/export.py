@@ -36,8 +36,47 @@ def ass_to_srt(ass_path):
 
 
 def _brief(job_dir):
-    p = next(iter(sorted(Path(job_dir).glob("brief/v*/brief.json"))), None)
+    try:
+        root = Path(job_dir)
+    except TypeError:
+        return {}
+    if not root.exists():
+        return {}
+    p = next(iter(sorted(root.glob("brief/v*/brief.json"))), None)
     return (json.loads(p.read_text()).get("brief") or {}) if p else {}
+
+
+def _caption_body(db, row, src):
+    """Post text for caption.txt. The job brief wins; a local brief.json is the fallback.
+
+    On Vercel the media file is a Blob cache download, so it does not sit next
+    to brief/v1/brief.json. Reading only that path writes a one-byte file.
+    """
+    brief = {}
+    job = db.job(row["job_id"]) if row.get("job_id") else None
+    if job:
+        brief = job.get("brief") or {}
+    if not (brief.get("caption") or brief.get("post_caption") or brief.get("script")):
+        parents = src.parents
+        located = _brief(parents[2]) if len(parents) > 2 else {}
+        if located:
+            brief = located
+    post = (brief.get("caption") or brief.get("post_caption") or brief.get("script") or "").strip()
+    tags = brief.get("hashtags") or []
+    if isinstance(tags, str):
+        tags = tags.split()
+    if tags:
+        post = (post + "\n\n" + " ".join(str(t) for t in tags)).strip()
+    return (post + "\n") if post else "\n"
+
+
+def _export_name(stage, aspect, suffix):
+    """compose_9x16.mp4, not the Blob cache hash the file was downloaded as."""
+    if not aspect or aspect == "source":
+        return f"{stage}{suffix}"
+    tag = str(aspect).replace(":", "x")
+    stem = "compose" if stage == "compose" else stage
+    return f"{stem}_{tag}{suffix}"
 
 
 def export(db, out_dir, persona=None, promoted=False, job=None, ids=None, zip_it=True, limit=500, live_only=False, stages=("finish", "compose")):
@@ -89,21 +128,24 @@ def export(db, out_dir, persona=None, promoted=False, job=None, ids=None, zip_it
             meta = json.loads((stored or {}).get("meta_json") or "{}") if stored else {}
         media = list((meta.get("exports") or {}).items()) or [("source", str(src))]
         for asp, p in media:
-            p = Path(local(str(p)) or "")
+            raw = str(p)
+            p = Path(local(raw) or "")
             if not p.exists():
                 continue
-            dest_stem = stem if asp in ("source", "9:16") else filename_stem(purpose_name(
-                displays.get(r.get("persona")) or r.get("persona") or "Asset", r.get("stage"), r.get("version"), asp))
-            shutil.copy2(p, d / f"{dest_stem}{p.suffix}"); files.append(f"{dest_stem}{p.suffix}")
-            ass = run_dir / f"captions_{asp.replace(':', 'x')}.ass"
+            if asp == "source":
+                name = f"{stem}{p.suffix}"
+            else:
+                name = _export_name(r["stage"], asp, p.suffix or ".mp4")
+            shutil.copy2(p, d / name); files.append(name)
+            tag = str(asp).replace(":", "x")
+            ass = run_dir / f"captions_{tag}.ass"
+            if not ass.exists() and not raw.startswith(("https://", "http://")):
+                ass = Path(raw).parent / f"captions_{tag}.ass"
             if ass.exists():
-                srt = d / (p.stem + ".srt"); srt.write_text(ass_to_srt(ass), encoding="utf-8"); files.append(srt.name)
+                srt = d / (Path(name).stem + ".srt"); srt.write_text(ass_to_srt(ass), encoding="utf-8"); files.append(srt.name)
         if (run_dir / "poster.jpg").exists():
             shutil.copy2(run_dir / "poster.jpg", d / "poster.jpg"); files.append("poster.jpg")
-        b = _brief(src.parents[2])
-        post = b.get("caption") or b.get("post_caption") or b.get("script") or ""
-        tags = b.get("hashtags") or []
-        (d / "caption.txt").write_text(post + ("\n\n" + " ".join(tags) if tags else "") + "\n", encoding="utf-8")
+        (d / "caption.txt").write_text(_caption_body(db, r, src), encoding="utf-8")
         files.append("caption.txt")
         items.append({"library_id": r["id"], "purpose": label, "job": r["job_id"], "stage": r["stage"], "version": r["version"],
                       "persona": r["persona"], "template": r["template"], "mode": r["mode"], "identity": r["identity"],

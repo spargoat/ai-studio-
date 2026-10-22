@@ -1,15 +1,16 @@
 """JSON API for the React UI. Thin layer over Runner / DB / library / export / persona. Dry runs only from the UI."""
 import contextlib, datetime as dt, hmac, io, json, os, threading, time
 from pathlib import Path
-from flask import Blueprint, abort, jsonify, request, send_file
+from flask import Blueprint, abort, jsonify, redirect, request, send_file
 from . import library, persona as P
 from .adintel import configured
 from .adintel import accounts as intel_accounts
 from .board import (BoardError, compile_board, ensure_presets, feed_artefact, job_brief, preset_intact,
                     preview_config, preview_pack)
-from .db import DatabaseBusy
-from .names import purpose_name
 from .config import connection_status, key_status, load_template
+from .db import DatabaseBusy
+from .gates import show_review
+from .names import purpose_name
 from .runner import BriefError, SpendGuardError
 
 UI_DIST = Path(__file__).resolve().parent.parent / "ui" / "dist"
@@ -119,7 +120,7 @@ def register(app, cfg, runner, live, bg):
         item["library_id"] = item.get("id")
         return item
 
-    def run_bg(jid, fn, *a):
+    def _guarded(jid, fn, a):
         with alock:
             if jid in active:
                 raise BriefError(f"{jid} is already running")
@@ -133,7 +134,29 @@ def register(app, cfg, runner, live, bg):
             finally:
                 with alock:
                     active.discard(jid)
-        bg(go)
+        return go
+
+    def run_bg(jid, fn, *a):
+        bg(_guarded(jid, fn, a))
+
+    def launch(jid, *, only=None, cascade=False):
+        """Start a job. inngest sends an event; Vercel advances one stage; otherwise a thread."""
+        from . import workflows
+        mode = workflows.executor_mode()
+        if mode == "inngest":
+            workflows.send_job(jid, only=only, cascade=cascade)
+            return None
+        if one_stage():
+            return runner.advance(jid, only=only)
+        if only is not None:
+            fn, args = runner.rerun, (jid, only, cascade)
+        else:
+            fn, args = runner.run_job, (jid,)
+        if mode == "inline":
+            _guarded(jid, fn, args)()
+            return None
+        run_bg(jid, fn, *args)
+        return None
 
     def err(msg, code=400):
         return jsonify({"error": str(msg)}), code
@@ -236,7 +259,11 @@ def register(app, cfg, runner, live, bg):
             scores[row["stage_run_id"]] = row
         stages = []
         for d in runner.stage_defs(j):
-            sc = cfg["stages"].get(d.get("uses", d["id"]), {"provider": "local", "model": "brief-resolver"})
+            key = d.get("uses", d["id"])
+            base = cfg["stages"].get(key, {"provider": "local", "model": "brief-resolver"})
+            sc = base
+            if key in cfg.get("stages", {}):
+                _prov, sc = runner.provider_for(key, job=j)
             runs = []
             for r in by_stage.get(d["id"], []):
                 m = json.loads(r["meta_json"] or "{}")
@@ -248,9 +275,11 @@ def register(app, cfg, runner, live, bg):
                                "stale": stale(r)})
             last = runs[-1] if runs else {}
             stages.append({"id": d["id"], "kind": d["kind"], "node": d.get("board_node") or d["kind"],
-                           "review": bool(d.get("review")), "needs": d.get("needs") or [],
+                           "review": bool(d.get("review")),
+                           "show_review": show_review(d["id"], d.get("review"), last.get("status"), last.get("review_status")),
+                           "needs": d.get("needs") or [],
                            "provider": last.get("provider") or sc["provider"], "model": last.get("model") or sc["model"],
-                           "default_model": sc["model"], "runs": runs})
+                           "default_model": base.get("model"), "runs": runs})
         return jsonify({"job": job_row(j) | {"brief": j["brief"]}, "stages": stages, "events": db.events(jid, 60),
                         "running": jid in active})
 
@@ -270,28 +299,45 @@ def register(app, cfg, runner, live, bg):
 
     @bp.get("/api/personas")
     def personas():
+        from .storage import allowed_redirect
         out = []
         for k, v in cfg["_personas"].items():
             refs = []
-            for i, raw in enumerate(v.get("refs") or []):
-                found = _resolve_ref(raw)
-                refs.append({"i": i, "name": Path(raw).name, "exists": found.is_file(),
-                             "placeholder": not found.is_file()})
+            for e in P.entries(v.get("refs")):
+                url = e["url"] if allowed_redirect(e.get("url") or "") else None
+                exists = bool(url) or bool(e.get("path") and Path(e["path"]).exists())
+                if not exists and e.get("path"):
+                    exists = _resolve_ref(e["path"]).is_file()
+                refs.append({"i": e["i"], "name": e["name"], "role": e["role"], "exists": exists,
+                             "url": url, "note": e.get("note"), "sha256": e.get("sha256"),
+                             "image": P.is_image(e), "placeholder": not exists})
             out.append({"id": k, "display": v.get("display") or k, "look": v.get("look"), "voice_name": v.get("voice_name"),
                         "lora": (v.get("lora") or {}).get("status"), "lock": v.get("lock") or {},
-                        "refs": refs,
+                        "identity_ref_note": v.get("identity_ref_note"), "refs": refs,
                         "missing": P.missing(v), "lock_text": P.lock_text(v, "image")})
         return jsonify(out)
 
     @bp.get("/api/personas/<pid>/ref/<int:i>")
     def ref(pid, i):
-        refs = (cfg["_personas"].get(pid) or {}).get("refs") or []
-        if i >= len(refs):
+        from .storage import allowed_redirect
+        raw_refs = (cfg["_personas"].get(pid) or {}).get("refs") or []
+        found = next((e for e in P.entries(raw_refs) if e["i"] == i), None)
+        if not found:
             abort(404)
-        found = _resolve_ref(refs[i])
-        if not found.is_file():
-            abort(404)
-        return send_file(found)
+        if allowed_redirect(found.get("url") or ""):
+            return redirect(found["url"])
+        path = found.get("path")
+        if path and Path(path).exists():
+            return send_file(path)
+        if path:
+            resolved = _resolve_ref(path)
+            if resolved.is_file():
+                return send_file(resolved)
+        if i < len(raw_refs) and isinstance(raw_refs[i], str):
+            resolved = _resolve_ref(raw_refs[i])
+            if resolved.is_file():
+                return send_file(resolved)
+        abort(404)
 
     @bp.get("/api/settings")
     def settings():
@@ -349,7 +395,8 @@ def register(app, cfg, runner, live, bg):
     # ---------- actions
     def brief_from(b):
         brief = {k: v for k, v in (b or {}).items() if v not in (None, "") and k in
-                 ("id", "persona", "template", "script", "setting", "topic", "headline", "cta", "caption", "hashtags")}
+                 ("id", "persona", "template", "script", "setting", "topic", "headline", "cta", "caption", "hashtags",
+                  "still_provider")}
         return brief
 
     @bp.post("/api/estimate")
@@ -384,8 +431,16 @@ def register(app, cfg, runner, live, bg):
             jid = runner.create_job(brief_from(body.get("brief")))
         except (BriefError, KeyError, ValueError) as e:
             return err(e)
-        if not one_stage():
-            run_bg(jid, runner.run_job, jid)
+        try:
+            from . import workflows
+            if workflows.executor_mode() == "inngest" or not one_stage():
+                launch(jid)
+        except Exception as e:
+            from .workflows import QueueError
+            if isinstance(e, QueueError):
+                db.log(jid, None, "error", f"inngest enqueue failed: {e}")
+                return err(e, 503)
+            raise
         return jsonify({"id": jid}), 201
 
     @bp.post("/api/jobs/<jid>/advance")
@@ -414,6 +469,8 @@ def register(app, cfg, runner, live, bg):
             return err("CRON_SECRET is not set", 503)
         if not hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {secret}"):
             return err("unauthorized", 401)
+        # A killed instance leaves its stage_run `running`. Recover those before picking the next three jobs.
+        reconciled = runner.reconcile()
         # failed jobs stay failed. partial here means more stages are still due, not a recorded stage error.
         # One stale job. A client that is already pumping updates the row, and a scan of
         # every open job is what held a connection until Turso reported capacity exceeded.
@@ -433,28 +490,38 @@ def register(app, cfg, runner, live, bg):
             except Exception as e:
                 out.append({"id": row["id"], "error": str(e)})
             break
-        return jsonify({"ok": True, "advanced": out})
+        return jsonify({"ok": True, "reconciled": reconciled, "advanced": out})
 
     @bp.post("/api/jobs/<jid>/resume")
     def resume(jid):
         db.job(jid) or abort(404)
         try:
-            if one_stage():
-                return jsonify(runner.advance(jid))
-            run_bg(jid, runner.run_job, jid)
+            stepped = launch(jid)
+            if stepped is not None:
+                return jsonify(stepped)
         except BriefError as e:
             return err(e, 409)
+        except Exception as e:
+            from .workflows import QueueError
+            if isinstance(e, QueueError):
+                return err(e, 503)
+            raise
         return jsonify({"ok": True})
 
     @bp.post("/api/jobs/<jid>/rerun/<stage>")
     def rerun(jid, stage):
         db.job(jid) or abort(404)
         try:
-            if one_stage():
-                return jsonify(runner.advance(jid, only=stage))
-            run_bg(jid, runner.rerun, jid, stage)
+            stepped = launch(jid, only=stage)
+            if stepped is not None:
+                return jsonify(stepped)
         except BriefError as e:
             return err(e, 409)
+        except Exception as e:
+            from .workflows import QueueError
+            if isinstance(e, QueueError):
+                return err(e, 503)
+            raise
         return jsonify({"ok": True})
 
     @bp.post("/api/jobs/<jid>/review/<stage>")
@@ -473,12 +540,18 @@ def register(app, cfg, runner, live, bg):
         if v == "approved" and jid not in active and db.job(jid)["status"] in ("awaiting_review", "partial"):
             try:
                 if one_stage():
-                    runner.db.set_job_status(jid, "partial")
-                    runner.advance(jid); resumed = True
-                else:
-                    run_bg(jid, runner.run_job, jid); resumed = True        # carry on to the next gate (dry runs only)
+                    from . import workflows
+                    if workflows.executor_mode() != "inngest":
+                        runner.db.set_job_status(jid, "partial")
+                launch(jid)
+                resumed = True
             except BriefError:
                 pass
+            except Exception as e:
+                from .workflows import QueueError
+                if not isinstance(e, QueueError):
+                    raise
+                db.log(jid, None, "error", f"inngest enqueue failed: {e}")
         return jsonify({"ok": True, "resumed": resumed, "pending": [p for p in pending_reviews() if p["job_id"] == jid]})
 
     @bp.post("/api/library/<int:lid>/promote")
@@ -509,14 +582,46 @@ def register(app, cfg, runner, live, bg):
         man, z = export(db, data_dir / "exports" / name, ids=ids, stages=None if b.get("all_stages") else ("finish", "compose"))
         if not man["count"]:
             return err("nothing to export: the selected items are not final outputs (tick 'include intermediate stages') or their files are missing")
-        return jsonify({"zip": z, "url": f"/file?p={z}", "name": Path(z).name, "size": Path(z).stat().st_size, "manifest": man})
+        from . import storage
+        zpath = Path(z)
+        url, stored = f"/file?p={z}", z
+        size = zpath.stat().st_size
+        if storage.enabled():
+            try:
+                blob = storage.put_file(f"exports/{zpath.name}", zpath.read_bytes(), "application/zip")
+            except storage.BlobError as e:
+                return err(str(e), 502)
+            url = stored = blob
+            zpath.unlink(missing_ok=True)
+            import shutil
+            shutil.rmtree(zpath.with_suffix(""), ignore_errors=True)
+        return jsonify({"zip": stored, "url": url, "name": zpath.name, "size": size, "manifest": man})
 
     @bp.get("/api/exports")
     def exports():
+        from . import storage
+        rows, seen = [], set()
+        if storage.enabled():
+            try:
+                blobs = storage.list_prefix("exports/")
+            except storage.BlobError:
+                blobs = []
+            for blob in blobs:
+                name = Path(blob.get("pathname") or "").name
+                if not name.endswith(".zip") or not blob.get("url") or name in seen:
+                    continue
+                seen.add(name)
+                at = (blob.get("uploadedAt") or "").replace("T", " ")[:16]
+                rows.append({"name": name, "url": blob["url"], "size": blob.get("size") or 0, "at": at})
         d = data_dir / "exports"
-        zs = sorted(d.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)[:20] if d.exists() else []
-        return jsonify([{"name": z.name, "url": f"/file?p={z}", "size": z.stat().st_size,
-                         "at": time.strftime("%Y-%m-%d %H:%M", time.localtime(z.stat().st_mtime))} for z in zs])
+        if d.exists():
+            for z in sorted(d.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True):
+                if z.name in seen:
+                    continue
+                seen.add(z.name)
+                rows.append({"name": z.name, "url": f"/file?p={z}", "size": z.stat().st_size,
+                             "at": time.strftime("%Y-%m-%d %H:%M", time.localtime(z.stat().st_mtime))})
+        return jsonify(rows[:20])
 
     def board_public(row, estimates=None, estimate_error=None):
         body = {"id": row["id"], "name": row["name"], "preset": row["preset"], "graph": row["graph"],

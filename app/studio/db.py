@@ -46,6 +46,9 @@ CREATE TABLE IF NOT EXISTS boards (
   id TEXT PRIMARY KEY, name TEXT, preset INTEGER DEFAULT 0, graph_json TEXT,
   last_job_id TEXT, created_at TEXT, updated_at TEXT
 );
+CREATE TABLE IF NOT EXISTS leases (
+  name TEXT PRIMARY KEY, owner TEXT, job_id TEXT, expires_at TEXT
+);
 """
 
 _lock = threading.Lock()
@@ -454,6 +457,9 @@ class DB:
                 self._attempt(lambda conn: conn.commit())
 
     def close(self):
+        # Hold the same lock as queries. A background job can still be writing
+        # when a test (or a shutdown) closes the runner; closing under the
+        # connection is what used to segfault sqlite.
         with _lock:
             if self.conn is not None:
                 self.conn.close()
@@ -672,10 +678,12 @@ class DB:
         return sum(v["effective"] for v in self.spend_summary().values())
 
     def save_score(self, run, persona, path, s):
+        passed = s.get("passed")
+        passed_i = None if passed is None else int(bool(passed))
         self.x("INSERT OR REPLACE INTO scores VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                (run["id"], run["job_id"], run["stage"], run["version"], persona, path, s.get("identity"),
                 s.get("identity_min"), s.get("identity_threshold"), s.get("identity_note"), json.dumps(s.get("visual")),
-                None, None, None, json.dumps(s.get("flags", [])), int(bool(s.get("passed"))), now()))
+                None, None, None, json.dumps(s.get("flags", [])), passed_i, now()))
         scope = self._scope
         if scope is not None:
             stored = dict(s)
@@ -733,3 +741,27 @@ class DB:
 
     def set_board_job(self, board_id, job_id):
         self.x("UPDATE boards SET last_job_id=?, updated_at=? WHERE id=?", (job_id, now(), board_id))
+
+    # --- leases (one compose at a time across instances; Turso when that is the database)
+    def acquire_lease(self, name, owner, job_id, ttl_s):
+        """Take `name` unless another owner still holds an unexpired lease. True when this owner holds it."""
+        exp = (dt.datetime.now().astimezone() + dt.timedelta(seconds=int(ttl_s))).isoformat(timespec="seconds")
+        with _lock:
+            self.conn.execute(
+                """INSERT INTO leases (name, owner, job_id, expires_at) VALUES (?,?,?,?)
+                   ON CONFLICT(name) DO UPDATE SET
+                     owner=excluded.owner, job_id=excluded.job_id, expires_at=excluded.expires_at
+                   WHERE leases.expires_at <= ? OR leases.owner = excluded.owner""",
+                (name, owner, job_id, exp, now()))
+            self.conn.commit()
+            row = self.conn.execute("SELECT owner FROM leases WHERE name=?", (name,)).fetchone()
+        if row is None:
+            return False
+        got = row["owner"] if not isinstance(row, tuple) else row[0]
+        return got == owner
+
+    def lease(self, name):
+        return self.one("SELECT * FROM leases WHERE name=?", (name,))
+
+    def release_lease(self, name, owner):
+        self.x("DELETE FROM leases WHERE name=? AND owner=?", (name, owner))

@@ -4,6 +4,7 @@
 - optional text overlays [{text, start, end, pos: top|center|bottom}]
 - optional music bed, side-chain ducked under the voice
 - exports per aspect (9:16, 1:1, 16:9), cropped around the detected face or padded (solid colour, no blur)."""
+import gc
 import os
 import re
 import subprocess
@@ -51,8 +52,9 @@ def spread(text, start, end):
 def speech_span(media, noise_db=-35, min_sil=0.25):
     """(start, end) of speech in the audio track via silencedetect. Local, no models."""
     from .assets import ffmpeg_bin
-    r = subprocess.run([ffmpeg_bin("ffmpeg"), "-i", str(media), "-af", f"silencedetect=n={noise_db}dB:d={min_sil}", "-f", "null", "-"],
-                       capture_output=True, text=True)
+    r = subprocess.run([ffmpeg_bin("ffmpeg"), "-threads", "1", "-i", str(media),
+                        "-af", f"silencedetect=n={noise_db}dB:d={min_sil}", "-f", "null", "-"],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
     d = duration(media) or 0
     starts = [float(x) for x in re.findall(r"silence_start: ([\d.]+)", r.stderr)]
     ends = [float(x) for x in re.findall(r"silence_end: ([\d.]+)", r.stderr)]
@@ -242,10 +244,11 @@ def compose(src, out_dir, params, script=None, fast=False):
         vf += overlay_filters(params.get("overlays"), tw, th, fontfile)
         if is_img:
             out = out_dir / f"compose_{tag}.png"
-            ff(["-i", str(src), "-vf", ",".join(vf), "-frames:v", "1", str(out)])
+            ff(["-threads", "1", "-i", str(src), "-filter_threads", "1", "-vf", ",".join(vf),
+                "-frames:v", "1", str(out)])
             return asp, str(out)
         out = out_dir / f"compose_{tag}.mp4"
-        args = ["-i", str(src)]
+        args = ["-threads", "1", "-i", str(src)]
         if music.get("path"):
             vol = music.get("volume", 0.18)
             args += ["-stream_loop", "-1", "-i", music["path"]]
@@ -257,16 +260,22 @@ def compose(src, out_dir, params, script=None, fast=False):
             args += ["-filter_complex", f"[0:v]{','.join(vf)}[vo];{af}", "-map", "[vo]", "-map", "[a]"]
         else:
             args += ["-vf", ",".join(vf), "-map", "0:v", "-map", "0:a?"]
-        args += ["-c:v", "libx264", "-crf", "20", "-preset", os.environ.get("STUDIO_FFMPEG_PRESET", "medium"),
+        # One thread and a short lookahead. Three parallel libx264 encodes exhausted the 2 GB instance.
+        args += ["-threads", "1", "-filter_threads", "1", "-filter_complex_threads", "1",
+                 "-max_muxing_queue_size", "128",
+                 "-c:v", "libx264", "-crf", "20", "-preset", os.environ.get("STUDIO_FFMPEG_PRESET", "medium"),
+                 "-x264-params", "threads=1:sync-lookahead=0",
                  "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "160k", "-shortest", "-movflags", "+faststart", str(out)]
         ff(args, timeout=900)
         return asp, str(out)
-    from concurrent.futures import ThreadPoolExecutor
     fmts = params.get("formats", ["9:16", "1:1", "16:9"])
     if fast and os.environ.get("STUDIO_COMPOSE_ALL") != "1":
-        fmts = fmts[:1]                       # dry run: one aspect; STUDIO_COMPOSE_ALL=1 or STUDIO_MOCK_FAST=0 = full
-    with ThreadPoolExecutor(max_workers=len(fmts) or 1) as ex:      # aspects encode in parallel
-        exports = dict(ex.map(one, fmts))
+        fmts = fmts[:1]                       # one aspect; STUDIO_COMPOSE_ALL=1 or STUDIO_MOCK_FAST=0 = full
+    exports = {}
+    for asp in fmts:
+        key, path = one(asp)
+        exports[key] = path
+        gc.collect()                          # drop the last encode's buffers before the next aspect
     return {"exports": exports, "words": len(words), "face_center": center, "source": str(src),
             "caption_source": ("elevenlabs alignment" if words and params.get("_alignment") and cap.get("use_alignment", True)
                                else "vtt" if cap.get("vtt") else "script"), "music": music.get("path")}

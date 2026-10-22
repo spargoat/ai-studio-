@@ -24,7 +24,7 @@ def add(db, run, reason):
             scores_json=excluded.scores_json, reason=excluded.reason""",
          (run["id"], run["job_id"], run["stage"], run["version"], j["persona"], j["template"], run["mode"],
           run["prompt"], run["output_path"], sc and sc["identity"], sc and sc["passed"],
-          json.dumps({k: sc[k] for k in ("identity", "identity_threshold", "visual", "flags", "copy", "brand", "engagement")}) if sc else None,
+          json.dumps({k: sc[k] for k in ("identity", "identity_note", "identity_threshold", "visual", "flags", "copy", "brand", "engagement")}) if sc else None,
           reason, now()))
 
 
@@ -93,7 +93,15 @@ def promote(db, ref, note=""):
 
 
 def fmt(r):
-    idt = "n/a" if r["identity"] is None else f"{r['identity']:.3f}"
+    note = ""
+    try:
+        note = (json.loads(r.get("scores_json") or "{}") or {}).get("identity_note") or ""
+    except (TypeError, ValueError):
+        note = ""
+    if note == "dry run, self-reference":
+        idt = note
+    else:
+        idt = "n/a" if r["identity"] is None else f"{r['identity']:.3f}"
     return (f"#{r['id']:<4} {'*' if r['promoted'] else ' '} {r['persona']:7} {r['template']:14} {r['job_id']}/{r['stage']} v{r['version']} "
             f"[{r['mode']}] id {idt} {'PASS' if r['passed'] else 'FLAG' if r['passed'] is not None else '-'}  {r['path']}"
             + (f"\n       prompt: {r['prompt'][:140]}" if r["prompt"] else ""))

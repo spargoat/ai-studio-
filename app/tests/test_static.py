@@ -16,6 +16,8 @@ class T(unittest.TestCase):
         refs = stage_static.stage(ROOT / "app" / "ui" / "dist", public)
         self.assertTrue(any(ref.startswith("/assets/index-") and ref.endswith(".js") for ref in refs), refs)
         self.assertTrue(any(ref.startswith("/assets/index-") and ref.endswith(".css") for ref in refs), refs)
+        built = " ".join(p.read_text(errors="ignore") for p in (ROOT / "app" / "ui" / "dist" / "assets").glob("*.js"))
+        self.assertIn("dry run, self-reference", built)
         for ref in refs:
             copied = public / ref.lstrip("/")
             self.assertTrue(copied.is_file(), ref)

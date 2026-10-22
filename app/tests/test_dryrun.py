@@ -5,7 +5,8 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("STUDIO_MOCK_FAST", "1")          # small placeholder renders: same code paths, ~10x faster
 os.environ.setdefault("STUDIO_FFMPEG_PRESET", "ultrafast")
-for k in ("FAL_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS"):
+for k in ("FAL_KEY", "ELEVENLABS_API_KEY", "ELEVENLABS",
+          "HIGGSFIELD_API_KEY", "HIGGSFIELD_API_SECRET", "HF_KEY", "HF_API_KEY", "HF_API_SECRET"):
     os.environ.pop(k, None)
 from studio.config import load_config
 from studio.runner import Runner, SpendGuardError
@@ -111,10 +112,16 @@ class T(unittest.TestCase):
             r.db.add_attempt(job_id="t-lock", stage="still", attempt=1, mode="live", provider="fal", status="failed",
                              error='fal 403: {"detail":"User is locked. Reason: Exhausted balance."}',
                              est_cost_usd=0.05, actual_cost_usd=0.0, started_at="2099-01-01T00:00:00+00:00")
-            with self.assertRaises(SpendGuardError):
+            Runner(c, live=True, log=lambda m: None)            # priced higgsfield fallback: live allowed, no call made
+            saved = {k: c["prices"][k]["usd_per_unit"] for k in ("hf_image", "hf_video", "hf_lipsync")}
+            for k in saved:
+                c["prices"][k]["usd_per_unit"] = 0
+            with self.assertRaises(SpendGuardError):            # unpriced fallback: still refused
                 Runner(c, live=True, log=lambda m: None)
             os.environ["STUDIO_FAL_TOPPED_UP"] = "1"
             Runner(c, live=True, log=lambda m: None)            # acknowledged top-up: preflight passes, no call made
+            for k, v in saved.items():
+                c["prices"][k]["usd_per_unit"] = v
         finally:
             for k in ("FAL_KEY", "ELEVENLABS_API_KEY", "STUDIO_FAL_TOPPED_UP"): os.environ.pop(k, None)
 
@@ -261,7 +268,9 @@ class T(unittest.TestCase):
         os.environ.pop("STUDIO_FAL_TOPPED_UP", None)
         try:
             c = cfg(); c["budget"] = {"global_cap_usd": 75, "per_job_cap_usd": 15}
-            # TMP db holds the fal lock row from test_7; unpriced fallback -> still refused
+            # TMP db holds the fal lock row from test_7. Zero the guard rates: unpriced fallback is refused.
+            for k in ("hf_image", "hf_video", "hf_lipsync"):
+                c["prices"][k]["usd_per_unit"] = 0
             with self.assertRaises(SpendGuardError):
                 Runner(c, live=True, log=lambda m: None)
             for k in ("hf_image", "hf_video", "hf_lipsync"):
@@ -277,7 +286,8 @@ class T(unittest.TestCase):
             self.assertEqual(res["meta"]["provider"], "higgsfield"); self.assertEqual(calls[0][0], "image")
             self.assertIsNone(Runner(cfg(), log=lambda m: None).fallback_route("still", cfg()["stages"]["still"]))  # dry-run: never
         finally:
-            higgsfield.HiggsfieldProvider.transport = staticmethod(higgsfield._no_transport)
+            higgsfield.HiggsfieldProvider.transport = staticmethod(higgsfield._sdk_transport)
+            higgsfield.HiggsfieldProvider.client_factory = None
             for k in ("FAL_KEY", "ELEVENLABS_API_KEY"): os.environ.pop(k, None)
 
     def test_a7_alignment_captions_and_overlay(self):
@@ -325,7 +335,12 @@ class T(unittest.TestCase):
         it = [i for i in man["items"] if "files" in i]
         self.assertEqual([i["stage"] for i in it], ["compose"])                    # compose supersedes finish
         f = it[0]["files"]
-        self.assertIn("caption.txt", f); self.assertTrue(any(x.endswith(".mp4") for x in f))
+        self.assertIn("caption.txt", f)
+        self.assertIn("compose_9x16.mp4", f)
+        folder = out / it[0]["folder"]
+        caption = (folder / "caption.txt").read_text()
+        self.assertGreater(len(caption.strip()), 1)
+        self.assertIn("Decide your stop", caption)
         self.assertTrue(Path(z).exists() and json.loads((out / "manifest.json").read_text())["count"] == 1)
         self.assertEqual(export(r.db, Path(tempfile.mkdtemp()) / "b", job="t-e2e", live_only=True)[0]["count"], 0)
         a = Path(tempfile.mkdtemp()) / "c.ass"

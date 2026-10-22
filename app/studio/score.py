@@ -27,7 +27,36 @@ def available():
         _cv()
         return True
     except ImportError:
+        pass
+    try:
+        from . import score_onnx
+        return score_onnx.available()
+    except Exception:
         return False
+
+
+DRY_RUN_IDENTITY = "dry run, self-reference"
+
+
+def mark_dry_still(score):
+    """A dry-run still is painted from the persona's own reference, so the cosine is not a match."""
+    flags = [f for f in (score.get("flags") or []) if not str(f).startswith("identity")]
+    return {**score, "identity": None, "identity_min": None, "identity_note": DRY_RUN_IDENTITY,
+            "flags": flags, "passed": False if flags else None}
+
+
+def unscored(cfg, reason, visual=None, flags=None):
+    """A stored score for a file we could not measure. The UI says 'not scored'."""
+    q = (cfg or {}).get("quality") or {} if isinstance(cfg, dict) else {}
+    thr = float(q.get("identity_threshold", 0.45))
+    note = reason if str(reason).startswith("not scored") else f"not scored: {reason}"
+    flags = list(flags or [])
+    passed = None if visual is None and not flags else (False if flags else None)
+    return {"identity": None, "identity_min": None, "identity_note": note, "identity_threshold": thr,
+            "visual": visual, "flags": flags, "passed": passed,
+            **{k: None for k in NOT_SCORED},
+            "not_scored": {"identity": "not scored", "visual": "not scored" if visual is None else None,
+                           **{k: "not scored: needs an LLM key" for k in NOT_SCORED}}}
 
 def _models():
     from .assets import model_dir
@@ -58,7 +87,12 @@ def _recog():
 
 def embed(img):
     """(embedding, face_box_in_original_px) of the largest face, or (None, None)."""
-    cv2, _np = _cv()
+    try:
+        cv2, _np = _cv()
+    except ImportError:
+        from . import score_onnx
+        rgb = img[:, :, ::-1] if getattr(img, "ndim", 0) == 3 else img
+        return score_onnx.embed_rgb(rgb)
     h, w = img.shape[:2]
     s = min(1.0, 1280 / max(h, w))
     im = cv2.resize(img, (int(w * s), int(h * s))) if s < 1 else img
@@ -70,9 +104,28 @@ def embed(img):
 
 
 def ref_paths(cfg, persona):
+    """Local identity images when a refs/<persona> directory exists, else face-lock Blob refs.
+
+    The directory keeps the offline quality-gate test on the checked-in Maksim
+    photos. Outfit, character, detail, handwriting and backstory are not
+    identity refs. face_sheet_secondary is included only after an identity ref,
+    never as the primary face.
+    """
     d = APP_DIR / "refs" / persona
     ps = sorted(p for p in d.glob("*") if p.suffix.lower() in IMG) if d.is_dir() else []
-    return [str(p) for p in ps] or [p for p in (cfg["_personas"].get(persona, {}).get("refs") or []) if Path(p).exists()]
+    if ps:
+        return [str(p) for p in ps]
+    from .persona import face_lock_entries, materialize
+    out = []
+    raw = (cfg.get("_personas") or {}).get(persona, {}).get("refs") or []
+    for entry in face_lock_entries(raw):
+        try:
+            path = materialize(entry)
+        except Exception:
+            continue
+        if path and Path(path).exists() and str(path).lower().endswith(IMG):
+            out.append(str(path))
+    return out
 
 
 def ref_embeddings(cfg, persona):
@@ -89,7 +142,14 @@ def ref_embeddings(cfg, persona):
 
 
 def frames(path, n=5):
-    cv2, _np = _cv()
+    try:
+        cv2, _np = _cv()
+    except ImportError:
+        from .storage import is_url, local
+        from . import score_onnx
+        if is_url(str(path)):
+            path = local(path)
+        return score_onnx.frames(path, n)
     if path.lower().endswith(IMG):
         img = cv2.imread(path)
         return [img] if img is not None else []
@@ -138,9 +198,16 @@ def visual_flags(v, q, stage=None):
 
 
 def score_file(cfg, persona, path, n_frames=5, stage=None):
-    cv2, np = _cv()
-    from .storage import local
-    path = local(path)
+    from .storage import is_url, local
+    if is_url(str(path)):
+        path = local(path)
+    try:
+        cv2, np = _cv()
+    except ImportError:
+        from . import score_onnx
+        if score_onnx.available():
+            return score_onnx.score_file(cfg, persona, path, n_frames, stage)
+        return unscored(cfg, "face scoring runtime is not installed")
     q = cfg.get("quality") or {}
     thr = float(q.get("identity_threshold", 0.45))
     frs = frames(path, n_frames)

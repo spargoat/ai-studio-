@@ -1,7 +1,6 @@
 # AI Studio
 
 Talking-head stage runner (Flask) and React UI, hosted on Vercel behind a shared password.
-The engine and the UI are unchanged: Python serves `/api`, and the Vite build in `app/ui/dist` is static.
 
 Source lives in [`app/`](app/). Engine commands and templates are in [app/README.md](app/README.md).
 
@@ -9,55 +8,51 @@ Source lives in [`app/`](app/). Engine commands and templates are in [app/README
 
 | Piece | Where |
 | --- | --- |
-| API, login, `/file`, classic pages | Flask app `app/wsgi.py` (one Python function) |
-| Hashed UI assets | `public/assets`, copied from `app/ui/dist` at build. Vercel serves that directory before the function, so `/assets/*` does not go through Flask or the password gate. Flask also serves `app/ui/dist/assets` if a request still reaches it. The build fails when `index.html` references a file that was not copied |
-| Jobs database | Turso/libSQL when `TURSO_DATABASE_URL` is set. Local SQLite otherwise. On Vercel, with no URL and without `STUDIO_SQLITE=1`, the app does not open `/tmp` SQLite: app and `/api` routes return 503 `Database not configured`, and `/api/cron/advance` does not write |
-| Job files | Vercel Blob when `BLOB_READ_WRITE_TOKEN` is set. Uploads are `PUT https://vercel.com/api/blob/?pathname=` with `x-api-version: 13`, the store id from the token, `x-content-type`, `x-add-random-suffix: 0`, and `x-allow-overwrite: 1` (the `@vercel/blob` 2.8.2 protocol). A rejected upload is logged with the response body, the stage run and the job are marked `failed`, and advance returns that error in JSON. A stage pulls inputs into `/tmp`, runs, uploads outputs, and stores the Blob URL. `/file` redirects only to `*.blob.vercel-storage.com` |
-| Progress | `POST /api/jobs/<id>/advance` runs one stage, or one fal queue poll. Cron `GET /api/cron/advance` moves jobs in `created`, `running`, or `partial`. A stage that failed or hit the spend guard marks the job `failed`; further advance and cron calls return that error and do not start another version. Re-run is the explicit retry |
-| Captions | DejaVu Sans and DejaVu Sans Bold in `app/fonts` (Bitstream Vera license, see `app/fonts/LICENSE`). drawtext gets `fontfile=`; libass captions get `fontsdir` pointing at that directory. A template `fonts_dir` is used only when that directory exists |
-| Face score | Optional. Local installs use `pip install '.[score]'` (numpy + opencv-python-headless). The request function does not include them. YuNet + SFace (`yunet.onnx`, `sface.onnx`) download into `/tmp` on first score, from Blob `runtime/<name>` when that object exists, otherwise from the [OpenCV model zoo](https://github.com/opencv/opencv_zoo), then the bytes are stored in Blob |
-| ffmpeg | Not in the bundle. On Vercel, the first compose/finish downloads a static Linux build into `/tmp` (Blob `runtime/ffmpeg-linux64.tar.xz` when present, otherwise the BtbN release) and unpacks `ffmpeg` and `ffprobe` |
+| API, login, `/file`, classic pages, `/api/inngest` | Flask app `app/wsgi.py` (one Python function) |
+| Hashed UI assets | `public/assets`, copied from `app/ui/dist` at build. Vercel serves that directory before the function. Flask also serves `app/ui/dist/assets` if a request still reaches it |
+| Jobs database | Turso/libSQL when `TURSO_DATABASE_URL` is set. Local SQLite otherwise. On Vercel, with no URL and without `STUDIO_SQLITE=1`, routes return 503 `Database not configured` except `/healthz`, `/assets/*`, and `/api/inngest` |
+| Job files | Vercel Blob when `BLOB_READ_WRITE_TOKEN` is set. A stage pulls inputs into `/tmp`, runs, uploads outputs, and stores the Blob URL |
+| Job execution | `STUDIO_EXECUTOR=inngest` sends `studio/job.run`. Inngest calls `/api/inngest`, which is not behind the studio password (Inngest signs the request). Without that flag, Vercel runs one stage per `POST /api/jobs/<id>/advance` or cron `GET /api/cron/advance` |
+| ffmpeg and face models | Not in the function bundle. On first use they download into `/tmp` (`/tmp/studio-bin`, `/tmp/studio-models`), from Blob `runtime/<name>` when that object exists, otherwise from the public source URL |
 
-Live runs from the app return **409** unless `STUDIO_ALLOW_LIVE=1`. Dry runs stay the default.
-
-Vercel project root is this repository (not `app/`). Build command is in `vercel.json`.
+Vercel project root is this repository (not `app/`). Build command is in `vercel.json`. It builds the UI and copies hashed assets. It does not download ffmpeg or the face models.
 
 ## Environment variables
 
-Set these in the Vercel project. Never commit values. Names only:
+Set these in the Vercel project. Never commit values.
 
 ### Required to boot the hosted app
 
 | Name | Purpose |
 | --- | --- |
-| `STUDIO_APP_PASSWORD` | Shared password (`studio/auth.py`) |
+| `STUDIO_APP_PASSWORD` | Shared password |
 | `STUDIO_SESSION_SECRET` | HMAC secret for the session cookie |
 | `STUDIO_REQUIRE_AUTH` | Set to `1` so the app fails closed when the password or secret is missing |
 | `TURSO_DATABASE_URL` | libSQL URL (`libsql://...`). `LIBSQL_URL` is accepted as an alias |
 | `TURSO_AUTH_TOKEN` | Turso token. `LIBSQL_AUTH_TOKEN` is accepted as an alias |
 | `BLOB_READ_WRITE_TOKEN` | Vercel Blob read/write token |
-| `CRON_SECRET` | Bearer token Vercel sends to `/api/cron/advance`. The route rejects calls without it |
+| `CRON_SECRET` | Bearer token Vercel sends to `/api/cron/advance` |
+| `INNGEST_EVENT_KEY` | Sends `studio/job.run` when `STUDIO_EXECUTOR=inngest`. The Inngest Vercel integration writes this |
+| `INNGEST_SIGNING_KEY` | Verifies Inngest's calls to `/api/inngest`. The integration writes this |
+| `STUDIO_EXECUTOR` | Set to `inngest` so creates, resumes, and reruns send an event instead of a thread |
 
 ### Required only for live provider calls
-
-Leave unset until a live run is intended. Caps in `app/config/config.yaml` still apply.
 
 | Name | Purpose |
 | --- | --- |
 | `STUDIO_ALLOW_LIVE` | Set to `1` or the API keeps returning 409 for live jobs |
+| `STUDIO_LIVE` | Set to `1` to construct the process runner in live mode |
 | `FAL_KEY` | fal.ai |
-| `ELEVENLABS_API_KEY` | ElevenLabs (`ELEVENLABS` is an alias) |
-| `ANTHROPIC_API_KEY` | Optional LLM stages. `OPENAI_API_KEY` is the other accepted name |
-| `HIGGSFIELD_API_KEY` | Optional fallback provider |
+| `ELEVENLABS_API_KEY` | ElevenLabs |
+| `HIGGSFIELD_API_KEY` | Higgsfield fallback. `HIGGSFIELD_API_SECRET` or `HF_KEY` also work |
 | `STUDIO_FAL_TOPPED_UP` | Set to `1` after topping up a locked fal account |
 
 ### Optional
 
 | Name | Purpose |
 | --- | --- |
-| `STUDIO_COOKIE_SECURE` | Set to `1` to mark the cookie Secure even when the proxy header is absent. HTTPS on Vercel sets this from `X-Forwarded-Proto` |
-| `VERCEL_SUPPORT_LARGE_FUNCTIONS` | Set to `1` only if the Python bundle exceeds the 500 MB standard limit |
-| `STUDIO_SQLITE` | Set to `1` to force the local SQLite file. On Vercel this is a testing override: without it, a missing Turso URL is a 503, not an ephemeral database. Also forces SQLite when a Turso URL is present |
+| `INNGEST_DEV` | Set to `1` locally to use the Inngest Dev Server. Leave unset on Vercel |
+| `STUDIO_SQLITE` | Set to `1` to force the local SQLite file on Vercel |
 | `STUDIO_FETCH_FFMPEG` | Set to `1` to download the static ffmpeg outside Vercel. On Vercel this happens when `VERCEL=1` |
 | `ADINTEL_API_URL` | Ads-tracker origin, or its `/api/board` base. With `ADINTEL_API_SECRET`, Intel nodes call `/api/board/ads`, `/api/board/ads/:id`, `/api/board/advertisers`, `/api/board/funnels` and `/api/board/funnels/:id/route`. If either is unset, the board uses a labelled fixture and does not present it as live |
 | `ADINTEL_API_SECRET` | Shared server-side secret for those reads. Sent in `x-adintel-secret`, never returned to the browser |
@@ -66,33 +61,24 @@ The board loads 40 ads per page by default, up to the tracker's 200-ad limit. Fu
 
 Use **New** to start a blank board or **Copy** to branch an existing one. The palette has operating maps, funnel strategies and asset workflows, including the FX Farm acquisition-to-retention map and a VSL kit. The FX Farm kit follows the dated `TWF Excalidraw acquisition-engine build spec` in Aaron's resource library; it has not been rechecked against the private live Excalidraw scene. The asset workflow kits include runnable Brief, Script, Voiceover, Image and Video nodes where supported. Dry runs use mock outputs and charge $0. The planning cards for lip-sync, distribution, payment, CRM and publication do not call providers or publish a funnel. Live generation requires configured providers and a separate approved run.
 
-`VERCEL` is set by the platform. Do not copy it into a local `.env`.
+## Bundle
+
+The Python builder packs the function to about 225 MB uncompressed (`LAMBDA_SIZE_EXCEEDED` at 236.69 MB when ffmpeg and the face models were copied into `app/bin` and `app/models` during the build). Those files are excluded (`app/models/**`, `app/bin/**`) and fetched at runtime. opencv-python-headless is not a request-function dependency. Identity scoring uses onnxruntime when OpenCV is absent.
+
+`python3 scripts/measure_bundle.py` reprints the uncompressed size. On Python 3.12 that measurement is **167.7 MB** including the built UI (onnxruntime 61.5 MB, numpy about 54 MB, libsql 12.4 MB, Pillow about 19 MB). The script exits non-zero above 180 MB.
 
 ## Local checks
 
 ```bash
-# from the repository root; the score extra is local only
 pip install -r requirements.txt '.[score]'
+cd app/ui && npm ci && npm run build && cd ../..
 cd app
-python3 -m unittest tests.test_dryrun tests.test_storage tests.test_advance tests.test_assets tests.test_static tests.test_fonts
+python3 -m unittest tests.test_dryrun tests.test_workflows tests.test_higgsfield tests.test_still_provider tests.test_storage tests.test_advance tests.test_assets tests.test_static tests.test_fonts tests.test_refs tests.test_tmp
 ```
 
-Dry-run tests use a throwaway SQLite file and mock providers. They do not call fal or ElevenLabs. The `score` extra is what the quality-gate tests import; it is not installed into the Vercel function.
+## Dashboard
 
-## What Aaron still does in the dashboard
-
-1. Import this repo into Vercel team **twf-jordan**, project **ai-studio**. Framework: Flask. Root directory: the repository root.
-2. From the Marketplace, add **Turso** and **Vercel Blob** on that project so the env vars above are created. Do not paste secrets into git.
-3. Set `STUDIO_APP_PASSWORD`, `STUDIO_SESSION_SECRET`, `STUDIO_REQUIRE_AUTH=1`, and `CRON_SECRET`.
-4. Leave `STUDIO_ALLOW_LIVE` unset until a paid run is deliberate.
-5. Cron is `* * * * *` (every minute). That schedule needs a Pro plan; Hobby crons run at most once a day. Do not promote the deployment to production from this change.
-
-## Limits
-
-- One Python function. Default max duration is **300 seconds** (Hobby maximum). A single stage that runs longer than that, usually compose/finish on a long clip, returns 504. Pro can raise `maxDuration` up to 800s in `vercel.json`.
-- Request bodies are capped at **4.5 MB**. Job media is uploaded to Blob, not through the function body.
-- This project's Python builder packs the function to about **225 MB** uncompressed (`LAMBDA_SIZE_EXCEEDED` at 236.69 MB, 405.79 MB before that pack). opencv-python-headless and numpy are not dependencies of the request function. Face models and ffmpeg are fetched into `/tmp` at runtime, and `excludeFiles` drops tests, UI source, `node_modules`, screenshots, and `app/models`. The hashed UI files stay in the function (`includeFiles`: `app/ui/dist/**`) so Flask can serve them, and the same bytes are copied to `public/assets` for the CDN. `python3 scripts/measure_bundle.py` reprints that uncompressed size (pip wheels plus the project files the builder would zip). Measured on Python 3.12: **22.0 MB** (19.4 MB of wheels, 2.5 MB of source, including the Vite assets and the DejaVu faces). The builder also adds its small runtime shim; that is not in the 22.0 MB.
-- On Vercel, identity and visual scores are not computed, and compose framing uses the geometric center instead of a detected face. The stage still finishes; the quality gate only flags, it does not block. Locally, with the `score` extra installed, scoring and face framing are unchanged.
-- The first compose or finish on a cold instance downloads the ffmpeg archive (about 150 MB) before it encodes. Later requests on that instance reuse `/tmp`. A new instance downloads again, from Blob when `runtime/ffmpeg-linux64.tar.xz` was stored.
-- fal generations do not block the request. Advance submits, stores the request id, and the next advance or the cron polls once.
-- Blob objects are public unguessable URLs so `<img>` and `<video>` can load them after `/file` redirects. The password gates the app and the `/file` route, not a URL someone already has. The same store holds the runtime ffmpeg and model cache under `runtime/`.
+1. Project **balconyvulcan**, team **twf-jordan**. Framework preset Flask. Root directory: the repository root (clear a root of `app` if one is set).
+2. From the Marketplace, add Turso, Vercel Blob, and the Inngest integration.
+3. Set `STUDIO_APP_PASSWORD`, `STUDIO_SESSION_SECRET`, `STUDIO_REQUIRE_AUTH=1`, `CRON_SECRET`, and `STUDIO_EXECUTOR=inngest`.
+4. Cron `* * * * *` needs a Pro plan. Hobby crons run at most once a day.

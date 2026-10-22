@@ -12,6 +12,7 @@ import hashlib
 import logging
 import mimetypes
 import os
+import shutil
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -48,6 +49,145 @@ def cache_dir():
     return p
 
 
+# Persona sheets above this size are the outfit and handwriting refs. No stage
+# downloads them; a warm instance that already did can drop them.
+LARGE_CACHE_BYTES = 12_000_000
+
+
+class NoSpace(OSError):
+    """Errno 28 with the free space that was left, so a failed stage log shows it."""
+
+    def __init__(self, path=None):
+        free = tmp_free()
+        super().__init__(28, f"No space left on device; tmp free {free} bytes", str(path or "/tmp"))
+
+
+def _budget():
+    raw = os.environ.get("STUDIO_TMP_BUDGET")
+    if not raw:
+        return None
+    return int(raw)
+
+
+def _accounted_dirs():
+    """Directories a simulated budget counts. Real runs use disk_usage('/tmp') instead."""
+    dirs = [cache_dir()]
+    for key in ("STUDIO_MODEL_DIR", "STUDIO_FFMPEG_DIR"):
+        value = os.environ.get(key)
+        if value:
+            dirs.append(Path(value))
+    return dirs
+
+
+def _used_bytes():
+    total, seen = 0, set()
+    for directory in _accounted_dirs():
+        try:
+            resolved = directory.resolve()
+        except OSError:
+            continue
+        if resolved in seen or not directory.exists():
+            continue
+        seen.add(resolved)
+        for path in directory.rglob("*"):
+            if not path.is_file():
+                continue
+            try:
+                total += path.stat().st_size
+            except OSError:
+                pass
+    return total
+
+
+def tmp_free():
+    """Bytes still available for scratch. A STUDIO_TMP_BUDGET replaces the real disk."""
+    limit = _budget()
+    if limit is not None:
+        return max(0, limit - _used_bytes())
+    path = "/tmp" if Path("/tmp").is_dir() else cache_dir()
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return 0
+
+
+def space_note(message):
+    text = str(message)
+    if "tmp free " in text:
+        return text
+    return f"{text}; tmp free {tmp_free()} bytes"
+
+
+def ensure_space(n, path=None):
+    """Refuse a scratch write that would pass a simulated budget. Real disks raise on write."""
+    limit = _budget()
+    if limit is None or n <= 0:
+        return
+    if _used_bytes() + n > limit:
+        raise NoSpace(path)
+
+
+def release_local(path):
+    """Delete a file this process downloaded into the Blob cache. Leaves other paths alone."""
+    if not path:
+        return
+    target = Path(path)
+    try:
+        root = cache_dir().resolve()
+        resolved = target.resolve()
+    except OSError:
+        return
+    if resolved == root or root not in resolved.parents:
+        return
+    target.unlink(missing_ok=True)
+
+
+def _get(http, url, timeout):
+    try:
+        return http.get(url, timeout=timeout, stream=True)
+    except TypeError:
+        return http.get(url, timeout=timeout)
+
+
+def _iter_bytes(res):
+    iterator = getattr(res, "iter_content", None)
+    if callable(iterator):
+        try:
+            yield from iterator(1 << 20)
+            return
+        except TypeError:
+            pass
+    data = getattr(res, "content", b"") or b""
+    if data:
+        yield data
+
+
+def _write_stream(res, dest):
+    """Stream a response to dest. A partial file is removed if the write fails."""
+    dest = Path(dest)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    digest = hashlib.sha256()
+    try:
+        with tmp.open("wb") as out:
+            for chunk in _iter_bytes(res):
+                if not chunk:
+                    continue
+                ensure_space(len(chunk), dest)
+                digest.update(chunk)
+                out.write(chunk)
+        tmp.replace(dest)
+    except OSError as e:
+        tmp.unlink(missing_ok=True)
+        if getattr(e, "errno", None) == 28 and not isinstance(e, NoSpace):
+            raise NoSpace(dest) from e
+        raise
+    except Exception:
+        tmp.unlink(missing_ok=True)
+        raise
+    return digest.hexdigest()
+
+
 def is_url(path):
     return isinstance(path, str) and path.startswith(("https://", "http://"))
 
@@ -60,19 +200,34 @@ def allowed_redirect(url):
     return host == "blob.vercel-storage.com" or host.endswith(".blob.vercel-storage.com")
 
 
-def local(path, getter=None):
-    """Filesystem path for a stored output. Blob URLs are downloaded under /tmp."""
+def _sha256(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def local(path, getter=None, sha256=None):
+    """Filesystem path for a stored output. Blob URLs are downloaded under /tmp.
+
+    The cache key is the content sha256 when the caller knows it, otherwise
+    the sha256 of the URL. A cached file whose bytes do not match sha256 is
+    discarded and fetched again.
+    """
     if not path or not is_url(str(path)):
         return path
     url = str(path)
     suffix = Path(urlparse(url).path).suffix
-    dest = cache_dir() / (hashlib.sha256(url.encode()).hexdigest() + suffix)
+    key = sha256 or hashlib.sha256(url.encode()).hexdigest()
+    dest = cache_dir() / (key + suffix)
     if dest.exists() and dest.stat().st_size > 0:
-        return str(dest)
+        if not sha256 or _sha256(dest.read_bytes()) == sha256:
+            return str(dest)
+        dest.unlink()
     http = getter or requests
-    res = http.get(url, timeout=120)
+    res = _get(http, url, 120)
     res.raise_for_status()
-    dest.write_bytes(res.content)
+    digest = _write_stream(res, dest)
+    if sha256 and digest != sha256:
+        dest.unlink(missing_ok=True)
+        raise BlobError(f"Blob download sha256 mismatch for {url}")
     return str(dest)
 
 
@@ -116,6 +271,16 @@ def _check(res, action):
         raise BlobError(message) from e
 
 
+def list_prefix(prefix, session=None):
+    """Blob objects whose pathname starts with prefix. Empty when Blob is off."""
+    if not enabled() or not prefix:
+        return []
+    http = session or requests
+    res = http.get(BLOB_PUT, params={"prefix": prefix, "limit": "100"}, headers=_headers(), timeout=60)
+    _check(res, "list")
+    return (res.json() or {}).get("blobs") or []
+
+
 def blob_url(pathname, session=None):
     """Public URL of an existing Blob object with this exact pathname, or None."""
     if not enabled() or not pathname:
@@ -134,16 +299,18 @@ def blob_url(pathname, session=None):
 
 
 def download(url, dest, session=None):
-    """Write a URL to dest. Used for Blob cache hits and public runtime assets."""
+    """Stream a URL to dest. Used for Blob cache hits and public runtime assets."""
     http = session or requests
-    res = http.get(url, timeout=300)
+    res = _get(http, url, 300)
     res.raise_for_status()
-    dest = Path(dest)
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dest.with_suffix(dest.suffix + ".part")
-    tmp.write_bytes(res.content)
-    tmp.replace(dest)
-    return dest
+    _write_stream(res, dest)
+    return Path(dest)
+
+
+def put_path(pathname, path, content_type, session=None):
+    """Upload a file without reading it all into memory first."""
+    with open(path, "rb") as handle:
+        return put_file(pathname, handle, content_type, session=session)
 
 
 def put_file(pathname, data, content_type, session=None):
@@ -185,7 +352,7 @@ def publish_tree(prefix, directory, session=None):
         return mapping
     for path in sorted(p for p in base.rglob("*") if p.is_file()):
         rel = path.relative_to(base).as_posix()
-        url = put_file(f"{prefix}/{rel}", path.read_bytes(), mimetypes.guess_type(path.name)[0], session=session)
+        url = put_path(f"{prefix}/{rel}", path, mimetypes.guess_type(path.name)[0], session=session)
         mapping[str(path.resolve())] = url
     return mapping
 

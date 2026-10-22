@@ -13,6 +13,10 @@ class Provider:
         self.name = name
         self.cfg = pcfg
 
+    def supports_durable_poll(self):
+        """True when a call can be submitted and polled later, without holding the request open."""
+        return False
+
     def run(self, kind, ctx):
         """Run one call. ctx keys: model, prompt, params, inputs{name: path}, out_dir,
         persona, script, video_seconds, audio_seconds, attempt.

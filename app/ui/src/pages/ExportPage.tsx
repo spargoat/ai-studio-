@@ -21,7 +21,7 @@ export default function ExportPage() {
   const all = data?.length && sel.size === data.length;
   return (
     <div>
-      <PageHeader title="Export" description="Bundle selected items into one zip: videos in every aspect, .srt captions, poster, caption.txt and a manifest. Nothing is uploaded."
+      <PageHeader title="Export" description="Bundle selected items into one zip: videos in every aspect, .srt captions, poster, caption.txt and a manifest. When Blob is configured the zip is stored there, so the link still works on the next request."
         actions={<Button icon={<Download size={14} />} disabled={!sel.size} loading={exp.isPending} onClick={() => exp.mutate()} data-action="export">Download zip ({sel.size})</Button>} />
       <label className="flex items-center gap-2 text-xs text-zinc-400 mb-3"><input type="checkbox" checked={allStages} onChange={(e) => { setAllStages(e.target.checked); setSel(new Set()); }} /> include intermediate stages (stills, voice…)</label>
       {isLoading ? <div className="py-12 flex justify-center"><Loader2 className="animate-spin text-zinc-500" /></div> : !data?.length ? <EmptyState icon={<PackageOpen size={22} />} title="No final outputs in the library yet" description="Finish or approve a job first." /> :
