@@ -13,6 +13,7 @@ from .db import DB, now
 from . import pricing
 from .media import duration, poster
 from .providers import make, ProviderError, NonRetryable
+from .providers.higgsfield import HiggsfieldPending, HiggsfieldProvider
 
 READY = "succeeded"
 
@@ -39,6 +40,7 @@ class Runner:
         self.auto_check = auto_check   # live: gates pass only if automated blank/corrupt QC passes
         self.fail_inject = fail_inject or {}
         self.provider_override = provider_override or {}
+        self.async_poll = False          # advance(): one higgsfield status check per request, no blocking wait
         self.db = DB(cfg["_db_file"])
         self.log_fn = log
         if live:
@@ -134,6 +136,109 @@ class Runner:
         if not self.live and p.paid:
             p = make("mock", self.cfg)   # DRY_RUN: every paid adapter is swapped for the mock
         return p, sc
+
+    def advance(self, job_id, only=None):
+        """Run one due stage, or poll one in-flight Higgsfield request. Safe to call again.
+
+        A paid Higgsfield stage submits once and returns ``pending``. The next call checks that
+        request and downloads the output when it is completed. It does not submit a second job.
+        """
+        job = self.db.job(job_id)
+        if not job:
+            raise BriefError(f"no job {job_id}")
+        running = [r for r in self.db.runs(job_id) if r["status"] == "running"]
+        if running:
+            run = running[-1]
+            meta = json.loads(run["meta_json"] or "{}")
+            if meta.get("higgsfield"):
+                self._poll_higgsfield(job, run)
+                fresh = self.db.run(run["id"])
+                pending = fresh["status"] == "running"
+                body = {"action": "poll", "stage": run["stage"], "ok": fresh["status"] == READY or pending,
+                        "pending": pending, "status": self.db.job(job_id)["status"]}
+                if fresh["status"] == "failed" and fresh.get("error"):
+                    body["ok"] = False
+                    body["error"] = fresh["error"]
+                return body
+            return {"action": "busy", "stage": run["stage"], "status": "running"}
+        self.async_poll = True
+        try:
+            defs = self.stage_defs(job)
+            for sdef in defs:
+                sid = sdef["id"]
+                if only and sid != only:
+                    continue
+                latest = self.db.latest(job_id, sid)
+                deps_ok = all(self.is_ready(self.db.latest(job_id, d), self.def_of(defs, d)) for d in sdef["needs"])
+                if not deps_ok:
+                    continue
+                if latest and latest["status"] == READY and latest["review_status"] == "rejected" and not only:
+                    continue
+                due = only is not None or latest is None or latest["status"] != READY or self.is_stale(job_id, latest)
+                if not due:
+                    continue
+                self.db.set_job_status(job_id, "running")
+                result = self.run_stage(job, sdef)
+                body = {"action": "stage", "stage": sid, "ok": result is True or result == "pending",
+                        "pending": result == "pending", "status": self.db.job(job_id)["status"]}
+                if result is False:
+                    latest = self.db.latest(job_id, sid)
+                    if latest and latest.get("error"):
+                        body["error"] = latest["error"]
+                    if self.db.job(job_id)["status"] == "running":
+                        self.db.set_job_status(job_id, "failed")
+                        body["status"] = "failed"
+                return body
+        finally:
+            self.async_poll = False
+        return {"action": "idle", "status": self.db.job(job_id)["status"]}
+
+    def _poll_higgsfield(self, job, run):
+        """One status check for a submitted Higgsfield request. Downloads the output when it is done."""
+        meta = json.loads(run["meta_json"] or "{}")
+        hfm = meta.get("higgsfield") or {}
+        provider = HiggsfieldProvider("higgsfield", {**self.cfg["providers"]["higgsfield"],
+                                                      "max_polls": 1, "poll_seconds": 0})
+        try:
+            result = provider.poll(hfm["request_id"])
+        except HiggsfieldPending as e:
+            hfm["status"] = e.status
+            meta["higgsfield"] = hfm
+            self.db.update_run(run["id"], meta=meta)
+            self.log(job["id"], run["stage"], "info", f"higgsfield {hfm['request_id']} still {e.status}")
+            return False
+        except Exception as e:
+            if hfm.get("aid"):
+                self.db.update_attempt(hfm["aid"], status="failed", error=str(e), finished_at=now())
+            self.db.update_run(run["id"], status="failed", error=str(e), finished_at=now())
+            self.db.set_job_status(job["id"], "failed")
+            self.log(job["id"], run["stage"], "error", f"higgsfield poll failed: {e}")
+            return False
+        out_dir = self.job_dir(job["id"]) / run["stage"] / f"v{run['version']}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            res = provider.save_result(hfm["kind"], result, out_dir)
+        except Exception as e:
+            self.db.update_run(run["id"], status="failed", error=str(e), finished_at=now())
+            self.db.set_job_status(job["id"], "failed")
+            self.log(job["id"], run["stage"], "error", f"higgsfield download failed: {e}")
+            return False
+        res["request_id"] = hfm["request_id"]
+        actual = pricing.cost(self.cfg, hfm.get("price_key") or run["price_key"], hfm["kind"],
+                              float(res["units_actual"]), {})
+        if hfm.get("aid"):
+            self.db.update_attempt(hfm["aid"], status="succeeded", actual_cost_usd=actual,
+                                   provider_request_id=hfm["request_id"], finished_at=now())
+        out_meta = res.get("meta") or {}
+        self._thumb(res["output_path"], out_dir, out_meta)
+        (out_dir / "meta.json").write_text(json.dumps(out_meta, indent=2))
+        sdef = next((d for d in self.stage_defs(job) if d["id"] == run["stage"]), {})
+        self.db.update_run(run["id"], status=READY, output_path=res["output_path"], meta=out_meta,
+                           actual_cost_usd=actual, attempts=hfm.get("attempt") or run["attempts"],
+                           finished_at=now(), review_status="pending" if sdef.get("review") else None)
+        self.score_run(run["id"])
+        self.log(job["id"], run["stage"], "info", f"v{run['version']} higgsfield {hfm['request_id']} completed")
+        return True
 
     def job_dir(self, job_id):
         return self.cfg["_data_dir"] / "jobs" / job_id
@@ -373,6 +478,8 @@ class Runner:
         if kind == "brief":
             return self._run_brief(job, sdef)
         provider, sc = self.provider_for(sdef.get("uses", sid))
+        if self.async_poll and provider.name == "higgsfield":
+            provider.cfg = {**provider.cfg, "max_polls": 1, "poll_seconds": 0}
         inputs_ids, inputs = {}, {}
         for d in sdef["needs"]:
             r = self.db.latest(job_id, d)
@@ -454,6 +561,17 @@ class Runner:
                 self.log(job_id, sid, "info", f"v{ver} ok in {time.time()-t0:.1f}s, actual ${actual:.4f}, attempt {attempt}/{max_try}")
                 self.score_run(rid)
                 return True
+            except HiggsfieldPending as e:
+                meta = {"higgsfield": {"request_id": e.request_id, "status_url": e.status_url,
+                                       "response_url": e.response_url, "cancel_url": e.cancel_url,
+                                       "status": e.status, "kind": kind, "model": sc["model"],
+                                       "attempt": attempt, "aid": aid, "price_key": sc["price_key"],
+                                       "version": ver}}
+                self.db.update_attempt(aid, status="running", provider_request_id=e.request_id)
+                self.db.update_run(rid, status="running", meta=meta, attempts=attempt)
+                self.log(job_id, sid, "info",
+                         f"v{ver} submitted to higgsfield ({e.request_id}); poll on the next advance")
+                return "pending"
             except NonRetryable as e:
                 last_err = f"attempt {attempt}: {e}"
                 # provider rejected the request (4xx validation/auth): no output, logged as $0; reconcile on dashboard

@@ -28,8 +28,15 @@ providers:
     timeout_seconds: 1200
   higgsfield:
     kind: higgsfield
-    key_env: [HIGGSFIELD_API_KEY]
-    optional_key: true          # fallback only; transport not wired yet
+    # key_id:key_secret in HIGGSFIELD_API_KEY, or that var plus HIGGSFIELD_API_SECRET.
+    # The SDK's HF_KEY / HF_API_KEY+HF_API_SECRET are accepted too. A live call fails
+    # closed (nothing sent) when the secret half is missing. Optional at preflight
+    # because this provider is the fal-lock fallback, not a default stage.
+    key_env: [HIGGSFIELD_API_KEY, HIGGSFIELD_API_SECRET, HF_KEY, HF_API_KEY, HF_API_SECRET]
+    optional_key: true
+    base_url: https://api.higgsfield.ai
+    poll_seconds: 2
+    timeout_seconds: 1200
   llm:
     kind: llm
     key_env: [ANTHROPIC_API_KEY, OPENAI_API_KEY]
@@ -91,21 +98,23 @@ stages:
 
 # Price table. USD ex-VAT. Every row carries its source and check date
 # (Phase 0 assessment, AAR-72, sources S1-S9). Re-check monthly (risk #6).
-# Fallback routing: when fal is locked (exhausted balance), fal stages with a `fallback` entry below route to it.
-# A fallback is only used if its price row is > 0 (so the spend guard still bites). Higgsfield is credit-priced;
-# the USD rows are placeholders to confirm, set to 0 = fallback disabled until Aaron sets real numbers.
+# Fallback routing: when fal is locked (exhausted balance), fal stages with a priced `fallback`
+# entry below route to Higgsfield. A route is used only when its price row is > 0.
+# Rates are the spend-guard ceilings in studio/pricing.py (HIGGSFIELD_PRICES), not a live quote.
+# lipsync has no catalog endpoint yet: the price lets the lock fall through, and the provider
+# refuses to submit until `model` is a real endpoint id (it must contain '/').
 fallback:
   enabled: true
   when: fal_locked
   routes:
-    still:   {provider: higgsfield, model: "nano_banana_2 (to confirm)", price_key: hf_image}
-    video:   {provider: higgsfield, model: "wan_3_0 (to confirm)", price_key: hf_video}
-    lipsync: {provider: higgsfield, model: "lipsync (to confirm)", price_key: hf_lipsync}
+    still:   {provider: higgsfield, model: alibaba/qwen-image-3/edit, price_key: hf_image}
+    video:   {provider: higgsfield, model: alibaba/wan-3.0/image-to-video, price_key: hf_video}
+    lipsync: {provider: higgsfield, model: unconfigured, price_key: hf_lipsync}
 
 prices:
-  hf_image:   {unit: image, usd_per_unit: 0.0, source: "Higgsfield credits; USD per credit to confirm", checked: 2026-10-20}
-  hf_video:   {unit: second, usd_per_unit: 0.0, source: "Higgsfield credits; USD per credit to confirm", checked: 2026-10-20}
-  hf_lipsync: {unit: second, usd_per_unit: 0.0, source: "Higgsfield credits; USD per credit to confirm", checked: 2026-10-20}
+  hf_image:   {unit: image, usd_per_unit: 0.094, source: "pricing.HIGGSFIELD_PRICES hf_image (soul v2 sample, guard ceiling)", checked: 2026-10-22}
+  hf_video:   {unit: second, usd_per_unit: 0.20, source: "pricing.HIGGSFIELD_PRICES hf_video (Wan 3.0 blog $0.20/s)", checked: 2026-10-22}
+  hf_lipsync: {unit: second, usd_per_unit: 0.20, source: "pricing.HIGGSFIELD_PRICES hf_lipsync (no catalog endpoint; video rate, submit refused)", checked: 2026-10-22}
   llm_unpriced:
     unit: call
     usd_per_unit: 0.0
