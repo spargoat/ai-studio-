@@ -3,7 +3,7 @@ The original server-rendered review pages stay at /classic and /job/<id>."""
 import json
 import threading
 from pathlib import Path
-from flask import Flask, abort, redirect, render_template_string, request, send_file, url_for
+from flask import Flask, abort, jsonify, redirect, render_template_string, request, send_file, send_from_directory, url_for
 from .runner import Runner
 
 PAGE = """<!doctype html><html><head><meta charset=utf-8><meta name=viewport content="width=device-width,initial-scale=1">
@@ -29,9 +29,9 @@ button.ok{background:#1d4d2b}button.no{background:#5a1f1f}
 <header><span class=mode>{{'LIVE' if live else 'DRY RUN'}}</span><h2><a href="/classic">AI Studio</a></h2>
 <nav><a href="/">App</a><a href="/classic" class="{{'on' if tab=='jobs' else ''}}">Jobs</a><a href="/classic/library" class="{{'on' if tab=='library' else ''}}">Library</a></nav>
 <div class=sm>spend ${{'%.2f'|format(spend)}} of ${{caps[0]}} cap</div></header><main>
-{% macro badges(sc) %}{% if sc %}<span class="b {{'pass' if sc.passed else 'flag'}}">{{'PASS' if sc.passed else 'FLAG'}}</span>
-<span class=b style="background:#223">identity {{'%.2f'|format(sc.identity) if sc.identity is not none else 'n/a'}}</span>
-{% if sc.visual %}<span class="b ns">{{sc.visual.width}}x{{sc.visual.height}} · sharp {{sc.visual.sharpness|int}}</span>{% endif %}
+{% macro badges(sc) %}{% if sc %}{% if sc.passed is not none %}<span class="b {{'pass' if sc.passed else 'flag'}}">{{'PASS' if sc.passed else 'FLAG'}}</span>{% endif %}
+<span class=b style="background:#223">identity {% if (sc.identity_note or '') == 'dry run, self-reference' %}dry run, self-reference{% elif sc.identity is not none %}{{'%.2f'|format(sc.identity)}}{% elif (sc.identity_note or '').startswith('not scored') or sc.passed is none %}not scored{% else %}n/a{% endif %}</span>
+{% if sc.visual %}<span class="b ns">{{sc.visual.width}}x{{sc.visual.height}} · sharp {{sc.visual.sharpness|int}}</span>{% else %}<span class="b ns">visual not scored</span>{% endif %}
 <span class="b ns" title="needs an LLM key">copy/brand/engagement: not scored</span>
 {% for f in sc.flags %}<div class=err>{{f}}</div>{% endfor %}{% endif %}{% endmacro %}
 {% macro media(p, poster=None) %}{% set u = '/file?p=' ~ p %}
@@ -41,7 +41,7 @@ button.ok{background:#1d4d2b}button.no{background:#5a1f1f}
 <form method=get><input name=q value="{{q or ''}}" placeholder="search prompts, jobs, templates" style="width:100%;padding:10px;border-radius:6px;border:1px solid #444;background:#222;color:#eee"></form>
 <div class=grid>{% for r in lib %}<div class=ver>{{media(r.path)}}<div class=sm>{% if r.promoted %}<span class="b approved">★ promoted</span>{% endif %}
 {{r.persona}} · {{r.template}}<br><a href="/job/{{r.job_id}}">{{r.job_id}}</a>/{{r.stage}} v{{r.version}} [{{r.mode}}]</div>
-{% if r.identity is not none %}<span class="b {{'pass' if r.passed else 'flag'}}">id {{'%.2f'|format(r.identity)}}</span>{% endif %}
+{% if r.scores_json and 'dry run, self-reference' in r.scores_json %}<span class="b ns">identity dry run, self-reference</span>{% elif r.identity is not none %}<span class="b {{'pass' if r.passed else 'flag'}}">id {{'%.2f'|format(r.identity)}}</span>{% endif %}
 {% if not r.promoted %}<form method=post action="/classic/library/{{r.id}}/promote"><button style="padding:6px 10px;font-size:13px">Promote</button></form>{% endif %}</div>
 {% else %}<p>Library empty. Run <code>studio library backfill</code>.</p>{% endfor %}</div>
 {% elif not job %}<div class=jobs>{% for j in jobs %}<a class=j href="/job/{{j.id}}"><b>{{j.id}}</b> <span class="b {{j.status}}">{{j.status}}</span>
@@ -56,12 +56,12 @@ button.ok{background:#1d4d2b}button.no{background:#5a1f1f}
 <b>v{{r.version}}</b> <span class="b {{r.status}}">{{r.status}}</span> <span class=sm>{{r.model}}</span>
 {% if r.review_status %}<span class="b {{r.review_status}}">{{r.review_status}}</span>{% endif %}{% if r.stale %}<span class="b stale">stale</span>{% endif %}
 {% if r.output_path %}<div style="margin:6px 0">{{media(r.output_path, r.poster)}}</div>{% endif %}
-{{badges(r.score)}}
+{% if r.score %}{{badges(r.score)}}{% elif s.id in ('still', 'video', 'lipsync', 'finish', 'compose') and r.output_path %}<span class="b ns">identity not scored</span> <span class="b ns">visual not scored</span>{% endif %}
 {% if r.exports %}<div class=sm>exports: {% for a,p in r.exports.items() %}<a href="/file?p={{p}}">{{a}}</a> {% endfor %}</div>{% endif %}
 <div class=sm>{{r.mode}} · ${{'%.3f'|format(r.actual_cost_usd or 0)}} · tries {{r.attempts}}</div>
 {% if r.review_note %}<div class=sm>note: {{r.review_note}}</div>{% endif %}
 {% if r.error and r.status!='succeeded' %}<div class=err>{{r.error[:300]}}</div>{% endif %}</div>{% endfor %}</div>
-{% if s.runs and s.runs[-1].status == 'succeeded' %}<form class=rv method=post action="/job/{{job.id}}/review/{{s.id}}">
+{% if s.show_review %}<form class=rv method=post action="/job/{{job.id}}/review/{{s.id}}">
 <input name=note placeholder="Reason (required to reject)"><button class=ok name=v value=approved>Approve v{{s.runs[-1].version}}</button>
 <button class=no name=v value=rejected>Reject</button></form>{% endif %}
 <form method=post action="/job/{{job.id}}/rerun/{{s.id}}" style="margin-top:6px"><button>Rerun {{s.id}}</button></form></div>{% endif %}{% endfor %}
@@ -71,8 +71,32 @@ button.ok{background:#1d4d2b}button.no{background:#5a1f1f}
 
 def create_app(cfg, live=False):
     app = Flask(__name__)
+
+    @app.before_request
+    def database_required():
+        from .db import missing_on_vercel
+        if (request.path == "/healthz" or request.path.startswith("/assets/")
+                or request.path.startswith("/api/inngest") or not missing_on_vercel()):
+            return None
+        msg = "Database not configured"
+        if request.path.startswith("/api/"):
+            return jsonify({"error": msg}), 503
+        return msg, 503
+
     from .auth import init as auth_init
     auth_init(app)                                   # shared-password sign-in (no-op unless configured/required)
+    from .api import UI_DIST
+
+    @app.get("/assets/<path:name>")
+    def ui_assets(name):
+        """Hashed Vite files. Also published from public/assets; this is the function fallback."""
+        return send_from_directory(UI_DIST / "assets", name)
+
+    from .db import missing_on_vercel
+    from . import workflows
+    if missing_on_vercel():
+        workflows.serve(app)                         # /api/inngest stays up without a database
+        return app                                   # no Runner, so nothing opens /tmp SQLite or writes
     runner = Runner(cfg, live=live, log=lambda m: None)
     data_dir = Path(cfg["_data_dir"]).resolve()
 
@@ -93,6 +117,7 @@ def create_app(cfg, live=False):
     @app.get("/job/<jid>")
     def job(jid):
         j = runner.db.job(jid) or abort(404)
+        from .gates import show_review
         stages = []
         for d in runner.stage_defs(j):
             sc = cfg["stages"].get(d["id"], {"provider": "local", "model": "brief-resolver"})
@@ -105,6 +130,8 @@ def create_app(cfg, live=False):
                 r["stale"] = r["status"] == "succeeded" and runner.is_stale(jid, r)
             last = runs[-1] if runs else None             # what this job actually ran, not the template default
             stages.append({"id": d["id"], "review": d.get("review"),
+                           "show_review": show_review(d["id"], d.get("review"),
+                                                      (last or {}).get("status"), (last or {}).get("review_status")),
                            "provider": (last or {}).get("provider") or sc["provider"],
                            "model": (last or {}).get("model") or sc["model"],
                            "default_model": sc["model"], "runs": runs})
@@ -155,9 +182,16 @@ def create_app(cfg, live=False):
 
     @app.get("/file")
     def file():
-        p = Path(request.args["p"]).resolve()
-        if data_dir not in p.parents:
+        from .storage import allowed_redirect
+        raw = request.args["p"]
+        if allowed_redirect(raw):
+            return redirect(raw)
+        p = Path(raw).resolve()
+        roots = [data_dir, Path("/tmp")]
+        if not any(root == p or root in p.parents for root in roots):
             abort(403)
+        if not p.exists():
+            abort(404)
         return send_file(p)
 
     from .api import register

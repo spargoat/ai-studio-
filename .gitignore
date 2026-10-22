@@ -7,4 +7,3 @@ bin/
 __pycache__/
 *.pyc
 .vercel/
-public/

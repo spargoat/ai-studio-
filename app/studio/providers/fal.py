@@ -10,25 +10,56 @@ from ..config import get_key
 from ..media import duration
 
 
-def data_uri(path):
+def _local_file(path, sha256=None):
+    """A filesystem path. Blob URLs are cached under /tmp by storage.local."""
+    from ..storage import is_url, local
+    if is_url(str(path)):
+        path = local(path, sha256=sha256)
+    path = Path(path)
+    if not path.exists():
+        return None
+    return path
+
+
+def data_uri(path, sha256=None):
+    path = _local_file(path, sha256)
+    if path is None:
+        raise ProviderError(f"reference file missing: {path}")
     mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
-    return f"data:{mime};base64," + base64.b64encode(Path(path).read_bytes()).decode()
+    return f"data:{mime};base64," + base64.b64encode(path.read_bytes()).decode()
 
 
-def upload(path, key_headers):
-    """Upload a local file to fal storage (free) and return its public URL.
-    Needed because some endpoints (lipsync) reject data: URIs."""
+def upload(path, key_headers, sha256=None):
+    """Upload a local file or Blob URL to fal storage (free) and return its public URL.
+    Needed because some endpoints (lipsync) reject data: URIs. Large images are
+    downscaled before the PUT."""
+    from ..images import prepare_for_fal
+    path = _local_file(path, sha256)
+    if path is None:
+        raise ProviderError("reference file missing")
+    path = Path(prepare_for_fal(path))
     mime = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
     r = requests.post("https://rest.alpha.fal.ai/storage/upload/initiate?storage_type=fal-cdn-v3",
-                      json={"content_type": mime, "file_name": Path(path).name},
+                      json={"content_type": mime, "file_name": path.name},
                       headers=key_headers, timeout=60)
     if r.status_code >= 400:
         raise ProviderError(f"fal upload initiate {r.status_code}: {r.text[:200]}")
     j = r.json()
-    put = requests.put(j["upload_url"], data=Path(path).read_bytes(), headers={"Content-Type": mime}, timeout=300)
+    put = requests.put(j["upload_url"], data=path.read_bytes(), headers={"Content-Type": mime}, timeout=300)
     if put.status_code >= 400:
         raise ProviderError(f"fal upload PUT {put.status_code}: {put.text[:200]}")
     return j["file_url"]
+
+
+class FalPending(Exception):
+    """Submitted to the fal queue; the result is not ready yet. Do not resubmit."""
+
+    def __init__(self, request_id, status_url, response_url, status):
+        super().__init__(f"fal {request_id} still {status}")
+        self.request_id = request_id
+        self.status_url = status_url
+        self.response_url = response_url
+        self.status = status
 
 
 class FalProvider(Provider):
@@ -84,10 +115,17 @@ class FalProvider(Provider):
         """Blocking poll used by the local thread/CLI path and by LoRA training."""
         ticket = {"request_id": rid, "status_url": status_url, "response_url": resp_url}
         deadline = time.time() + (timeout or self.cfg.get("timeout_seconds", 1200))
+        polls = 0
+        limit = self.cfg.get("max_polls")
         while time.time() < deadline:
             got = self.poll(ticket)
             if got["state"] == "pending":
-                time.sleep(self.cfg.get("poll_seconds", 5))
+                polls += 1
+                if limit and polls >= int(limit):
+                    raise FalPending(rid, status_url, resp_url, got.get("provider_status") or "IN_PROGRESS")
+                delay = self.cfg.get("poll_seconds", 5)
+                if delay:
+                    time.sleep(delay)
                 continue
             if got["state"] == "failed":
                 if got.get("retry", True):
@@ -102,9 +140,13 @@ class FalProvider(Provider):
             if ctx.get("loras"):
                 return {"prompt": ctx["prompt"], "loras": ctx["loras"], **p}, "lora"
             payload = {"prompt": ctx["prompt"], **p}
-            refs = [r for r in (ctx.get("refs") or []) if Path(r).exists()]
+            sha = ctx.get("ref_sha256") or {}
+            refs = []
+            for ref in ctx.get("refs") or []:
+                if isinstance(ref, str) and _local_file(ref, sha.get(ref) if sha else None):
+                    refs.append(ref)
             if refs:
-                payload["image_urls"] = [upload(r, self._headers()) for r in refs]
+                payload["image_urls"] = [upload(r, self._headers(), sha.get(r)) for r in refs]
             return payload, "images"
         if kind == "video":
             p = dict(ctx["params"])
@@ -164,6 +206,28 @@ class FalProvider(Provider):
                 for chunk in r.iter_content(1 << 20):
                     f.write(chunk)
         return str(out)
+
+    def save_result(self, kind, res, out_dir):
+        """Write a completed fal result JSON to out_dir. Used when a later request finishes a poll."""
+        out_dir = Path(out_dir)
+        if kind == "image":
+            img = res.get("image") or (res.get("images") or [None])[0]
+            if not img:
+                raise ProviderError(f"fal returned no image: {str(res)[:300]}")
+            out = self._download(img["url"], out_dir / "still.png")
+            n = len(res.get("images") or [img])
+            return {"output_path": out, "meta": {"url": img["url"], "n": n, "seed": res.get("seed")},
+                    "units_actual": n, "request_id": None}
+        if kind in ("video", "lipsync"):
+            url = (res.get("video") or {}).get("url")
+            if not url:
+                raise ProviderError(f"fal returned no video: {str(res)[:300]}")
+            name = "video.mp4" if kind == "video" else "lipsync.mp4"
+            out = self._download(url, out_dir / name)
+            d = duration(out)
+            return {"output_path": out, "meta": {"url": url, "seconds": d},
+                    "units_actual": d, "request_id": None}
+        raise ProviderError(f"cannot finish fal kind {kind}")
 
     def do_image(self, ctx):
         ticket = self.submit("image", ctx)

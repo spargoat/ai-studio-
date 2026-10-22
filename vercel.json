@@ -1,0 +1,22 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "cd app/ui && npm ci && npm run build && cd ../.. && python3 scripts/stage_static.py",
+  "functions": {
+    "app/wsgi.py": {
+      "maxDuration": 300,
+      "includeFiles": "app/ui/dist/**",
+      "excludeFiles": "{app/ui/node_modules/**,app/ui/src/**,app/tests/**,app/screens/**,app/tools/**,app/models/**,app/bin/**,app/data/**,public/**,**/.git/**,**/__pycache__/**,**/*.pyc}"
+    }
+  },
+  "headers": [
+    {
+      "source": "/assets/(.*)",
+      "headers": [
+        { "key": "Cache-Control", "value": "public, max-age=31536000, immutable" }
+      ]
+    }
+  ],
+  "crons": [
+    { "path": "/api/cron/advance", "schedule": "* * * * *" }
+  ]
+}

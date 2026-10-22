@@ -56,7 +56,7 @@ stages:
     # Local, $0. Per-template: captions, overlays, music bed (ducked), aspect exports framed on the face.
     params:
       captions: {enabled: true, words_per_chunk: 3, size_pct: 6.2, y_pct: 72, highlight: "&H0000D7FF",
-                 font_name: TWF Caption, fonts_dir: /workspace/creative/fonts/twf_caption}   # vtt: /path.vtt to time from a VTT
+                 font_name: DejaVu Sans}   # faces in app/fonts; vtt: /path.vtt to time from a VTT
       overlays: []            # e.g. [{text: "Free guide", start: 0, end: 3, pos: top}]
       music: {}               # e.g. {path: /workspace/creative/music/tracks/x.m4a, volume: 0.18, duck: true}
       formats: ["9:16", "1:1", "16:9"]

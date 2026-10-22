@@ -1,11 +1,13 @@
-# Installed by Vercel when the project root is app/.
-# inngest serves /api/inngest (studio/workflows.py).
-flask>=3
-PyYAML
-requests
-waitress
+# Same request-function set as the repository-root requirements.txt.
+# Vercel project root is the repository, not app/. OpenCV is an optional
+# local extra (pyproject.toml [score]); it is not part of the function bundle.
+flask>=3.0.3
+pyyaml>=6.0
+requests>=2.32
+libsql>=0.1.11
+waitress>=3.0
+numpy>=1.26
+onnxruntime>=1.20,<1.32
+pillow>=10
 inngest>=0.5.14
 higgsfield-client>=0.1.0
-numpy
-opencv-python-headless
-Pillow

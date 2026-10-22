@@ -12,6 +12,18 @@ import { api, ts } from "../lib/api";
 const TABS = [{ id: "all", label: "All", icon: Library }, { id: "promoted", label: "Promoted", icon: Star }, { id: "final", label: "Final outputs", icon: Film }] as const;
 const STAGES = ["", "still", "voice", "video", "lipsync", "finish", "compose", "script", "llm"];
 
+function identityPhrase(r: { identity?: number | null; scores_json?: string | null }) {
+  if (String(r.scores_json || "").includes("dry run, self-reference")) return "dry run, self-reference";
+  if (r.identity != null) return Number(r.identity).toFixed(2);
+  return "not scored";
+}
+
+function identityLabel(r: { identity?: number | null; passed?: number | boolean | null; scores_json?: string | null }) {
+  const phrase = identityPhrase(r);
+  if (phrase === "dry run, self-reference" || r.identity == null) return <span className="text-xs text-zinc-500">{phrase}</span>;
+  return <Badge variant={r.passed ? "success" : "danger"} size="sm">{phrase}</Badge>;
+}
+
 export default function LibraryPage() {
   const qc = useQueryClient();
   const [tab, setTab] = useState<string>("all"); const [q, setQ] = useState(""); const [persona, setPersona] = useState(""); const [stage, setStage] = useState("");
@@ -45,14 +57,14 @@ export default function LibraryPage() {
               {r.prompt && <div className="text-[11px] text-zinc-600 line-clamp-2 mt-0.5">{r.prompt}</div>}
               <div className="flex gap-1 mt-2 sm:hidden"><Button size="xs" variant="ghost" icon={<Eye size={12} />} onClick={() => { setPreview(r); setNote(r.note || ""); }}>Open</Button>
                 {!r.promoted && <Button size="xs" variant="secondary" icon={<Star size={12} />} onClick={() => promote.mutate(r.id)}>Promote</Button>}</div></td>
-            <td className={`${td} hidden md:table-cell`}>{r.identity != null ? <Badge variant={r.passed ? "success" : "danger"} size="sm">{r.identity.toFixed(2)}</Badge> : <span className="text-xs text-zinc-600">n/a</span>}</td>
+            <td className={`${td} hidden md:table-cell`}>{identityLabel(r)}</td>
             <td className={`${td} text-right whitespace-nowrap hidden sm:table-cell`}><Button size="xs" variant="ghost" icon={<Eye size={12} />} onClick={() => { setPreview(r); setNote(r.note || ""); }}>Open</Button>
               {!r.promoted && <Button size="xs" variant="secondary" icon={<Star size={12} />} loading={promote.isPending && promote.variables === r.id} onClick={() => promote.mutate(r.id)}>Promote</Button>}</td>
           </tr>))}</tbody></table></div>}
       <Modal open={!!preview} onClose={() => setPreview(null)} title={preview ? `#${preview.id} ${preview.job_id}/${preview.stage} v${preview.version}` : ""} size="xl"
         footer={preview && !preview.promoted ? <><Input inputSize="sm" placeholder="note (optional)" value={note} onChange={(e) => setNote(e.target.value)} /><Button size="sm" icon={<Star size={12} />} onClick={() => promote.mutate(preview.id)}>Promote</Button></> : undefined}>
         {preview && <div className="space-y-2"><Media path={preview.path} className="w-full max-h-[60vh]" />
-          <div className="text-xs text-zinc-400">{preview.persona} · {preview.template} · {preview.mode} · identity {preview.identity?.toFixed?.(2) ?? "n/a"}</div>
+          <div className="text-xs text-zinc-400">{preview.persona} · {preview.template} · {preview.mode} · identity {identityPhrase(preview)}</div>
           {preview.prompt && <pre className="text-[11px] text-zinc-400 whitespace-pre-wrap max-h-40 overflow-y-auto">{preview.prompt}</pre>}</div>}
       </Modal>
     </div>

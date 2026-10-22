@@ -1,14 +1,20 @@
 """JSON API for the React UI. Thin layer over Runner / DB / library / export / persona. Dry runs only from the UI."""
-import contextlib, io, json, threading, time
+import contextlib, hmac, io, json, os, threading, time
 from pathlib import Path
-from flask import Blueprint, abort, jsonify, request, send_file, send_from_directory
+from flask import Blueprint, abort, jsonify, redirect, request, send_file
 from . import library, persona as P
 from .config import key_status, load_template
+from .gates import show_review
 from .runner import BriefError, SpendGuardError
 
 UI_DIST = Path(__file__).resolve().parent.parent / "ui" / "dist"
 TEMPLATES_DIR = Path(__file__).resolve().parent.parent / "templates"
 _doctor_lock = threading.Lock()
+
+
+def one_stage():
+    """Vercel cannot keep a background thread alive after the response. One stage per request."""
+    return os.environ.get("VERCEL") == "1" or os.environ.get("STUDIO_ONE_STAGE") == "1"
 
 
 def register(app, cfg, runner, live, bg):
@@ -38,20 +44,23 @@ def register(app, cfg, runner, live, bg):
         bg(_guarded(jid, fn, a))
 
     def launch(jid, *, only=None, cascade=False):
-        """Start a job. thread (default) and inline run locally; inngest sends an event."""
+        """Start a job. inngest sends an event; Vercel advances one stage; otherwise a thread."""
         from . import workflows
         mode = workflows.executor_mode()
         if mode == "inngest":
             workflows.send_job(jid, only=only, cascade=cascade)
-            return
+            return None
+        if one_stage():
+            return runner.advance(jid, only=only)
         if only is not None:
             fn, args = runner.rerun, (jid, only, cascade)
         else:
             fn, args = runner.run_job, (jid,)
         if mode == "inline":
             _guarded(jid, fn, args)()
-            return
+            return None
         run_bg(jid, fn, *args)
+        return None
 
     def err(msg, code=400):
         return jsonify({"error": str(msg)}), code
@@ -123,7 +132,9 @@ def register(app, cfg, runner, live, bg):
                             | {"exports": m.get("exports"), "poster": m.get("poster"), "score": sco,
                                "stale": r["status"] == "succeeded" and runner.is_stale(jid, r)})
             last = runs[-1] if runs else {}
-            stages.append({"id": d["id"], "kind": d["kind"], "review": bool(d.get("review")), "needs": d.get("needs") or [],
+            stages.append({"id": d["id"], "kind": d["kind"], "review": bool(d.get("review")),
+                           "show_review": show_review(d["id"], d.get("review"), last.get("status"), last.get("review_status")),
+                           "needs": d.get("needs") or [],
                            "provider": last.get("provider") or sc["provider"], "model": last.get("model") or sc["model"],
                            "default_model": sc["model"], "runs": runs})
         return jsonify({"job": job_row(j) | {"brief": j["brief"]}, "stages": stages, "events": db.events(jid, 60),
@@ -141,20 +152,34 @@ def register(app, cfg, runner, live, bg):
 
     @bp.get("/api/personas")
     def personas():
+        from .storage import allowed_redirect
         out = []
         for k, v in cfg["_personas"].items():
+            refs = []
+            for e in P.entries(v.get("refs")):
+                url = e["url"] if allowed_redirect(e.get("url") or "") else None
+                exists = bool(url) or bool(e.get("path") and Path(e["path"]).exists())
+                refs.append({"i": e["i"], "name": e["name"], "role": e["role"], "exists": exists,
+                             "url": url, "note": e.get("note"), "sha256": e.get("sha256"),
+                             "image": P.is_image(e)})
             out.append({"id": k, "display": v.get("display") or k, "look": v.get("look"), "voice_name": v.get("voice_name"),
                         "lora": (v.get("lora") or {}).get("status"), "lock": v.get("lock") or {},
-                        "refs": [{"i": i, "name": Path(r).name, "exists": Path(r).exists()} for i, r in enumerate(v.get("refs") or [])],
+                        "identity_ref_note": v.get("identity_ref_note"), "refs": refs,
                         "missing": P.missing(v), "lock_text": P.lock_text(v, "image")})
         return jsonify(out)
 
     @bp.get("/api/personas/<pid>/ref/<int:i>")
     def ref(pid, i):
-        refs = (cfg["_personas"].get(pid) or {}).get("refs") or []
-        if i >= len(refs) or not Path(refs[i]).exists():
+        from .storage import allowed_redirect
+        found = next((e for e in P.entries((cfg["_personas"].get(pid) or {}).get("refs")) if e["i"] == i), None)
+        if not found:
             abort(404)
-        return send_file(refs[i])
+        if allowed_redirect(found.get("url") or ""):
+            return redirect(found["url"])
+        path = found.get("path")
+        if path and Path(path).exists():
+            return send_file(path)
+        abort(404)
 
     @bp.get("/api/settings")
     def settings():
@@ -201,12 +226,20 @@ def register(app, cfg, runner, live, bg):
     def create():
         body = request.get_json(force=True)
         if body.get("mode") == "live":
-            lock = db.fal_lock()
-            if lock:
-                return err(f"Live runs are blocked: the fal account has been locked (exhausted balance) since {lock['started_at']} "
-                           f"on {lock['job_id']}/{lock['stage']}. Top up at fal.ai, then run live from the CLI with STUDIO_FAL_TOPPED_UP=1.", 409)
-            return err("Live runs are started from the CLI (studio --live new ...) so the spend guards and approval stay explicit. "
-                       "This app starts dry runs only.", 409)
+            if os.environ.get("STUDIO_ALLOW_LIVE") != "1":
+                lock = db.fal_lock()
+                if lock:
+                    return err(f"Live runs are blocked: the fal account has been locked (exhausted balance) since {lock['started_at']} "
+                               f"on {lock['job_id']}/{lock['stage']}. Top up at fal.ai, then run live from the CLI with STUDIO_FAL_TOPPED_UP=1.", 409)
+                return err("Live runs are blocked. Set STUDIO_ALLOW_LIVE=1 to allow them from this app. "
+                           "Otherwise start them from the CLI (studio --live new ...) so the spend guards stay explicit.", 409)
+            try:
+                from .runner import Runner
+                with Runner(cfg, live=True, log=lambda m: None) as lr:
+                    jid = lr.create_job(brief_from(body.get("brief")))
+            except (BriefError, SpendGuardError, KeyError, ValueError) as e:
+                return err(e, 400)
+            return jsonify({"id": jid}), 201
         if live:
             return err("this server was started with --live; the UI only starts dry runs", 409)
         try:
@@ -214,7 +247,9 @@ def register(app, cfg, runner, live, bg):
         except (BriefError, KeyError, ValueError) as e:
             return err(e)
         try:
-            launch(jid)
+            from . import workflows
+            if workflows.executor_mode() == "inngest" or not one_stage():
+                launch(jid)
         except Exception as e:
             from .workflows import QueueError
             if isinstance(e, QueueError):
@@ -223,11 +258,45 @@ def register(app, cfg, runner, live, bg):
             raise
         return jsonify({"id": jid}), 201
 
+    @bp.post("/api/jobs/<jid>/advance")
+    def advance(jid):
+        job = db.job(jid) or abort(404)
+        if job["mode"] == "live" and os.environ.get("STUDIO_ALLOW_LIVE") != "1":
+            return err("Live runs are blocked. Set STUDIO_ALLOW_LIVE=1 to advance them.", 409)
+        try:
+            return jsonify(runner.advance(jid))
+        except BriefError as e:
+            return err(e, 409)
+
+    @bp.route("/api/cron/advance", methods=["GET", "POST"])
+    def cron_advance():
+        secret = os.environ.get("CRON_SECRET") or ""
+        if not secret:
+            return err("CRON_SECRET is not set", 503)
+        if not hmac.compare_digest(request.headers.get("Authorization", ""), f"Bearer {secret}"):
+            return err("unauthorized", 401)
+        # A killed instance leaves its stage_run `running`. Recover those before picking the next three jobs.
+        reconciled = runner.reconcile()
+        # failed jobs stay failed. partial here means more stages are still due, not a recorded stage error.
+        rows = db.q("SELECT id, mode FROM jobs WHERE status IN ('created','running','partial') ORDER BY updated_at LIMIT 3")
+        out = []
+        for row in rows:
+            if row["mode"] == "live" and os.environ.get("STUDIO_ALLOW_LIVE") != "1":
+                out.append({"id": row["id"], "skipped": "live blocked"})
+                continue
+            try:
+                out.append({"id": row["id"], **runner.advance(row["id"])})
+            except Exception as e:
+                out.append({"id": row["id"], "error": str(e)})
+        return jsonify({"ok": True, "reconciled": reconciled, "advanced": out})
+
     @bp.post("/api/jobs/<jid>/resume")
     def resume(jid):
         db.job(jid) or abort(404)
         try:
-            launch(jid)
+            stepped = launch(jid)
+            if stepped is not None:
+                return jsonify(stepped)
         except BriefError as e:
             return err(e, 409)
         except Exception as e:
@@ -241,7 +310,9 @@ def register(app, cfg, runner, live, bg):
     def rerun(jid, stage):
         db.job(jid) or abort(404)
         try:
-            launch(jid, only=stage)
+            stepped = launch(jid, only=stage)
+            if stepped is not None:
+                return jsonify(stepped)
         except BriefError as e:
             return err(e, 409)
         except Exception as e:
@@ -266,7 +337,12 @@ def register(app, cfg, runner, live, bg):
         resumed = False
         if v == "approved" and jid not in active and db.job(jid)["status"] in ("awaiting_review", "partial"):
             try:
-                launch(jid); resumed = True        # carry on to the next gate (dry runs only)
+                if one_stage():
+                    from . import workflows
+                    if workflows.executor_mode() != "inngest":
+                        runner.db.set_job_status(jid, "partial")
+                launch(jid)
+                resumed = True
             except BriefError:
                 pass
             except Exception as e:
@@ -304,19 +380,49 @@ def register(app, cfg, runner, live, bg):
         man, z = export(db, data_dir / "exports" / name, ids=ids, stages=None if b.get("all_stages") else ("finish", "compose"))
         if not man["count"]:
             return err("nothing to export: the selected items are not final outputs (tick 'include intermediate stages') or their files are missing")
-        return jsonify({"zip": z, "url": f"/file?p={z}", "name": Path(z).name, "size": Path(z).stat().st_size, "manifest": man})
+        from . import storage
+        zpath = Path(z)
+        url, stored = f"/file?p={z}", z
+        size = zpath.stat().st_size
+        if storage.enabled():
+            try:
+                blob = storage.put_file(f"exports/{zpath.name}", zpath.read_bytes(), "application/zip")
+            except storage.BlobError as e:
+                return err(str(e), 502)
+            url = stored = blob
+            zpath.unlink(missing_ok=True)
+            import shutil
+            shutil.rmtree(zpath.with_suffix(""), ignore_errors=True)
+        return jsonify({"zip": stored, "url": url, "name": zpath.name, "size": size, "manifest": man})
 
     @bp.get("/api/exports")
     def exports():
+        from . import storage
+        rows, seen = [], set()
+        if storage.enabled():
+            try:
+                blobs = storage.list_prefix("exports/")
+            except storage.BlobError:
+                blobs = []
+            for blob in blobs:
+                name = Path(blob.get("pathname") or "").name
+                if not name.endswith(".zip") or not blob.get("url") or name in seen:
+                    continue
+                seen.add(name)
+                at = (blob.get("uploadedAt") or "").replace("T", " ")[:16]
+                rows.append({"name": name, "url": blob["url"], "size": blob.get("size") or 0, "at": at})
         d = data_dir / "exports"
-        zs = sorted(d.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True)[:20] if d.exists() else []
-        return jsonify([{"name": z.name, "url": f"/file?p={z}", "size": z.stat().st_size,
-                         "at": time.strftime("%Y-%m-%d %H:%M", time.localtime(z.stat().st_mtime))} for z in zs])
+        if d.exists():
+            for z in sorted(d.glob("*.zip"), key=lambda p: p.stat().st_mtime, reverse=True):
+                if z.name in seen:
+                    continue
+                seen.add(z.name)
+                rows.append({"name": z.name, "url": f"/file?p={z}", "size": z.stat().st_size,
+                             "at": time.strftime("%Y-%m-%d %H:%M", time.localtime(z.stat().st_mtime))})
+        return jsonify(rows[:20])
 
-    # ---------- SPA
-    @bp.get("/assets/<path:p>")
-    def assets(p):
-        return send_from_directory(UI_DIST / "assets", p)
+    # ---------- SPA. /assets is registered on the app so it stays available
+    # when the database gate returns before the blueprint.
 
     def spa(**_):
         if not (UI_DIST / "index.html").exists():
