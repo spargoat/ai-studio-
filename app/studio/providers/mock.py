@@ -55,8 +55,14 @@ def ffmpeg_ready():
 
 
 def byte_media():
-    """Fast dry media on a host with no ffmpeg. Skips the runtime download."""
-    return mock_fast() and not ffmpeg_ready()
+    """Fast dry media. A board dry run sets STUDIO_NO_FFMPEG_FETCH so a warm
+    instance does not encode with ffmpeg it downloaded on an earlier request.
+    """
+    if not mock_fast():
+        return False
+    if os.environ.get("STUDIO_NO_FFMPEG_FETCH") == "1":
+        return True
+    return not ffmpeg_ready()
 
 
 def placeholder_seconds(secs):

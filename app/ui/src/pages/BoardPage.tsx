@@ -86,6 +86,30 @@ function savedLabel(iso?: string) {
   return `Saved ${iso.slice(0, 16).replace("T", " ")}`;
 }
 
+const BLOCK_LABEL: Record<string, string> = {
+  video: "Video", voice: "Voiceover", script: "Script", brief: "Brief", landing: "Landing page",
+  still: "Still", image: "Still", funnel_step: "Funnel step", ad_feed: "Ad Feed", funnel_route: "Funnel Map",
+};
+
+function blockName(stage: { id: string; kind?: string; node?: string }) {
+  const key = stage.node || stage.kind || "";
+  return BLOCK_LABEL[key] || (key ? key.replace(/_/g, " ") : stage.id);
+}
+
+function openRun(status?: string) {
+  return status === "created" || status === "running" || status === "partial";
+}
+
+function waitingBlocks(job: { stages?: { id: string; kind?: string; node?: string; runs?: { status: string }[] }[] } | undefined) {
+  const names: string[] = [];
+  for (const stage of job?.stages || []) {
+    const last = stage.runs?.length ? stage.runs[stage.runs.length - 1] : undefined;
+    if (last && (last.status === "succeeded" || last.status === "failed" || last.status === "blocked_budget")) continue;
+    names.push(blockName(stage));
+  }
+  return names;
+}
+
 function stageView(stage: { runs?: { status: string; review_status?: string; actual_cost_usd?: number; est_cost_usd?: number }[] } | undefined, jobStatus?: string) {
   const run = stage?.runs?.length ? stage.runs[stage.runs.length - 1] : undefined;
   if (!run) {
@@ -112,6 +136,7 @@ function nodeBox(n: FlowNode): Box {
 function Canvas() {
   const qc = useQueryClient();
   const { screenToFlowPosition, fitView } = useReactFlow();
+  const flowPane = useRef<HTMLDivElement>(null);
   const { data: meta } = useQuery({ queryKey: ["meta"], queryFn: () => api("/api/meta") });
   const { data: list } = useQuery({ queryKey: ["boards"], queryFn: () => api<any[]>("/api/boards") });
   const [boardId, setBoardId] = useState(() => window.localStorage.getItem("studio:board-id") || "talking_head");
@@ -529,14 +554,15 @@ function Canvas() {
     setTab((current) => (current === "both" || current === spec.side ? current : "both"));
     const id = `${type}-${Math.random().toString(36).slice(2, 6)}`;
     const size = { width: spec.width, height: spec.side === "intel" ? 250 : 220 };
+    const rect = flowPane.current?.getBoundingClientRect();
+    const center = rect && rect.width > 0 && rect.height > 0
+      ? screenToFlowPosition({ x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 })
+      : { x: 48, y: 48 };
     setNodes((ns) => [...ns, {
       id, type: "board",
-      position: placeNode(ns.map(nodeBox), { x: 48, y: 48 }, size),
+      position: placeNode(ns.map(nodeBox), { x: center.x - size.width / 2, y: center.y - size.height / 2 }, size),
       data: { nodeType: type, enabled: true, config },
     }]);
-    if (type === "funnel_route") {
-      setTimeout(() => fitView({ nodes: [{ id }], padding: 0.45, duration: 200 }), 40);
-    }
   };
 
   const save = useMutation({
@@ -596,24 +622,32 @@ function Canvas() {
       };
       applyStages(row.stages, row.status);
       if (row.error) await fail(row.error);
-      for (let i = 0; i < 80; i++) {
-        let action = "";
-        if (row.pump) {
-          const step = await api<{ status?: string; action?: string; stage?: string; ok?: boolean; error?: string; stages?: { id: string; status: string }[] }>(`/api/jobs/${row.id}/advance`, { method: "POST", body: {}, timeoutMs: 25000 });
-          status = step.status || status;
-          action = step.action || "";
-          applyStages(step.stages, step.status);
-          if (step.ok === false || step.error) throw new Error(step.error || "Dry run stopped");
-        } else {
-          status = await paint() || status;
-        }
-        if (action === "idle" || action === "stopped") break;
-        if (status === "failed") throw new Error("Dry run failed");
-        if (status === "done" || status === "awaiting_review") break;
-        if (!row.pump && status !== "created" && status !== "running" && status !== "partial") break;
+      // The burst can return pump:false while the saved job is still open.
+      // Polling that job only repaints "waiting" and then toasts success.
+      status = await paint() || row.status || status;
+      if (status === "failed" || status === "blocked") throw new Error(row.error || "Dry run stopped before every block finished");
+      let busyCount = 0;
+      for (let i = 0; i < 80 && openRun(status); i++) {
+        const step = await api<{ status?: string; action?: string; stage?: string; ok?: boolean; error?: string; stages?: { id: string; status: string }[] }>(`/api/jobs/${row.id}/advance`, { method: "POST", body: {}, timeoutMs: 25000 });
+        status = step.status || status;
+        applyStages(step.stages, step.status);
+        if (step.ok === false || step.error) throw new Error(step.error || "Dry run stopped");
+        if (step.action === "busy") {
+          busyCount += 1;
+          if (busyCount >= 2) throw new Error(`${step.stage || "A block"} is still running and did not finish`);
+        } else busyCount = 0;
+        if (step.action === "idle" || step.action === "stopped") break;
+        if (status === "failed") throw new Error(step.error || "Dry run failed");
+        if (status === "done" || status === "awaiting_review" || status === "blocked") break;
         await new Promise((resolve) => setTimeout(resolve, 280));
       }
-      if (row.pump) status = await paint() || status;
+      status = await paint() || status;
+      if (openRun(status)) {
+        const names = waitingBlocks(qc.getQueryData(["job", row.id]));
+        const shown = names.slice(0, 4).join(", ");
+        throw new Error(shown ? `Dry run stopped. Still waiting: ${shown}` : "Dry run stopped before every block finished");
+      }
+      if (status === "failed" || status === "blocked") throw new Error("Dry run stopped before every block finished");
       return { ...row, status };
     },
     onSuccess: (row) => { setRunError(""); setJobId(row.id); qc.invalidateQueries({ queryKey: ["board", boardId] }); toast.success(`Dry run ${row.id} · ${row.status}`); },
@@ -781,7 +815,7 @@ function Canvas() {
                 ))}
               </div>}
             </aside>
-            <div className="v3-flow">
+            <div className="v3-flow" ref={flowPane}>
               <ReactFlow nodes={view.nodes} edges={view.edges} nodeTypes={nodeTypes} onNodesChange={onNodesChange} onEdgesChange={onEdgesChange}
                 onConnect={onConnect} onConnectEnd={onConnectEnd} isValidConnection={isValid} edgesReconnectable={false}
                 connectionRadius={40} colorMode="dark" fitView minZoom={0.15}

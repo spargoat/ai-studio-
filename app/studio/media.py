@@ -36,8 +36,8 @@ def _duration(path):
         return None
     try:
         r = subprocess.run([probe, "-v", "error", "-show_entries", "format=duration",
-                            "-of", "json", str(path)], capture_output=True, text=True)
-    except OSError:
+                            "-of", "json", str(path)], capture_output=True, text=True, timeout=8)
+    except (OSError, subprocess.TimeoutExpired):
         return None
     try:
         return round(float(json.loads(r.stdout)["format"]["duration"]), 2)

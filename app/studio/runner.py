@@ -327,6 +327,61 @@ class Runner:
     def def_of(self, defs, sid):
         return next(d for d in defs if d["id"] == sid)
 
+    def _block_name(self, sdef):
+        if not sdef:
+            return "A block"
+        key = sdef.get("board_node") or sdef.get("kind") or sdef.get("id") or "block"
+        labels = {
+            "video": "Video", "voice": "Voiceover", "script": "Script", "brief": "Brief",
+            "landing": "Landing page", "still": "Still", "image": "Still",
+            "funnel_step": "Funnel step", "ad_feed": "Ad Feed", "funnel_route": "Funnel Map",
+            "intel": "Intel",
+        }
+        return labels.get(key, str(key).replace("_", " ").capitalize())
+
+    def stall_reason(self, job_id):
+        """Why a dry run stopped with blocks that never started. Named, so the canvas can show it."""
+        job = self.db.job(job_id)
+        if not job:
+            return "Dry run stopped before every block finished"
+        defs = self.stage_defs(job)
+        by_id = {d["id"]: d for d in defs}
+        lines = []
+        for sdef in defs:
+            if sdef.get("disabled"):
+                continue
+            latest = self.db.latest(job_id, sdef["id"])
+            if latest and latest["status"] == READY and self.is_ready(latest, sdef) and not self.is_stale(job_id, latest):
+                continue
+            name = self._block_name(sdef)
+            if latest and latest["status"] in ("failed", "blocked_budget"):
+                text = latest.get("error") or f"{name} failed"
+                lines.append(text if name in text else f"{name}: {text}")
+                continue
+            unmet = []
+            for dep in sdef.get("needs") or []:
+                ddef = by_id.get(dep)
+                if ddef is None:
+                    unmet.append(f"{dep} (missing)")
+                    continue
+                if ddef.get("disabled"):
+                    unmet.append(f"{self._block_name(ddef)} (turned off)")
+                    continue
+                if not self.is_ready(self.db.latest(job_id, dep), ddef):
+                    unmet.append(self._block_name(ddef))
+            if unmet:
+                lines.append(f"{name} is waiting on {', '.join(unmet)}")
+            elif latest is None or latest["status"] != READY:
+                lines.append(f"{name} did not finish")
+        if not lines:
+            return "Dry run stopped before every block finished"
+        shown = lines[:4]
+        text = "Dry run stopped. " + "; ".join(shown)
+        extra = len(lines) - len(shown)
+        if extra:
+            text += f"; and {extra} more"
+        return text
+
     def is_complete(self, job_id, defs):
         active = [d for d in defs if not d.get("disabled")]
         return all(self.is_ready(self.db.latest(job_id, d["id"]), d)
@@ -517,6 +572,9 @@ class Runner:
                 scope.flush()
             if isinstance(body, dict):
                 body["stages"] = scope.statuses()
+                if body.get("status") == "blocked" and not body.get("error"):
+                    body["ok"] = False
+                    body["error"] = self.stall_reason(job_id)
             return body
 
     def _advance_body(self, job_id, only=None):
@@ -538,7 +596,16 @@ class Runner:
                     body["ok"] = False
                     body["error"] = fresh["error"]
                 return body
-            return {"action": "busy", "stage": run["stage"], "status": "running"}
+            # A dry row left running means the previous request died mid-stage.
+            # Waiting out the 360s timeout left the button on Running with no error.
+            sdef = next((d for d in defs if d["id"] == run["stage"]), None)
+            reason = f"{self._block_name(sdef)} was left running with no result"
+            stamp = now()
+            self.db.update_run(run["id"], status="failed", error=reason, finished_at=stamp)
+            self._close_attempts_for_run(run, reason, stamp)
+            self.log(job_id, run["stage"], "error", reason)
+            return {"action": "stage", "stage": run["stage"], "ok": False, "pending": False,
+                    "error": reason, "status": self.settle(job_id)}
         if not only:
             bad = self._failed_stage(job_id)
             if bad:
@@ -590,7 +657,11 @@ class Runner:
                 return body
         finally:
             self.async_fal = False
-        return {"action": "idle", "status": self.settle(job_id)}
+        body = {"action": "idle", "status": self.settle(job_id)}
+        if body["status"] == "blocked":
+            body["ok"] = False
+            body["error"] = self.stall_reason(job_id)
+        return body
 
     def _failed_stage(self, job_id):
         """Latest run of a stage that already failed. Advance does not start another version."""
@@ -668,7 +739,9 @@ class Runner:
         persona = self.cfg["_personas"][brief["persona"]]
         cps = (next((d for d in self.stage_defs(job) if d["kind"] == "voice"), {}).get("params") or {}).get("chars_per_second", 15)
         audio_s = pricing.est_audio_seconds(brief["script"], cps)
-        if not dry_estimate:
+        # A fast dry run must not ffprobe the voice file. That probe has no timeout
+        # and ran before the video row existed, so a hang left Video on "waiting".
+        if not dry_estimate and os.environ.get("STUDIO_MOCK_FAST", "1") == "0":
             from .storage import local
             voice_id = next((d["id"] for d in self.stage_defs(job) if d["kind"] == "voice"), "voice")
             v = self.db.latest(job["id"], voice_id)
@@ -858,6 +931,8 @@ class Runner:
         run = self.db.run(run_id)
         if not q.get("enabled", True) or run["stage"] not in q.get("stages", ["still", "video", "lipsync", "finish"]):
             return None
+        if self._meta(run.get("meta_json")).get("placeholder"):
+            return None
         from . import score
         if not score.scorable(run["output_path"]):
             return None
@@ -916,9 +991,8 @@ class Runner:
 
     def _placeholder_still(self, out_dir):
         path = Path(out_dir) / "board_still.png"
-        from .assets import ffmpeg_on_disk
-        if ffmpeg_on_disk("ffmpeg") is None:
-            from .providers.mock import write_placeholder
+        from .providers.mock import byte_media, write_placeholder
+        if byte_media():
             write_placeholder("png", path)
             return str(path)
         from .media import ff

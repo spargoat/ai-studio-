@@ -761,6 +761,122 @@ class T(unittest.TestCase):
         self.assertEqual(blown.get_json()["error"], "disk full")
         self.assertTrue(blown.get_json()["id"])
 
+    def test_replicate_scaffold_dry_run_finishes_video(self):
+        c = cfg()
+        c["_db_file"] = TMP / "scaffold-video.db"
+        os.environ["STUDIO_ONE_STAGE"] = "1"
+        os.environ["STUDIO_DRY_BUDGET_S"] = "0"
+        self.addCleanup(os.environ.pop, "STUDIO_ONE_STAGE", None)
+        self.addCleanup(os.environ.pop, "STUDIO_DRY_BUDGET_S", None)
+        steps = [{"n": i, "kind": "ad" if i == 1 else "click" if i == 2 else "landing", "label": f"Step {i}"} for i in range(1, 4)]
+        nodes, edges = [], []
+        for i, step in enumerate(steps):
+            nid = f"step-funnel-{step['n']}"
+            nodes.append({"id": nid, "type": "funnel_step", "enabled": True, "position": {"x": 0, "y": 0},
+                          "config": {"n": str(step["n"]), "kind": step["kind"], "label": step["label"]}})
+            if i:
+                prev = f"step-funnel-{steps[i - 1]['n']}"
+                edges.append({"id": f"e{i}", "source": prev, "sourceHandle": "step", "target": nid, "targetHandle": "step"})
+        ids = {k: f"rep-funnel-{k}" for k in ("brief", "script", "voice", "video", "landing")}
+        for key, typ, cfg_node in (
+            ("brief", "brief", {"persona": "marco"}),
+            ("script", "script", {}),
+            ("voice", "voice", {}),
+            ("video", "video", {"format": "talking_head", "aspect": "9:16"}),
+            ("landing", "landing", {}),
+        ):
+            nodes.append({"id": ids[key], "type": typ, "enabled": True, "position": {"x": 0, "y": 0}, "config": cfg_node})
+        edges += [
+            {"id": "e-brief", "source": "step-funnel-1", "sourceHandle": "step", "target": ids["brief"], "targetHandle": "source"},
+            {"id": "e-script", "source": ids["brief"], "sourceHandle": "brief", "target": ids["script"], "targetHandle": "brief"},
+            {"id": "e-click", "source": "step-funnel-2", "sourceHandle": "step", "target": ids["script"], "targetHandle": "source"},
+            {"id": "e-voice", "source": ids["script"], "sourceHandle": "script", "target": ids["voice"], "targetHandle": "script"},
+            {"id": "e-video", "source": ids["voice"], "sourceHandle": "audio", "target": ids["video"], "targetHandle": "audio"},
+            {"id": "e-land-b", "source": ids["brief"], "sourceHandle": "brief", "target": ids["landing"], "targetHandle": "brief"},
+            {"id": "e-land-s", "source": "step-funnel-3", "sourceHandle": "step", "target": ids["landing"], "targetHandle": "source"},
+        ]
+        graph = {"nodes": nodes, "edges": edges, "variables": {"persona": "marco", "offer": "stop", "script": ""}}
+        client = create_app(c).test_client()
+        created = client.post("/api/boards", json={"name": "FMO", "graph": graph})
+        self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
+        bid = created.get_json()["id"]
+        with patch("studio.media.duration", side_effect=AssertionError("ffprobe")):
+            started = client.post(f"/api/boards/{bid}/run", json={"mode": "dry"})
+            self.assertEqual(started.status_code, 201, started.get_data(as_text=True))
+            body = started.get_json()
+            self.assertIs(body["pump"], True)
+            self.assertNotIn("error", body)
+            jid = body["id"]
+            status = body.get("status")
+            guard = 0
+            while status in ("created", "running", "partial") and guard < 40:
+                step = client.post(f"/api/jobs/{jid}/advance", json={})
+                self.assertEqual(step.status_code, 200, step.get_data(as_text=True))
+                body = step.get_json()
+                self.assertIsNot(body.get("ok"), False, body)
+                status = body.get("status") or status
+                if body.get("action") in ("idle", "stopped") or status in ("done", "failed", "blocked"):
+                    break
+                guard += 1
+        self.assertEqual(status, "done", body)
+        done = client.get(f"/api/jobs/{jid}").get_json()
+        self.assertEqual(_stage_status(done, ids["video"]), "succeeded")
+        self.assertEqual(next(stage["needs"] for stage in done["stages"] if stage["id"] == ids["video"]), [ids["voice"]])
+        blob = Path(_stage_run(done, ids["video"])["output_path"]).read_bytes()
+        self.assertIn(b"ftyp", blob[:64])
+
+    def test_video_waiting_on_a_disabled_still_is_an_error(self):
+        c = cfg()
+        c["_db_file"] = TMP / "video-blocked.db"
+        os.environ["STUDIO_ONE_STAGE"] = "1"
+        self.addCleanup(os.environ.pop, "STUDIO_ONE_STAGE", None)
+        graph = {"variables": {"persona": "marco", "script": "Name the offer, then the one next step."}, "nodes": [
+            {"id": "b", "type": "brief", "enabled": True, "position": {"x": 0, "y": 0}, "config": {"persona": "marco"}},
+            {"id": "s", "type": "still", "enabled": False, "position": {"x": 0, "y": 0}, "config": {}},
+            {"id": "v", "type": "video", "enabled": True, "position": {"x": 0, "y": 0}, "config": {"format": "talking_head"}},
+        ], "edges": [
+            {"id": "e1", "source": "b", "sourceHandle": "brief", "target": "s", "targetHandle": "brief"},
+            {"id": "e2", "source": "s", "sourceHandle": "still", "target": "v", "targetHandle": "still"},
+        ]}
+        client = create_app(c).test_client()
+        created = client.post("/api/boards", json={"name": "Blocked video", "graph": graph})
+        self.assertEqual(created.status_code, 201, created.get_data(as_text=True))
+        res = client.post(f"/api/boards/{created.get_json()['id']}/run", json={"mode": "dry"})
+        self.assertEqual(res.status_code, 201, res.get_data(as_text=True))
+        body = res.get_json()
+        self.assertIs(body["pump"], False)
+        self.assertIn("Video is waiting on Still", body["error"])
+        self.assertEqual(body["status"], "blocked")
+
+    def test_a_stage_left_running_fails_on_the_next_advance(self):
+        c = cfg()
+        c["_db_file"] = TMP / "stuck-run.db"
+        graph = talking_head_preset()
+        stages = compile_board(graph)
+        brief = job_brief(graph, stages)
+        for stage in brief["board_stages"]:
+            stage["review"] = False
+        with Runner(c, log=lambda m: None) as runner:
+            jid = runner.create_job(brief)
+            runner.db.new_run(jid, "video", "dry", "mock", "mock", "local_ffmpeg", "", {}, {}, 0)
+            step = runner.advance(jid)
+        self.assertFalse(step["ok"])
+        self.assertNotEqual(step["action"], "busy")
+        self.assertIn("Video was left running with no result", step["error"])
+        self.assertEqual(step["status"], "failed")
+
+    def test_board_dry_run_uses_placeholder_bytes_when_ffmpeg_is_installed(self):
+        from studio.providers.mock import byte_media
+        saved = os.environ.get("STUDIO_NO_FFMPEG_FETCH")
+        self.addCleanup(lambda: os.environ.pop("STUDIO_NO_FFMPEG_FETCH", None) if saved is None else os.environ.__setitem__("STUDIO_NO_FFMPEG_FETCH", saved))
+        os.environ["STUDIO_NO_FFMPEG_FETCH"] = "1"
+        with patch("studio.providers.mock.ffmpeg_ready", return_value=True):
+            self.assertTrue(byte_media())
+        os.environ["STUDIO_MOCK_FAST"] = "0"
+        self.addCleanup(lambda: os.environ.__setitem__("STUDIO_MOCK_FAST", "1"))
+        with patch("studio.providers.mock.ffmpeg_ready", return_value=True):
+            self.assertFalse(byte_media())
+
     def test_vercel_dry_run_does_not_download_ffmpeg(self):
         c = cfg()
         c["_db_file"] = TMP / "nofetch.db"
@@ -1018,6 +1134,13 @@ class T(unittest.TestCase):
         self.assertIn("v3-alert", page)
         self.assertIn("setRunError", page)
         self.assertIn("timeoutMs: 25000", page)
+        self.assertIn("openRun(status)", page)
+        self.assertIn("Still waiting:", page)
+        self.assertIn("is still running and did not finish", page)
+        self.assertIn("flowPane.current?.getBoundingClientRect()", page)
+        self.assertIn("rect.left + rect.width / 2", page)
+        self.assertIn("rect.top + rect.height / 2", page)
+        self.assertNotIn("setTimeout(() => fitView({ nodes: [{ id }], padding: 0.45, duration: 200 }), 40)", page)
         self.assertIn('draggable={type !== "funnel_route"}', page)
         self.assertIn('addNode("funnel_route", { funnel_id: f.id, funnel_name: f.name })', page)
         self.assertIn("Add this funnel as a Funnel Map block", page)

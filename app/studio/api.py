@@ -42,6 +42,22 @@ def one_stage():
     return os.environ.get("VERCEL") == "1" or os.environ.get("STUDIO_ONE_STAGE") == "1"
 
 
+class _NoFfmpegFetch:
+    """A dry board writes placeholder bytes even when ffmpeg is already on disk."""
+
+    def __enter__(self):
+        self.previous = os.environ.get("STUDIO_NO_FFMPEG_FETCH")
+        os.environ["STUDIO_NO_FFMPEG_FETCH"] = "1"
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.previous is None:
+            os.environ.pop("STUDIO_NO_FFMPEG_FETCH", None)
+        else:
+            os.environ["STUDIO_NO_FFMPEG_FETCH"] = self.previous
+        return False
+
+
 def register(app, cfg, runner, live, bg):
     db = runner.db
     ensure_presets(db)
@@ -186,7 +202,8 @@ def register(app, cfg, runner, live, bg):
                                "summary": m.get("summary"),
                                "stale": stale(r)})
             last = runs[-1] if runs else {}
-            stages.append({"id": d["id"], "kind": d["kind"], "review": bool(d.get("review")), "needs": d.get("needs") or [],
+            stages.append({"id": d["id"], "kind": d["kind"], "node": d.get("board_node") or d["kind"],
+                           "review": bool(d.get("review")), "needs": d.get("needs") or [],
                            "provider": last.get("provider") or sc["provider"], "model": last.get("model") or sc["model"],
                            "default_model": sc["model"], "runs": runs})
         return jsonify({"job": job_row(j) | {"brief": j["brief"]}, "stages": stages, "events": db.events(jid, 60),
@@ -332,7 +349,12 @@ def register(app, cfg, runner, live, bg):
         if job["mode"] == "live" and os.environ.get("STUDIO_ALLOW_LIVE") != "1":
             return err("Live runs are blocked. Set STUDIO_ALLOW_LIVE=1 to advance them.", 409)
         try:
-            return jsonify(runner.advance(jid))
+            if job["mode"] == "live":
+                body = runner.advance(jid)
+            else:
+                with _NoFfmpegFetch():
+                    body = runner.advance(jid)
+            return jsonify(body)
         except BriefError as e:
             return err(e, 409)
         except Exception as e:
@@ -540,38 +562,32 @@ def register(app, cfg, runner, live, bg):
         # One run_job held every node on idle until the request returned, and on
         # Vercel that request downloaded ffmpeg. Run a short burst, then let the
         # client pump and paint. A dry board does not fetch the ffmpeg archive.
-        previous = os.environ.get("STUDIO_NO_FFMPEG_FETCH")
-        os.environ["STUDIO_NO_FFMPEG_FETCH"] = "1"
         try:
-            try:
-                budget = float(os.environ.get("STUDIO_DRY_BUDGET_S") or 18)
-            except ValueError:
-                budget = 18.0
-            deadline = time.monotonic() + max(0.0, budget)
-            status, error, stages = "created", None, None
-            # One read of this job, then each stage is a single write batch.
-            # Reloading latest() per node is what made Turso take 30–60s a stage.
-            with runner.db.job_scope(jid):
-                while time.monotonic() < deadline:
-                    step = runner.advance(jid)
-                    status = step.get("status") or status
-                    stages = step.get("stages", stages)
-                    if step.get("ok") is False:
-                        error = step.get("error") or "Dry run stopped"
-                        break
-                    if step.get("action") in ("idle", "stopped"):
-                        break
-                    if status not in ("created", "running", "partial"):
-                        break
+            with _NoFfmpegFetch():
+                try:
+                    budget = float(os.environ.get("STUDIO_DRY_BUDGET_S") or 18)
+                except ValueError:
+                    budget = 18.0
+                deadline = time.monotonic() + max(0.0, budget)
+                status, error, stages = "created", None, None
+                # One read of this job, then each stage is a single write batch.
+                # Reloading latest() per node is what made Turso take 30–60s a stage.
+                with runner.db.job_scope(jid):
+                    while time.monotonic() < deadline:
+                        step = runner.advance(jid)
+                        status = step.get("status") or status
+                        stages = step.get("stages", stages)
+                        if step.get("ok") is False:
+                            error = step.get("error") or "Dry run stopped"
+                            break
+                        if step.get("action") in ("idle", "stopped"):
+                            break
+                        if status not in ("created", "running", "partial"):
+                            break
         except BriefError as e:
             return err(e, 409)
         except Exception as e:
             return jsonify({"error": str(e), "id": jid}), 502
-        finally:
-            if previous is None:
-                os.environ.pop("STUDIO_NO_FFMPEG_FETCH", None)
-            else:
-                os.environ["STUDIO_NO_FFMPEG_FETCH"] = previous
         pump = status in ("created", "running", "partial") and not error
         body = {"id": jid, "mode": "dry", "pump": pump, "status": status, "stages": stages or []}
         if error:
