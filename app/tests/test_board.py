@@ -393,25 +393,18 @@ class T(unittest.TestCase):
             self.assertEqual(loaded["preview"]["origin"], "fixture")
             self.assertIn("Fixture", loaded["preview"]["label"])
             self.assertTrue(loaded["preview"]["timeline"]["evidence"]["fields"]["points"])
+            import time
+            started_at = time.perf_counter()
             started = client.post("/api/boards/talking_head/run", json={})
+            elapsed = time.perf_counter() - started_at
             self.assertEqual(started.status_code, 201, started.get_data(as_text=True))
             payload = started.get_json()
             self.assertEqual(payload["mode"], "dry")
-            self.assertIs(payload["pump"], True)
-            job = client.get(f"/api/jobs/{payload['id']}").get_json()
-            self.assertEqual(job["job"]["mode"], "dry")
-            # The first request only runs the unwired timeline. The chain continues on /advance.
-            self.assertEqual(_stage_status(job, "timeline"), "succeeded")
-            self.assertIsNone(_stage_status(job, "ad_feed"))
-            last = {}
-            for _ in range(16):
-                last = client.post(f"/api/jobs/{payload['id']}/advance").get_json()
-                if last.get("ok") is False or last.get("status") in ("awaiting_review", "done", "failed"):
-                    break
-                if last.get("action") in ("idle", "stopped"):
-                    break
-            self.assertEqual(last.get("status"), "done", last)
+            self.assertIs(payload["pump"], False)
+            self.assertEqual(payload["status"], "done")
+            self.assertLess(elapsed, 45, "a dry board should finish in seconds, not one encode per stage")
             done = client.get(f"/api/jobs/{payload['id']}").get_json()
+            self.assertEqual(done["job"]["mode"], "dry")
             for sid in ("timeline", "ad_feed", "ad_breakdown", "funnel", "teardown", "brief", "script", "voice", "video"):
                 self.assertEqual(_stage_status(done, sid), "succeeded", sid)
                 run = _stage_run(done, sid)
@@ -712,8 +705,11 @@ class T(unittest.TestCase):
         os.environ["STUDIO_ONE_STAGE"] = "1"
         self.addCleanup(os.environ.pop, "STUDIO_ONE_STAGE", None)
         app = create_app(c)
-        with patch("studio.runner.Runner.advance", return_value={"action": "idle", "status": "created"}):
+        with patch("studio.runner.Runner.run_job", return_value="done") as run:
             res = app.test_client().post("/api/boards/talking_head/run", json={"mode": "dry"})
+        self.assertTrue(run.called)
+        self.assertIs(res.get_json()["pump"], False)
+        self.assertEqual(res.get_json()["status"], "done")
         self.assertEqual(res.status_code, 201, res.get_data(as_text=True))
         jid = res.get_json()["id"]
         job = app.test_client().get(f"/api/jobs/{jid}").get_json()
@@ -876,9 +872,22 @@ class T(unittest.TestCase):
         split = css.split(".lib-split {", 1)[1].split("}", 1)[0]
         self.assertIn("align-items: start", split)
         self.assertIn('loading ? "Loading ads…"', nodes)
+        self.assertIn('scope: "feed"', nodes)
+        self.assertNotIn("keepPreviousData", nodes)
         self.assertIn("cleanStepLabel(config.label)", nodes)
         self.assertIn("isPending", page)
-        self.assertIn("previewLoading", page)
+        self.assertNotIn("keepPreviousData", page)
+        item = css.split(".v3-dir-item b, .v3-dir-item small {", 1)[1].split("}", 1)[0]
+        self.assertIn("white-space: normal", item)
+        self.assertIn("overflow-wrap: anywhere", item)
+        self.assertNotIn("ellipsis", item)
+        main = (root / "ui" / "src" / "main.tsx").read_text()
+        router = (root / "ui" / "src" / "router.tsx").read_text()
+        self.assertIn("vite:preloadError", main)
+        self.assertIn("studio:chunk-reload", main)
+        self.assertIn("preventDefault", main)
+        self.assertNotIn("serviceWorker", main + router)
+        self.assertIn("errorElement", router)
 
     def test_marco_face_sheet_is_a_placeholder_when_the_file_is_missing(self):
         client = create_app(cfg()).test_client()
@@ -921,6 +930,10 @@ class T(unittest.TestCase):
         res = client.get("/api/meta", headers={"x-vercel-oidc-token": token})
         body = res.get_data(as_text=True)
         self.assertNotIn(token, body)
+        cache = res.headers["Cache-Control"]
+        self.assertIn("no-store", cache)
+        self.assertNotIn("public", cache.lower())
+        self.assertEqual(res.headers["CDN-Cache-Control"], "no-store")
         row = next(item for item in res.get_json()["connections"] if item["id"] == "llm")
         self.assertTrue(row["set"])
         self.assertEqual(row["env"], "x-vercel-oidc-token")
@@ -1074,6 +1087,128 @@ class T(unittest.TestCase):
             provider.do_script({"stage": "script", "kind": "script", "model": "openai/gpt-4o-mini",
                                 "prompt": "x", "params": {}, "out_dir": str(TMP)})
         self.assertIn("needs key", str(caught.exception))
+
+    def test_feed_scope_is_only_the_waterfall(self):
+        client = create_app(cfg()).test_client()
+        res = client.get("/api/intel/preview?advertiser=Northline%20Markets&page_id=&scope=feed")
+        self.assertEqual(res.status_code, 200, res.get_data(as_text=True))
+        body = res.get_json()
+        self.assertEqual(body["origin"], "fixture")
+        self.assertIn("feed", body)
+        self.assertNotIn("breakdown", body)
+        self.assertNotIn("timeline", body)
+        self.assertGreater(body["feed"]["evidence"]["fields"]["matched"], 0)
+        cache = res.headers["Cache-Control"]
+        self.assertIn("no-store", cache)
+        self.assertNotIn("public", cache.lower())
+        self.assertEqual(res.headers["CDN-Cache-Control"], "no-store")
+
+    def test_mixed_pages_narrow_and_a_wrong_page_is_empty(self):
+        os.environ["ADINTEL_API_URL"] = "https://tracker.example"
+        os.environ["ADINTEL_API_SECRET"] = "secret"
+        class Resp:
+            status_code = 200
+            def __init__(self, ads, matched):
+                self.ads, self.matched = ads, matched
+            def json(self):
+                return {"ok": True, "evidence": {"source": "sqlite", "asOf": "2026-10-22"},
+                        "matched": self.matched, "limit": 40, "offset": 0, "observed": {"ads": self.ads}}
+        mixed = [{"id": "keep", "advertiser": "Financial Markets Online", "pageId": "141622589997474", "status": "live", "headline": "Course"},
+                 {"id": "drop", "advertiser": "Christopher Edwards", "pageId": "1284750291390880", "status": "live", "headline": "Transparency Before Performance"}]
+        wrong = [{"id": "other", "advertiser": "Christopher Edwards", "pageId": "1284750291390880", "status": "live", "headline": "Transparency Before Performance"}]
+        try:
+            with patch("studio.adintel.requests.get", return_value=Resp(mixed, 621)):
+                pack = query_ads({"advertiser": "Financial Markets Online", "page_id": "141622589997474"})
+            self.assertEqual([ad["id"] for ad in pack["ads"]], ["keep"])
+            self.assertEqual(pack["matched"], 1)
+            with patch("studio.adintel.requests.get", side_effect=[type("Bad", (), {"status_code": 400, "json": lambda self: {}})(), Resp(wrong, 109)]):
+                empty = query_ads({"advertiser": "Financial Markets Online", "page_id": "141622589997474"})
+            self.assertEqual(empty["ads"], [])
+            self.assertEqual(empty["matched"], 0)
+        finally:
+            os.environ.pop("ADINTEL_API_URL", None)
+            os.environ.pop("ADINTEL_API_SECRET", None)
+
+    def test_unassigned_ad_joins_the_advertiser_funnel(self):
+        from studio.adintel import funnel_for, route_for_funnel
+        os.environ["ADINTEL_API_URL"] = "https://tracker.example"
+        os.environ["ADINTEL_API_SECRET"] = "secret"
+        directory = {"ok": True, "evidence": {"source": "sqlite", "asOf": "2026-10-21"}, "observed": {"funnels": [
+            {"id": "ethan", "name": "Ethan Young", "advertisers": [], "ads": 0},
+            {"id": "small", "name": "FMO short", "advertisers": ["financial markets online"], "ads": 2},
+            {"id": "recrZfUBy00FQqCeX", "name": "Financial Markets Online", "advertisers": ["Financial Markets Online"], "ads": 39},
+        ]}}
+        class Resp:
+            def __init__(self, data, code=200):
+                self.status_code = code
+                self.data = data
+            def json(self):
+                return self.data
+        def fmo(url, params=None, timeout=None, headers=None):
+            if url.endswith("/ads/fmo-1"):
+                return Resp({"ok": True, "evidence": {"asOf": "2026-10-21"}, "observed": {
+                    "id": "fmo-1", "advertiser": "Financial Markets Online", "status": "live",
+                    "assignedFunnel": "", "funnel": "", "headline": "90-Day Trading Course"}})
+            if url.endswith("/funnels"):
+                return Resp(directory)
+            if url.endswith("/funnels/recrZfUBy00FQqCeX/route"):
+                owned = [{"role": "cta", "title": "Form", "adId": "fmo-1"}, {"role": "landing", "title": "Webinar", "adId": "fmo-1"}]
+                noise = [{"role": "landing", "title": "Eventbrite", "adId": "other"}] * 20
+                return Resp({"ok": True, "evidence": {"asOf": "2026-10-21"},
+                             "funnel": {"id": "recrZfUBy00FQqCeX", "name": "Financial Markets Online"},
+                             "observed": {"storedSteps": noise + owned, "laneSteps": []},
+                             "inferred": {"storedSteps": [], "laneSteps": []},
+                             "unknown": {"storedSteps": [], "laneSteps": []}})
+            raise AssertionError(url)
+        def ethan(url, params=None, timeout=None, headers=None):
+            if url.endswith("/ads/ethan-1"):
+                return Resp({"ok": True, "evidence": {"asOf": "2026-10-21"}, "observed": {
+                    "id": "ethan-1", "advertiser": "Ethan Young", "status": "live", "assignedFunnel": "", "funnel": ""}})
+            if url.endswith("/funnels"):
+                return Resp(directory)
+            raise AssertionError(url)
+        wide = [{"role": "next", "title": f"Step {i}"} for i in range(15) for _ in range(2)]
+        wide_body = {"ok": True, "evidence": {"asOf": "2026-10-21"}, "funnel": {"id": "big", "name": "Big"},
+                     "observed": {"storedSteps": wide, "laneSteps": []},
+                     "inferred": {"storedSteps": [], "laneSteps": []}, "unknown": {"storedSteps": [], "laneSteps": []}}
+        try:
+            with patch("studio.adintel.requests.get", side_effect=fmo):
+                result = funnel_for("fmo-1")
+            self.assertEqual(result["funnel_id"], "recrZfUBy00FQqCeX")
+            self.assertEqual(result["funnel_name"], "Financial Markets Online")
+            self.assertNotIn("note", result)
+            self.assertEqual([step["label"] for step in result["steps"]], ["Form", "Webinar"])
+            self.assertTrue(all(step["ad_id"] == "fmo-1" for step in result["steps"]))
+            with patch("studio.adintel.requests.get", side_effect=ethan) as get:
+                empty = funnel_for("ethan-1")
+            self.assertIn("No funnel is assigned", empty["note"])
+            self.assertEqual(empty["steps"], [])
+            self.assertEqual(get.call_count, 2)
+            with patch("studio.adintel.requests.get", return_value=Resp(wide_body)):
+                collapsed = route_for_funnel("big", ad_id="missing")
+            self.assertEqual(len(collapsed["steps"]), 12)
+            self.assertEqual(len({(step["kind"], step["label"]) for step in collapsed["steps"]}), 12)
+        finally:
+            os.environ.pop("ADINTEL_API_URL", None)
+            os.environ.pop("ADINTEL_API_SECRET", None)
+
+    def test_dry_placeholders_stay_small_unless_asked(self):
+        from studio.providers.mock import frame_size, mock_fast, placeholder_seconds
+        saved = os.environ.get("STUDIO_MOCK_FAST")
+        def restore():
+            if saved is None:
+                os.environ.pop("STUDIO_MOCK_FAST", None)
+            else:
+                os.environ["STUDIO_MOCK_FAST"] = saved
+        self.addCleanup(restore)
+        os.environ.pop("STUDIO_MOCK_FAST", None)
+        self.assertTrue(mock_fast())
+        self.assertEqual(frame_size(), (270, 480, 10))
+        self.assertEqual(placeholder_seconds(15), 1.0)
+        os.environ["STUDIO_MOCK_FAST"] = "0"
+        self.assertFalse(mock_fast())
+        self.assertEqual(frame_size(), (1080, 1920, 30))
+        self.assertEqual(placeholder_seconds(15), 15.0)
 
 
 def _stage_run(job, sid):

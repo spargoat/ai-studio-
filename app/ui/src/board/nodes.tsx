@@ -250,24 +250,50 @@ function Panels({ artefact }: { artefact?: Artefact | null }) {
   );
 }
 
-function FeedWaterfall({ nodeId, config, ads, matched, loading }: { nodeId: string; config: Record<string, string>; ads: WaterAd[]; matched?: number; loading?: boolean }) {
+function FeedWaterfall({ nodeId, config }: { nodeId: string; config: Record<string, string> }) {
   const { setConfig, accounts, addAds } = useContext(BoardCtx);
   const [open, setOpen] = useState<string | null>(null);
   const [selected, setSelected] = useState<string[]>([]);
+  // This node's account, not the first ad-feed on the board. The dropdown label
+  // comes from the account list, so the cards have to be read with the same page.
+  const qs = new URLSearchParams({
+    advertiser: config.advertiser || "",
+    page_id: config.page_id || "",
+    status: config.status || "",
+    date_from: config.date_from || "",
+    date_to: config.date_to || "",
+    longevity_min: config.longevity_min || "",
+    limit: config.limit || "40",
+    offset: config.offset || "0",
+    ad_id: config.ad_id || "",
+    scope: "feed",
+  }).toString();
+  const own = useQuery({
+    queryKey: ["intel-feed", qs],
+    queryFn: () => api<{ feed?: { evidence?: { fields?: { waterfall?: WaterAd[]; matched?: number } } } }>(`/api/intel/preview?${qs}`),
+  });
+  const ads = own.data?.feed?.evidence?.fields?.waterfall || [];
+  const matched = own.data?.feed?.evidence?.fields?.matched;
+  const loading = own.isPending || (own.isFetching && !own.data);
   const route = useQuery({ queryKey: ["ad-funnel", open], queryFn: () => api<{ steps: { n: number; kind: string; label: string; url?: string; state?: string }[]; note?: string }>(`/api/intel/ads/${encodeURIComponent(open || "")}/funnel`), enabled: !!open });
   const offset = Number(config.offset || 0) || 0;
   const limit = Number(config.limit || 40) || 40;
+  const named = accounts.filter((row) => row.advertiser === (config.advertiser || ""));
+  const accountValue = config.page_id || (config.advertiser && named.length === 1 ? (named[0].page_id || named[0].advertiser) : "");
   return (
     <div className="nodrag nopan">
       <label className="v3-lab">Ad account
-        <select aria-label="Ad account" className="v3-in" value={config.advertiser || ""}
+        <select aria-label="Ad account" className="v3-in" value={accountValue}
           onChange={(e) => {
-            const advertiser = e.target.value;
-            const row = accounts.find((item) => item.advertiser === advertiser);
-            setConfig(nodeId, { advertiser, page_id: row?.page_id || "", ad_id: "", status: "", date_from: "", date_to: "", longevity_min: "", offset: "0" });
+            const picked = e.target.value;
+            const row = accounts.find((item) => (item.page_id || item.advertiser) === picked);
+            setConfig(nodeId, { advertiser: row?.advertiser || "", page_id: row?.page_id || "", ad_id: "", status: "", date_from: "", date_to: "", longevity_min: "", offset: "0" });
           }}>
           <option value="">All accounts in this read</option>
-          {accounts.map((row) => <option key={row.page_id || row.advertiser} value={row.advertiser}>{row.advertiser} · {row.ads}</option>)}
+          {accounts.map((row) => {
+            const optionValue = row.page_id || row.advertiser;
+            return <option key={`${optionValue}-${row.ads}`} value={optionValue}>{row.advertiser} · {row.ads}</option>;
+          })}
         </select>
       </label>
       <div className="v3-acts nodrag nopan">
@@ -305,7 +331,7 @@ function FeedWaterfall({ nodeId, config, ads, matched, loading }: { nodeId: stri
             </div>
           );
         })}
-        {!ads.length && <p className="v3-muted">{loading ? "Loading ads…" : "No ads for this account in the read."}</p>}
+        {!ads.length && <p className={own.isError ? "v3-warn" : "v3-muted"}>{own.isError ? (own.error as Error).message : loading ? "Loading ads…" : "No ads for this account in the read."}</p>}
       </div>
       <div className="v3-acts nodrag nopan">
         <button type="button" className="v3-mini" disabled={offset <= 0} onClick={() => { setSelected([]); setConfig(nodeId, { offset: String(Math.max(0, offset - limit)), ad_id: "" }); }}>Previous</button>
@@ -315,8 +341,8 @@ function FeedWaterfall({ nodeId, config, ads, matched, loading }: { nodeId: stri
   );
 }
 
-function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config, loading }: {
-  artefact?: Artefact | null; nodeType: string; nodeId: string; selectedEvent?: string; config: Record<string, string>; loading?: boolean;
+function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config }: {
+  artefact?: Artefact | null; nodeType: string; nodeId: string; selectedEvent?: string; config: Record<string, string>;
 }) {
   const { mapFunnel, replicate, funnels, setConfig } = useContext(BoardCtx);
   const pickedRoute = useQuery({
@@ -328,7 +354,6 @@ function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config, loading 
   const fields = evidence?.fields || {};
   const picked = (fields.picked as { headline?: string; advertiser?: string } | undefined) || artefact?.ad;
   const steps = (fields.steps as { label?: string }[] | undefined) || [];
-  const waterfall = (fields.waterfall as WaterAd[] | undefined) || [];
   if (nodeType === "market_timeline") {
     return (
       <div className="v3-bd">
@@ -351,7 +376,7 @@ function IntelBody({ artefact, nodeType, nodeId, selectedEvent, config, loading 
   const routeSteps = collapseRoute((pickedRoute.data?.steps?.length ? pickedRoute.data.steps : steps) as RouteStep[]);
   return (
     <div className="v3-bd">
-      {nodeType === "ad_feed" && <FeedWaterfall nodeId={nodeId} config={config} ads={waterfall} matched={fields.matched as number | undefined} loading={loading} />}
+      {nodeType === "ad_feed" && <FeedWaterfall nodeId={nodeId} config={config} />}
       {nodeType === "funnel_route" && (
         <>
           <label className="v3-lab">Funnel
@@ -636,7 +661,7 @@ export function BoardNode({ id, data, selected }: NodeProps<Node<BoardData, "boa
           </div>
         )}
         {data.nodeType === "kit_master" ? <KitBody id={id} config={data.config} /> : canvas ? <CanvasBody id={id} nodeType={data.nodeType} config={data.config} /> : intel
-          ? <IntelBody artefact={data.preview} nodeType={data.nodeType} nodeId={id} selectedEvent={data.config.event_id} config={data.config} loading={data.previewLoading} />
+          ? <IntelBody artefact={data.preview} nodeType={data.nodeType} nodeId={id} selectedEvent={data.config.event_id} config={data.config} />
           : <CreateBody id={id} nodeType={data.nodeType} config={data.config} file={data.file} />}
         {!canvas && <footer className="v3-ft">
           <span className={`v3-st ${statusClass(status)}`}>{status}</span>

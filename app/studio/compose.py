@@ -253,7 +253,7 @@ def compose(src, out_dir, params, script=None, fast=False):
     from concurrent.futures import ThreadPoolExecutor
     fmts = params.get("formats", ["9:16", "1:1", "16:9"])
     if fast and os.environ.get("STUDIO_COMPOSE_ALL") != "1":
-        fmts = fmts[:1]                       # tests: one aspect; STUDIO_COMPOSE_ALL=1 or STUDIO_MOCK_FAST=0 = full
+        fmts = fmts[:1]                       # dry run: one aspect; STUDIO_COMPOSE_ALL=1 or STUDIO_MOCK_FAST=0 = full
     with ThreadPoolExecutor(max_workers=len(fmts) or 1) as ex:      # aspects encode in parallel
         exports = dict(ex.map(one, fmts))
     return {"exports": exports, "words": len(words), "face_center": center, "source": str(src),

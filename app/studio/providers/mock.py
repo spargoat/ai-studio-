@@ -7,9 +7,28 @@ from .base import Provider, ProviderError
 from ..assets import font_file, ffmpeg_bin
 from ..media import ff, esc, duration
 
-# STUDIO_MOCK_FAST=1: render placeholders small/low-fps (tests); outputs are throwaway either way
-FAST = os.environ.get("STUDIO_MOCK_FAST") == "1"
-W, H, FPS = (270, 480, 10) if FAST else (1080, 1920, 30)
+def mock_fast():
+    """Dry placeholders stay small. STUDIO_MOCK_FAST=0 asks for full-size media."""
+    return os.environ.get("STUDIO_MOCK_FAST", "1") != "0"
+
+
+def frame_size():
+    return (270, 480, 10) if mock_fast() else (1080, 1920, 30)
+
+
+def placeholder_seconds(secs):
+    """A dry board used to encode the full 3–15s clip at 1080p. One second is enough to prove the path."""
+    try:
+        secs = float(secs or 1)
+    except (TypeError, ValueError):
+        secs = 1.0
+    if mock_fast():
+        return min(secs, 1.0)
+    return secs
+
+
+# Kept for callers that read the constants at import. frame_size() is the live choice.
+W, H, FPS = frame_size()
 
 BG = {"marco": "0x1d2b3a", "maksim": "0x2f3a24", "callum": "0x3a2430"}
 
@@ -49,6 +68,7 @@ class MockProvider(Provider):
         self._maybe_fail(ctx)
         out = Path(ctx["out_dir"]) / "still.png"
         refs = [r for r in (ctx.get("refs") or []) if os.path.exists(r)]
+        W, H, _fps = frame_size()
         label = _label(["DRY RUN - MOCK STILL", f"{ctx['persona_display']}", f"would call {ctx['model']}"], 40, 1500)
         if refs:
             vf = (f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
@@ -63,21 +83,28 @@ class MockProvider(Provider):
     def do_video(self, ctx):
         self._maybe_fail(ctx)
         out = Path(ctx["out_dir"]) / "video.mp4"
-        secs = ctx["video_seconds"]
-        fps = FPS
-        frames = int(secs * fps)
-        vf = (f"scale={W}:{H},zoompan=z='1+0.0008*on':x='iw/2-(iw/zoom/2)+6*sin(on/20)':"
-              f"y='ih/2-(ih/zoom/2)':d={frames}:s={W}x{H}:fps={fps}," +
-              _label(["MOCK SILENT VIDEO", f"{secs}s - {ctx['model']}"], 38, 200))
-        ff(["-loop", "1", "-i", ctx["inputs"]["still"], "-vf", vf, "-t", str(secs), "-an",
-            "-c:v", "libx264", "-preset", os.environ.get("STUDIO_FFMPEG_PRESET", "veryfast"), "-pix_fmt", "yuv420p", str(out)])
+        secs = placeholder_seconds(ctx["video_seconds"])
+        W, H, fps = frame_size()
+        preset = os.environ.get("STUDIO_FFMPEG_PRESET", "veryfast")
+        if mock_fast():
+            # zoompan at full length is what made a dry board take minutes per clip.
+            ff(["-f", "lavfi", "-i", f"color=c={BG.get(ctx['persona'], '0x333333')}:s={W}x{H}:d={secs}:r={fps}",
+                "-vf", _label(["MOCK SILENT VIDEO", f"{secs}s - {ctx['model']}"], 28, 80),
+                "-t", str(secs), "-an", "-c:v", "libx264", "-preset", preset, "-pix_fmt", "yuv420p", str(out)])
+        else:
+            frames = int(secs * fps)
+            vf = (f"scale={W}:{H},zoompan=z='1+0.0008*on':x='iw/2-(iw/zoom/2)+6*sin(on/20)':"
+                  f"y='ih/2-(ih/zoom/2)':d={frames}:s={W}x{H}:fps={fps}," +
+                  _label(["MOCK SILENT VIDEO", f"{secs}s - {ctx['model']}"], 38, 200))
+            ff(["-loop", "1", "-i", ctx["inputs"]["still"], "-vf", vf, "-t", str(secs), "-an",
+                "-c:v", "libx264", "-preset", preset, "-pix_fmt", "yuv420p", str(out)])
         return {"output_path": str(out), "meta": {"mock": True, "seconds": duration(out)},
                 "units_actual": secs, "request_id": "mock"}
 
     def do_voice(self, ctx):
         self._maybe_fail(ctx)
         out = Path(ctx["out_dir"]) / "voice.mp3"
-        secs = ctx["audio_seconds"]
+        secs = placeholder_seconds(ctx["audio_seconds"])
         ff(["-f", "lavfi", "-i", f"sine=frequency=180:duration={secs}", "-af",
             "tremolo=f=4:d=0.7,volume=0.3", "-c:a", "libmp3lame", "-b:a", "128k", str(out)])
         return {"output_path": str(out),

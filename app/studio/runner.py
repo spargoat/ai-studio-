@@ -844,7 +844,7 @@ class Runner:
         if not score.scorable(run["output_path"]):
             return None
         persona = self.db.job(run["job_id"])["persona"]
-        if not self.live and os.environ.get("STUDIO_MOCK_FAST") == "1":
+        if not self.live and os.environ.get("STUDIO_MOCK_FAST", "1") != "0":
             n_frames = n_frames or 1               # tests: fewer sampled frames, same code path
         try:
             s = score.score_file(self.cfg, persona, run["output_path"], n_frames or q.get("frames", 5), run["stage"])

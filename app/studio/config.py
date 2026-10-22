@@ -57,7 +57,10 @@ def oidc_request_token():
         return ""
     if not has_request_context():
         return ""
-    return (request.headers.get(OIDC_HEADER) or "").strip()
+    header = (request.headers.get(OIDC_HEADER) or "").strip()
+    if header:
+        return header
+    return (request.environ.get("HTTP_X_VERCEL_OIDC_TOKEN") or "").strip()
 
 
 def key_status(provider_cfg):

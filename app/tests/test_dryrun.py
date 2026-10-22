@@ -162,7 +162,7 @@ class T(unittest.TestCase):
         r = Runner(cfg(), log=lambda m: None)                                # e2e dry job composed all aspects
         run = r.db.latest("t-e2e", "compose")
         m = json.loads(run["meta_json"])
-        exp = ["16:9", "1:1", "9:16"] if os.environ.get("STUDIO_MOCK_FAST") != "1" else ["9:16"]
+        exp = ["16:9", "1:1", "9:16"] if os.environ.get("STUDIO_MOCK_FAST") == "0" else ["9:16"]
         self.assertEqual(sorted(m["exports"]), exp)
         self.assertTrue(all(Path(p).stat().st_size > 5000 for p in m["exports"].values()))
         self.assertEqual(sorted(m["export_scores"]), exp) if len(exp) > 1 else None

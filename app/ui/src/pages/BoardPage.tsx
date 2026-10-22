@@ -1,5 +1,5 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
-import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ReactFlow, ReactFlowProvider, Background, Controls, MiniMap, applyNodeChanges, applyEdgeChanges,
   useReactFlow, type Connection, type Edge, type Node, type NodeChange, type EdgeChange, type OnConnect, type FinalConnectionState,
@@ -167,7 +167,6 @@ function Canvas() {
   const previewQuery = useQuery({
     queryKey: ["intel-preview", previewQs],
     queryFn: () => api<any>(`/api/intel/preview?${previewQs}`),
-    placeholderData: keepPreviousData,
     enabled: nodes.length > 0,
   });
   const preview = previewQuery.data || board?.preview || null;

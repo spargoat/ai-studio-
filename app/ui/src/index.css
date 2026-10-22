@@ -664,8 +664,8 @@ a, button, input, select, textarea {
 .v3-funnel-bar label { display: inline-flex; align-items: center; gap: 5px; color: var(--tx3); font-size: 11px; }
 .v3-funnel-bar input, .v3-funnel-bar select { width: 130px; min-width: 90px; border: 1px solid var(--line2); border-radius: 5px; background: var(--bg2); color: var(--tx); padding: 4px 6px; font-size: 11px; }
 .v3-funnel-bar span { color: var(--tx2); font-size: 11px; }
-.v3-dir-item { display: block; width: 100%; max-width: 100%; box-sizing: border-box; text-align: left; margin: 4px 0; padding: 7px; border: 1px solid var(--line2); border-radius: 7px; background: var(--bg2); color: var(--tx); overflow: hidden; }
-.v3-dir-item b, .v3-dir-item small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.v3-dir-item { display: block; width: 100%; max-width: 100%; box-sizing: border-box; text-align: left; margin: 4px 0; padding: 7px; border: 1px solid var(--line2); border-radius: 7px; background: var(--bg2); color: var(--tx); overflow: visible; height: auto; }
+.v3-dir-item b, .v3-dir-item small { display: block; overflow: visible; text-overflow: unset; white-space: normal; overflow-wrap: anywhere; }
 .v3-dir-item small { color: var(--tx3); font-size: 10px; }
 .v3-canvas { position: relative; flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: row; background: var(--bg); }
 .v3-flow { flex: 1; min-width: 0; min-height: 0; position: relative; }

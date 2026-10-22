@@ -5,7 +5,7 @@ from flask import Blueprint, abort, jsonify, request, send_file
 from . import library, persona as P
 from .adintel import configured
 from .adintel import accounts as intel_accounts
-from .board import BoardError, compile_board, ensure_presets, job_brief, preview_config, preview_pack
+from .board import BoardError, compile_board, ensure_presets, feed_artefact, job_brief, preview_config, preview_pack
 from .names import purpose_name
 from .config import connection_status, key_status, load_template
 from .runner import BriefError, SpendGuardError
@@ -77,6 +77,19 @@ def register(app, cfg, runner, live, bg):
     def err(msg, code=400):
         return jsonify({"error": str(msg)}), code
 
+    def private(payload, code=200):
+        """Per-request reads. Vercel otherwise caches a public body that never saw the OIDC header."""
+        resp = jsonify(payload)
+        resp.status_code = code
+        resp.cache_control.no_store = True
+        resp.cache_control.no_cache = True
+        resp.cache_control.private = True
+        resp.cache_control.max_age = 0
+        resp.cache_control.public = None
+        resp.headers["CDN-Cache-Control"] = "no-store"
+        resp.headers["Pragma"] = "no-cache"
+        return resp
+
     def doctor_text():
         from .cli import doctor
         buf = io.StringIO()
@@ -107,7 +120,7 @@ def register(app, cfg, runner, live, bg):
     @bp.get("/api/meta")
     def meta():
         pers = cfg["_personas"]
-        return jsonify({"live": live, "personas": [{"id": k, "display": v.get("display") or k, "voice_name": v.get("voice_name") or ""} for k, v in pers.items()],
+        return private({"live": live, "personas": [{"id": k, "display": v.get("display") or k, "voice_name": v.get("voice_name") or ""} for k, v in pers.items()],
                         "templates": sorted(p.stem for p in TEMPLATES_DIR.glob("*.yaml")),
                         "fal_lock": db.fal_lock(), "caps": caps(), "spend": db.effective_spend(),
                         "connections": connection_status(cfg),
@@ -498,17 +511,18 @@ def register(app, cfg, runner, live, bg):
         if not one_stage():
             run_bg(jid, runner.run_job, jid)
             return jsonify({"id": jid, "mode": "dry", "pump": False}), 201
+        # Dry placeholders are a second or two. Run the whole board in this request
+        # so a 28-block replicate is not one full encode per HTTP call.
         try:
-            runner.advance(jid)
+            status = runner.run_job(jid)
         except BriefError as e:
             return err(e, 409)
-        # One request runs one stage. The client keeps calling /advance until a gate.
-        return jsonify({"id": jid, "mode": "dry", "pump": True}), 201
+        return jsonify({"id": jid, "mode": "dry", "pump": False, "status": status}), 201
 
     @bp.get("/api/intel/accounts")
     def intel_accounts_route():
         try:
-            return jsonify(intel_accounts())
+            return private(intel_accounts())
         except Exception as e:
             from .adintel import AdIntelError
             if isinstance(e, AdIntelError):
@@ -519,7 +533,7 @@ def register(app, cfg, runner, live, bg):
     def intel_funnels_route():
         from .adintel import AdIntelError, directory
         try:
-            return jsonify(directory())
+            return private(directory())
         except AdIntelError as e:
             return err(str(e), 502)
 
@@ -533,7 +547,10 @@ def register(app, cfg, runner, live, bg):
                   "event_id": a.get("event_id") or "", "limit": a.get("limit") or "40",
                   "offset": a.get("offset") or "0"}
         try:
-            return jsonify(preview_pack(config))
+            if (a.get("scope") or "") == "feed":
+                art = feed_artefact({k: v for k, v in config.items() if k != "event_id"})
+                return private({"origin": (art.get("evidence") or {}).get("origin"), "feed": art})
+            return private(preview_pack(config))
         except Exception as e:
             return err(e, 502)
 
@@ -541,7 +558,7 @@ def register(app, cfg, runner, live, bg):
     def intel_ad_funnel(ad_id):
         from .adintel import AdIntelError, funnel_for
         try:
-            return jsonify({**funnel_for(ad_id), "origin": "live" if configured() else "fixture"})
+            return private({**funnel_for(ad_id), "origin": "live" if configured() else "fixture"})
         except AdIntelError as e:
             return err(str(e), 502)
 
@@ -549,7 +566,7 @@ def register(app, cfg, runner, live, bg):
     def intel_funnel_route(funnel_id):
         from .adintel import AdIntelError, route_for_funnel
         try:
-            return jsonify(route_for_funnel(funnel_id))
+            return private(route_for_funnel(funnel_id))
         except AdIntelError as e:
             return err(str(e), 502)
 

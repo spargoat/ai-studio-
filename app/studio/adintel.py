@@ -240,9 +240,10 @@ def normalize_ad(raw):
         "library_url": raw.get("libraryUrl") or "",
         "creative_family": raw.get("treatment") or raw.get("creative_family") or "",
         "platforms": platforms,
-        "page_id": raw.get("pageId") or "",
+        "page_id": raw.get("pageId") or raw.get("page_id") or "",
         "funnel": raw.get("funnel") or "",
         "assigned_funnel": raw.get("assignedFunnel") or "",
+        "funnel_id": str(raw.get("funnelId") or raw.get("assignedFunnelId") or ""),
         "as_of": raw.get("asOf"),
     }
     return ad if ad["id"] else None
@@ -347,7 +348,10 @@ def query_ads(filters=None):
     pack["matched"] = body.get("matched", len(pack["ads"]))
     pack["offset"] = body.get("offset", 0)
     pack["limit"] = body.get("limit", 40)
-    return pack
+    # The tracker ignores pageId, or we dropped it after a 400. Do not present
+    # another page's cards as this account. A page that already matches keeps
+    # the tracker's matched total.
+    return _pin_requested_page(pack, filters.get("page_id") or filters.get("pageId"))
 
 
 def ad_by_id(ad_id):
@@ -359,12 +363,97 @@ def ad_by_id(ad_id):
     return normalize_ad(body.get("observed"))
 
 
+def _pin_requested_page(pack, wanted):
+    """Keep the list on the page the caller asked for.
+
+    Ads with no page id are left alone. When every returned ad is that page,
+    the tracker's matched total stays. A mixed page is narrowed. A page that
+    is entirely someone else's is an empty list, not the other account's cards.
+    """
+    wanted = str(wanted or "").strip()
+    ads = pack.get("ads") or []
+    if not wanted or not ads:
+        return pack
+    pages = [str(ad.get("page_id") or "") for ad in ads]
+    if not any(pages):
+        return pack
+    if all(page == wanted for page in pages):
+        return pack
+    if wanted not in pages:
+        pack["ads"] = []
+        pack["matched"] = 0
+        return pack
+    pinned = [ad for ad in ads if str(ad.get("page_id") or "") == wanted]
+    pack["ads"] = pinned
+    pack["matched"] = len(pinned)
+    return pack
+
+
+def _funnel_id_for_advertiser(advertiser):
+    """Directory join used when the ad record itself has no funnel id.
+
+    Exact advertiser name, case-insensitive, and the funnel must already have
+    ads. The row with the most ads wins. An empty Ethan Young funnel stays unassigned.
+    """
+    name = str(advertiser or "").strip().lower()
+    if not name:
+        return None
+    best_id, best_ads = None, 0
+    for row in directory().get("funnels") or []:
+        names = [str(item).strip().lower() for item in (row.get("advertisers") or [])]
+        if name not in names:
+            continue
+        try:
+            count = int(row.get("ads") or 0)
+        except (TypeError, ValueError):
+            count = 0
+        if count <= 0 or count <= best_ads:
+            continue
+        best_ads = count
+        best_id = row.get("id") or row.get("name")
+    return best_id
+
+
+def _collapse_steps(steps, limit=12):
+    """A stored route can repeat the same card thousands of times. Keep the first of each."""
+    seen, out = set(), []
+    for step in steps:
+        key = (step.get("kind"), step.get("label"))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(step)
+        if len(out) >= limit:
+            break
+    return out
+
+
+def _renumber(steps):
+    out = []
+    for n, step in enumerate(steps, 1):
+        row = dict(step)
+        row["n"] = n
+        out.append(row)
+    return out
+
+
+def _present_steps(steps, ad_id, limit=12):
+    wanted = str(ad_id or "")
+    if wanted:
+        owned = [step for step in steps if step.get("ad_id") and str(step["ad_id"]) == wanted]
+        if owned:
+            return _renumber(owned)
+    return _renumber(_collapse_steps(steps, limit))
+
+
 def funnel_for(ad_id):
     ad = ad_by_id(ad_id) or {}
     if not configured():
         mapped = FIXTURE_FUNNELS.get(ad_id) or {"steps": [], "landing_page": {"url": ad.get("landing_url") or "", "title": ""}}
         return {"ad_id": ad_id, **mapped}
-    funnel_id = ad.get("assigned_funnel") or ad.get("funnel")
+    funnel_id = (ad.get("assigned_funnel") or ad.get("funnel") or ad.get("funnel_id") or "").strip()
+    if not funnel_id:
+        funnel_id = _funnel_id_for_advertiser(ad.get("advertiser"))
     if not funnel_id:
         return {"ad_id": ad_id, "funnel_id": None, "steps": [],
                 "landing_page": {"url": ad.get("landing_url") or "", "title": ""},
@@ -390,10 +479,12 @@ def route_for_funnel(funnel_id, ad_id=None, landing_url=""):
                           "label": _step_label(raw),
                           "url": raw.get("url") or "", "state": state,
                           "source": raw.get("source") or "", "checked_on": raw.get("checkedOn"),
-                          "lane_id": raw.get("laneId"), "branch": raw.get("branch")})
+                          "lane_id": raw.get("laneId"), "branch": raw.get("branch"),
+                          "ad_id": str(raw.get("adId") or raw.get("ad_id") or "")})
     if not steps and landing_url:
         steps.append({"n": 1, "kind": "destination", "label": "Destination URL on ad record",
                       "url": landing_url, "state": "observed", "source": "Ads.Destination URL"})
+    steps = _present_steps(steps, ad_id)
     return {"ad_id": ad_id, "funnel_id": (body.get("funnel") or {}).get("id"), "steps": steps,
             "funnel_name": (body.get("funnel") or {}).get("name"),
             "landing_page": {"url": landing_url, "title": ""},
