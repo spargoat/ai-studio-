@@ -18,7 +18,7 @@ def register(app, cfg, runner, live, bg):
     active, alock = set(), threading.Lock()
     data_dir = Path(cfg["_data_dir"]).resolve()
 
-    def run_bg(jid, fn, *a):
+    def _guarded(jid, fn, a):
         with alock:
             if jid in active:
                 raise BriefError(f"{jid} is already running")
@@ -32,7 +32,26 @@ def register(app, cfg, runner, live, bg):
             finally:
                 with alock:
                     active.discard(jid)
-        bg(go)
+        return go
+
+    def run_bg(jid, fn, *a):
+        bg(_guarded(jid, fn, a))
+
+    def launch(jid, *, only=None, cascade=False):
+        """Start a job. thread (default) and inline run locally; inngest sends an event."""
+        from . import workflows
+        mode = workflows.executor_mode()
+        if mode == "inngest":
+            workflows.send_job(jid, only=only, cascade=cascade)
+            return
+        if only is not None:
+            fn, args = runner.rerun, (jid, only, cascade)
+        else:
+            fn, args = runner.run_job, (jid,)
+        if mode == "inline":
+            _guarded(jid, fn, args)()
+            return
+        run_bg(jid, fn, *args)
 
     def err(msg, code=400):
         return jsonify({"error": str(msg)}), code
@@ -194,25 +213,42 @@ def register(app, cfg, runner, live, bg):
             jid = runner.create_job(brief_from(body.get("brief")))
         except (BriefError, KeyError, ValueError) as e:
             return err(e)
-        run_bg(jid, runner.run_job, jid)
+        try:
+            launch(jid)
+        except Exception as e:
+            from .workflows import QueueError
+            if isinstance(e, QueueError):
+                db.log(jid, None, "error", f"inngest enqueue failed: {e}")
+                return err(e, 503)
+            raise
         return jsonify({"id": jid}), 201
 
     @bp.post("/api/jobs/<jid>/resume")
     def resume(jid):
         db.job(jid) or abort(404)
         try:
-            run_bg(jid, runner.run_job, jid)
+            launch(jid)
         except BriefError as e:
             return err(e, 409)
+        except Exception as e:
+            from .workflows import QueueError
+            if isinstance(e, QueueError):
+                return err(e, 503)
+            raise
         return jsonify({"ok": True})
 
     @bp.post("/api/jobs/<jid>/rerun/<stage>")
     def rerun(jid, stage):
         db.job(jid) or abort(404)
         try:
-            run_bg(jid, runner.rerun, jid, stage)
+            launch(jid, only=stage)
         except BriefError as e:
             return err(e, 409)
+        except Exception as e:
+            from .workflows import QueueError
+            if isinstance(e, QueueError):
+                return err(e, 503)
+            raise
         return jsonify({"ok": True})
 
     @bp.post("/api/jobs/<jid>/review/<stage>")
@@ -230,9 +266,14 @@ def register(app, cfg, runner, live, bg):
         resumed = False
         if v == "approved" and jid not in active and db.job(jid)["status"] in ("awaiting_review", "partial"):
             try:
-                run_bg(jid, runner.run_job, jid); resumed = True        # carry on to the next gate (dry runs only)
+                launch(jid); resumed = True        # carry on to the next gate (dry runs only)
             except BriefError:
                 pass
+            except Exception as e:
+                from .workflows import QueueError
+                if not isinstance(e, QueueError):
+                    raise
+                db.log(jid, None, "error", f"inngest enqueue failed: {e}")
         return jsonify({"ok": True, "resumed": resumed, "pending": [p for p in pending_reviews() if p["job_id"] == jid]})
 
     @bp.post("/api/library/<int:lid>/promote")

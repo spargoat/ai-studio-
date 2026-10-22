@@ -1,0 +1,10 @@
+# Installed by Vercel when the project root is app/.
+# inngest serves /api/inngest (studio/workflows.py).
+flask>=3
+PyYAML
+requests
+waitress
+inngest>=0.5.14
+numpy
+opencv-python-headless
+Pillow
