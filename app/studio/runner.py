@@ -144,9 +144,23 @@ class Runner:
             raise BriefError("brief.still_provider must be 'higgsfield' or 'fal'")
         return choice
 
+    def _apply_persona_voice(self, sc, job):
+        """personas.<id>.voice_model replaces stages.voice for that persona. Others keep the stage default."""
+        if not job:
+            return sc
+        persona_id = (job.get("brief") or {}).get("persona")
+        persona = (self.cfg.get("_personas") or {}).get(persona_id) or {}
+        model = str(persona.get("voice_model") or "").strip()
+        if not model:
+            return sc
+        price_key = {"eleven_v3": "elevenlabs_v3"}.get(model, sc.get("price_key"))
+        return {**sc, "model": model, "price_key": price_key}
+
     def _stage_config(self, stage, live, job=None):
         """Stage adapter for this job. A still_provider replaces stages.still for that job only."""
         sc = dict(self.cfg["stages"][stage])
+        if stage == "voice":
+            sc = self._apply_persona_voice(sc, job)
         choice = self._still_provider_choice(job) if stage == "still" else None
         if choice == "higgsfield":
             route = ((self.cfg.get("fallback") or {}).get("routes") or {}).get("still") or {}
@@ -309,6 +323,10 @@ class Runner:
             ctx = self.build_ctx(fake, sdef, inputs={}, dry_estimate=True)
             if key == "still" and brief.get("still_provider"):
                 _provider, sc = self.provider_for(key, job=fake)
+            elif key == "voice":
+                _provider, sc = self.provider_for(key, job=fake)
+                if sdef.get("model"):
+                    sc = {**sc, "model": sdef["model"], "price_key": sdef.get("price_key", sc["price_key"])}
             else:
                 sc = self.cfg["stages"][key]
             units = pricing.units_for(sdef["kind"], sdef["params"], ctx)
