@@ -240,8 +240,9 @@ maksim:
     - yachts/Riviera/jets/Alpine (Marco lane)
 callum:
   display: Callum
-  voice_id: eOI2ur2q3RYLvOJKFn3s
-  voice_name: Ollie
+  voice_id: 7WFWk7zmM49WQZguCHGx
+  voice_name: "Callum - draft (take M5, eleven_v3)"
+  voice_model: eleven_v3
   voice_settings:
     stability: 0.45
     similarity_boost: 0.8
